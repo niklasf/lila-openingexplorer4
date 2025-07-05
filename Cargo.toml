@@ -1,0 +1,14 @@
+[package]
+name = "lila-openingexplorer4"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bincode = "2.0.1"
+fjall = "2.11.1"
+shakmaty = { version = "0.29.0", features = ["variant"] }
+thiserror = "2.0.12"
+
+[dev-dependencies]
+arbitrary = "1.4.1"
+quickcheck = "1.0.3"
