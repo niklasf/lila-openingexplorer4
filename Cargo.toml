@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 bincode = "2.0.1"
 fjall = "2.11.1"
-shakmaty = { version = "0.29.0", features = ["variant"] }
+shakmaty = { version = "0.29.0", git = "https://github.com/niklasf/shakmaty.git", features = ["variant", "bincode"] }
 thiserror = "2.0.12"
 
 [dev-dependencies]

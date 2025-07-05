@@ -5,6 +5,7 @@ use bincode::{
     de::Decoder,
     enc::Encoder,
     error::{DecodeError, EncodeError},
+    impl_borrow_decode,
 };
 use thiserror::Error;
 
@@ -29,6 +30,8 @@ impl<Context> Decode<Context> for GameId {
         Ok(GameId(base62))
     }
 }
+
+impl_borrow_decode!(GameId);
 
 #[derive(Error, Debug)]
 #[error("invalid game id")]
@@ -99,7 +102,7 @@ mod tests {
 
         fn bincode_roundtrip(game_id: GameId) -> bool {
             let config = bincode::config::standard();
-            let encoded = bincode::encode_to_vec(&game_id, config).unwrap();
+            let encoded = bincode::encode_to_vec(game_id, config).unwrap();
             let (decoded, n): (GameId, _) = bincode::decode_from_slice(&encoded, config).unwrap();
             (decoded, n) == (game_id, 6)
         }
