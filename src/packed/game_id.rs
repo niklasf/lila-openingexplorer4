@@ -1,37 +1,25 @@
+use bytes::Buf;
+use bytes::BufMut;
 use std::{fmt, fmt::Write, str::FromStr};
 
-use bincode::{
-    Decode, Encode,
-    de::Decoder,
-    enc::Encoder,
-    error::{DecodeError, EncodeError},
-    impl_borrow_decode,
-};
 use thiserror::Error;
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct GameId(u64);
 
-impl Encode for GameId {
-    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        let bytes: [u8; 6] = self.0.to_le_bytes()[..6].try_into().expect("6 bytes");
-        bytes.encode(encoder)
+impl GameId {
+    const SIZE: usize = 6;
+
+    pub fn pack<B: BufMut>(&self, buf: &mut B) {
+        buf.put_uint_le(self.0, Self::SIZE);
+    }
+
+    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
+        let n = buf.get_uint_le(Self::SIZE);
+        assert!(n < 62_u64.pow(8), "invalid game id");
+        GameId(n)
     }
 }
-
-impl<Context> Decode<Context> for GameId {
-    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let d: [u8; 6] = Decode::decode(decoder)?;
-        let bytes = [d[0], d[1], d[2], d[3], d[4], d[5], 0, 0];
-        let base62 = u64::from_le_bytes(bytes);
-        if base62 >= 62_u64.pow(8) {
-            return Err(DecodeError::Other("invalid game id"));
-        }
-        Ok(GameId(base62))
-    }
-}
-
-impl_borrow_decode!(GameId);
 
 #[derive(Error, Debug)]
 #[error("invalid game id")]
@@ -100,11 +88,10 @@ mod tests {
             GameId::from_str(&game_id.to_string()).unwrap() == game_id
         }
 
-        fn bincode_roundtrip(game_id: GameId) -> bool {
-            let config = bincode::config::standard();
-            let encoded = bincode::encode_to_vec(game_id, config).unwrap();
-            let (decoded, n): (GameId, _) = bincode::decode_from_slice(&encoded, config).unwrap();
-            (decoded, n) == (game_id, 6)
+        fn pack_roundtrip(game_id: GameId) -> bool {
+            let mut buf = Vec::new();
+            game_id.pack(&mut buf);
+            GameId::unpack(&mut &buf[..]) == game_id
         }
     }
 }
