@@ -1,30 +1,30 @@
-use crate::packed::GameId;
-use crate::packed::LaxDate;
 use bincode::{Decode, Encode};
-use shakmaty::Outcome;
-use shakmaty::packed::PackedSetup;
-use shakmaty::packed::PackedUciMove;
+use shakmaty::{
+    ByColor, KnownOutcome,
+    packed::{PackedSetup, PackedUciMove},
+};
+
+use crate::packed::{GameId, LaxDate, Rating};
 
 #[derive(Debug, Clone, Encode, Decode)]
-struct GamePlayer {
+pub struct GamePlayer {
     name: String,
     title: String,
-    rating: u16,
+    rating: Rating,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
-struct GameMeta {
+pub struct GameMeta {
     id: GameId,
-    outcome: Outcome,
-    white: GamePlayer,
-    black: GamePlayer,
+    outcome: KnownOutcome,
+    player: ByColor<GamePlayer>,
     broadcast_name: String,
     date: LaxDate,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
-struct Game {
+pub struct Game {
     meta: GameMeta,
     setup: Option<PackedSetup>,
-    uci: Vec<PackedUciMove>,
+    moves: Vec<PackedUciMove>,
 }

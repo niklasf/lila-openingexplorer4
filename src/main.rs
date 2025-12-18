@@ -1,0 +1,3 @@
+mod packed;
+
+fn main() {}
