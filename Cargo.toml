@@ -4,12 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bincode = "2.0.1"
 bytes = "1.11.0"
 fjall = "2.11.1"
-shakmaty = { version = "0.29.0", git = "https://github.com/niklasf/shakmaty.git", features = ["variant", "bincode"] }
+shakmaty = { version = "0.29.0", git = "https://github.com/niklasf/shakmaty.git", features = ["variant"] }
 thiserror = "2.0.12"
 
 [dev-dependencies]
-arbitrary = "1.4.1"
 quickcheck = "1.0.3"

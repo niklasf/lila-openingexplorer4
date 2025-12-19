@@ -39,10 +39,10 @@ impl LaxDate {
 
 #[derive(Error, Debug)]
 #[error("invalid lax date")]
-pub struct InvalidLaxDateError;
+pub struct InvalidLaxDate;
 
 impl FromStr for LaxDate {
-    type Err = InvalidLaxDateError;
+    type Err = InvalidLaxDate;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut parts = s.splitn(3, '-');
@@ -52,14 +52,14 @@ impl FromStr for LaxDate {
                 .and_then(|part| u32::from_str(part).ok())
                 .and_then(|year| year.checked_sub(1900))
                 .and_then(|year_since_1900| u8::try_from(year_since_1900).ok())
-                .ok_or(InvalidLaxDateError)?,
+                .ok_or(InvalidLaxDate)?,
             month: parts
                 .next()
                 .map(|part| {
                     NonZeroU8::from_str(part)
                         .ok()
                         .filter(|&m| m.get() <= 12)
-                        .ok_or(InvalidLaxDateError)
+                        .ok_or(InvalidLaxDate)
                 })
                 .transpose()?,
             day: parts
@@ -68,7 +68,7 @@ impl FromStr for LaxDate {
                     NonZeroU8::from_str(part)
                         .ok()
                         .filter(|&d| d.get() <= 31)
-                        .ok_or(InvalidLaxDateError)
+                        .ok_or(InvalidLaxDate)
                 })
                 .transpose()?,
         })
