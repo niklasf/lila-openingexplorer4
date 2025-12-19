@@ -78,7 +78,7 @@ mod tests {
     use super::*;
 
     impl Arbitrary for GameId {
-        fn arbitrary(g: &mut Gen) -> GameId {
+        fn arbitrary(g: &mut Gen) -> Self {
             GameId(u64::arbitrary(g) % 62u64.pow(8))
         }
     }
