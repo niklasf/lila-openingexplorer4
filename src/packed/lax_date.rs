@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::{fmt, num::NonZeroU8};
 use thiserror::Error;
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct LaxDate {
     year_since_1900: u8,
     month: Option<NonZeroU8>,

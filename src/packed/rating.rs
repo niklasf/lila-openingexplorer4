@@ -2,7 +2,7 @@ use std::{fmt, num::TryFromIntError};
 
 use bytes::{Buf, BufMut};
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rating {
     offset: i16,
 }
