@@ -4,7 +4,7 @@ use std::ops::ControlFlow;
 use lila_openingexplorer4::packed::{
     GameId, GamePlayer, LaxDate, LichessGame, Rating, RatingMode, Speed,
 };
-use pgn_reader::{RawTag, Reader, Visitor};
+use pgn_reader::{RawTag, Reader, Skip, Visitor};
 use shakmaty::packed::PackedSetup;
 use shakmaty::san::SanPlus;
 use shakmaty::uci::UciMove;
@@ -239,6 +239,13 @@ impl Visitor for ToLichessGame {
             Ok(movetext) => ControlFlow::Continue(movetext),
             Err(err) => ControlFlow::Break(Err(err)),
         }
+    }
+
+    fn begin_variation(
+        &mut self,
+        _movetext: &mut Self::Movetext,
+    ) -> ControlFlow<Self::Output, Skip> {
+        ControlFlow::Continue(Skip(true))
     }
 
     fn san(&mut self, movetext: &mut Movetext, san: SanPlus) -> ControlFlow<Self::Output> {
