@@ -1,3 +1,4 @@
+use crate::packed::{pack_int, unpack_int};
 use std::{fmt, num::TryFromIntError};
 
 use bytes::{Buf, BufMut};
@@ -11,12 +12,12 @@ impl Rating {
     const BASE: i32 = 1500;
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        buf.put_i16(self.offset); // TODO: varint
+        pack_int(buf, self.offset as i64);
     }
 
     pub fn unpack<B: Buf>(buf: &mut B) -> Self {
         Rating {
-            offset: buf.get_i16(), // TODO: varint
+            offset: unpack_int(buf) as i16,
         }
     }
 }

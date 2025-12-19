@@ -21,6 +21,16 @@ pub fn unpack_uint<B: Buf>(buf: &mut B) -> u64 {
     }
 }
 
+pub fn pack_int<B: BufMut>(buf: &mut B, n: i64) {
+    // Zigzag (small absolute values to small unsigned values)
+    pack_uint(buf, ((n << 1) ^ (n >> 63)) as u64);
+}
+
+pub fn unpack_int<B: Buf>(buf: &mut B) -> i64 {
+    let n = unpack_uint(buf);
+    (n >> 1) as i64 ^ -(n as i64 & 1)
+}
+
 #[cfg(test)]
 mod tests {
     use quickcheck::quickcheck;
@@ -28,10 +38,16 @@ mod tests {
     use super::*;
 
     quickcheck! {
-        fn pack_roundtrip(n: u64) -> bool {
+        fn pack_uint_roundtrip(n: u64) -> bool {
             let mut buf = Vec::new();
             pack_uint(&mut buf, n);
             unpack_uint(&mut &buf[..]) == n
+        }
+
+        fn pack_int_roundtrip(n: i64) -> bool {
+            let mut buf = Vec::new();
+            pack_int(&mut buf, n);
+            unpack_int(&mut &buf[..]) == n
         }
     }
 }
