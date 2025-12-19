@@ -1,6 +1,8 @@
 use bytes::Buf;
 use bytes::BufMut;
+use std::str::FromStr;
 use std::{fmt, num::NonZeroU8};
+use thiserror::Error;
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct LaxDate {
@@ -32,6 +34,44 @@ impl LaxDate {
             month,
             day,
         }
+    }
+}
+
+#[derive(Error, Debug)]
+#[error("invalid lax date")]
+pub struct InvalidLaxDateError;
+
+impl FromStr for LaxDate {
+    type Err = InvalidLaxDateError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.splitn(3, '-');
+        Ok(LaxDate {
+            year_since_1900: parts
+                .next()
+                .and_then(|part| u32::from_str(part).ok())
+                .and_then(|year| year.checked_sub(1900))
+                .and_then(|year_since_1900| u8::try_from(year_since_1900).ok())
+                .ok_or(InvalidLaxDateError)?,
+            month: parts
+                .next()
+                .map(|part| {
+                    NonZeroU8::from_str(part)
+                        .ok()
+                        .filter(|&m| m.get() <= 12)
+                        .ok_or(InvalidLaxDateError)
+                })
+                .transpose()?,
+            day: parts
+                .next()
+                .map(|part| {
+                    NonZeroU8::from_str(part)
+                        .ok()
+                        .filter(|&d| d.get() <= 31)
+                        .ok_or(InvalidLaxDateError)
+                })
+                .transpose()?,
+        })
     }
 }
 
@@ -75,9 +115,9 @@ mod tests {
     }
 
     quickcheck! {
-        //fn str_roundtrip(game_id: GameId) -> bool {
-        //    GameId::from_str(&game_id.to_string()).unwrap() == game_id
-        //}
+        fn str_roundtrip(lax_date: LaxDate) -> bool {
+            LaxDate::from_str(&lax_date.to_string()).unwrap() == lax_date
+        }
 
         fn pack_roundtrip(lax_date: LaxDate) -> bool {
             let mut buf = Vec::new();
