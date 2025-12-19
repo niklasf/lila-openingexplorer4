@@ -84,5 +84,15 @@ mod tests {
             lax_date.pack(&mut buf);
             LaxDate::unpack(&mut &buf[..]) == lax_date
         }
+
+        fn packed_partial_ord(left: LaxDate, right: LaxDate) -> bool {
+            let mut left_buf = Vec::new();
+            left.pack(&mut left_buf);
+
+            let mut right_buf = Vec::new();
+            right.pack(&mut right_buf);
+
+            (left < right) == (left_buf < right_buf)
+        }
     }
 }
