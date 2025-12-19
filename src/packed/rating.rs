@@ -1,5 +1,8 @@
 use crate::packed::{pack_int, unpack_int};
-use std::{fmt, num::TryFromIntError};
+use btoi::btoi;
+use std::fmt;
+use std::str::FromStr;
+use thiserror::Error;
 
 use bytes::{Buf, BufMut};
 
@@ -20,6 +23,24 @@ impl Rating {
             offset: unpack_int(buf) as i16,
         }
     }
+
+    pub fn from_ascii(bytes: &[u8]) -> Result<Self, InvalidRating> {
+        btoi::<i32>(bytes)
+            .map_err(|_| InvalidRating)
+            .and_then(|value| Rating::try_from(value))
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("invalid rating")]
+pub struct InvalidRating;
+
+impl FromStr for Rating {
+    type Err = InvalidRating;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_ascii(s.as_bytes())
+    }
 }
 
 impl From<Rating> for i32 {
@@ -29,11 +50,14 @@ impl From<Rating> for i32 {
 }
 
 impl TryFrom<i32> for Rating {
-    type Error = TryFromIntError;
+    type Error = InvalidRating;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         Ok(Rating {
-            offset: value.saturating_sub(Rating::BASE).try_into()?,
+            offset: value
+                .saturating_sub(Rating::BASE)
+                .try_into()
+                .map_err(|_| InvalidRating)?,
         })
     }
 }

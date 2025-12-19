@@ -1,3 +1,4 @@
+use btoi::btou;
 use bytes::Buf;
 use bytes::BufMut;
 use std::str::FromStr;
@@ -35,6 +36,40 @@ impl LaxDate {
             day,
         }
     }
+
+    pub fn from_ascii(bytes: &[u8]) -> Result<Self, InvalidLaxDate> {
+        let mut parts = bytes.splitn(3, |&b| b == b'-' || b == b'.');
+        Ok(LaxDate {
+            year_since_1900: parts
+                .next()
+                .and_then(|part| btou::<u32>(part).ok())
+                .and_then(|year| year.checked_sub(1900))
+                .and_then(|year_since_1900| u8::try_from(year_since_1900).ok())
+                .ok_or(InvalidLaxDate)?,
+            month: parts
+                .next()
+                .filter(|part| part != b"?" && part != b"??")
+                .map(|part| {
+                    btou::<u8>(part)
+                        .ok()
+                        .filter(|&m| m <= 12)
+                        .and_then(NonZeroU8::new)
+                        .ok_or(InvalidLaxDate)
+                })
+                .transpose()?,
+            day: parts
+                .next()
+                .filter(|part| part != b"?" && part != b"??")
+                .map(|part| {
+                    btou::<u8>(part)
+                        .ok()
+                        .filter(|&m| m <= 12)
+                        .and_then(NonZeroU8::new)
+                        .ok_or(InvalidLaxDate)
+                })
+                .transpose()?,
+        })
+    }
 }
 
 #[derive(Error, Debug)]
@@ -45,33 +80,7 @@ impl FromStr for LaxDate {
     type Err = InvalidLaxDate;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut parts = s.splitn(3, '-');
-        Ok(LaxDate {
-            year_since_1900: parts
-                .next()
-                .and_then(|part| u32::from_str(part).ok())
-                .and_then(|year| year.checked_sub(1900))
-                .and_then(|year_since_1900| u8::try_from(year_since_1900).ok())
-                .ok_or(InvalidLaxDate)?,
-            month: parts
-                .next()
-                .map(|part| {
-                    NonZeroU8::from_str(part)
-                        .ok()
-                        .filter(|&m| m.get() <= 12)
-                        .ok_or(InvalidLaxDate)
-                })
-                .transpose()?,
-            day: parts
-                .next()
-                .map(|part| {
-                    NonZeroU8::from_str(part)
-                        .ok()
-                        .filter(|&d| d.get() <= 31)
-                        .ok_or(InvalidLaxDate)
-                })
-                .transpose()?,
-        })
+        Self::from_ascii(s.as_bytes())
     }
 }
 

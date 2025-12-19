@@ -19,6 +19,24 @@ impl GameId {
         assert!(n < 62_u64.pow(8), "invalid game id");
         GameId(n)
     }
+
+    pub fn from_ascii(bytes: &[u8]) -> Result<Self, InvalidGameId> {
+        if bytes.len() != 8 {
+            return Err(InvalidGameId);
+        }
+
+        let mut base62 = 0;
+        for c in bytes.into_iter().rev() {
+            base62 = u64::from(match c {
+                b'0'..=b'9' => c - b'0',
+                b'A'..=b'Z' => c - b'A' + 10,
+                b'a'..=b'z' => c - b'a' + 10 + 26,
+                _ => return Err(InvalidGameId),
+            }) + base62 * 62;
+        }
+
+        Ok(GameId(base62))
+    }
 }
 
 #[derive(Error, Debug)]
@@ -29,21 +47,7 @@ impl FromStr for GameId {
     type Err = InvalidGameId;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() != 8 {
-            return Err(InvalidGameId);
-        }
-
-        let mut base62 = 0;
-        for c in s.bytes().rev() {
-            base62 = u64::from(match c {
-                b'0'..=b'9' => c - b'0',
-                b'A'..=b'Z' => c - b'A' + 10,
-                b'a'..=b'z' => c - b'a' + 10 + 26,
-                _ => return Err(InvalidGameId),
-            }) + base62 * 62;
-        }
-
-        Ok(GameId(base62))
+        Self::from_ascii(s.as_bytes())
     }
 }
 

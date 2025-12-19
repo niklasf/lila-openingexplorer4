@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+btoi = "0.5.0"
 bytes = "1.11.0"
 fjall = "2.11.1"
+pgn-reader = { version = "0.28.0", git = "https://github.com/niklasf/shakmaty.git" }
 shakmaty = { version = "0.29.0", git = "https://github.com/niklasf/shakmaty.git", features = ["variant"] }
 thiserror = "2.0.12"
 

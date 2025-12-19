@@ -234,8 +234,10 @@ checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 name = "lila-openingexplorer4"
 version = "0.1.0"
 dependencies = [
+ "btoi",
  "bytes",
  "fjall",
+ "pgn-reader",
  "quickcheck",
  "shakmaty",
  "thiserror",
@@ -348,6 +350,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07ba0ad7e047712414213ff67533e6dd477af0a4e1d14fb52343e53d30ea9397"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "pgn-reader"
+version = "0.28.0"
+source = "git+https://github.com/niklasf/shakmaty.git#bc50fb1fe49aed0542430230a1bcc46b1f735987"
+dependencies = [
+ "btoi",
+ "memchr",
+ "shakmaty",
 ]
 
 [[package]]
