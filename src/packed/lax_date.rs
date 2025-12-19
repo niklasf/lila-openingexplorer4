@@ -132,7 +132,7 @@ mod tests {
             let mut right_buf = Vec::new();
             right.pack(&mut right_buf);
 
-            (left < right) == (left_buf < right_buf)
+            left_buf.cmp(&right_buf) == left.cmp(&right)
         }
     }
 }

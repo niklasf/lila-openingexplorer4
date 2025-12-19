@@ -11,11 +11,11 @@ impl GameId {
     const SIZE: usize = 6;
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        buf.put_uint_le(self.0, Self::SIZE);
+        buf.put_uint(self.0, Self::SIZE);
     }
 
     pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        let n = buf.get_uint_le(Self::SIZE);
+        let n = buf.get_uint(Self::SIZE);
         assert!(n < 62_u64.pow(8), "invalid game id");
         GameId(n)
     }
@@ -92,6 +92,16 @@ mod tests {
             let mut buf = Vec::new();
             game_id.pack(&mut buf);
             GameId::unpack(&mut &buf[..]) == game_id
+        }
+
+        fn packed_ord(left: GameId, right: GameId) -> bool {
+            let mut left_buf = Vec::new();
+            left.pack(&mut left_buf);
+
+            let mut right_buf = Vec::new();
+            right.pack(&mut right_buf);
+
+            left_buf.cmp(&right_buf) == left.cmp(&right)
         }
     }
 }
