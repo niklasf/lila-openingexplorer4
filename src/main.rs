@@ -421,23 +421,31 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut packed_game = Vec::new();
             prepared.game.pack_entire(&mut packed_game);
 
-            games_partition.insert(prepared.game_id.to_bytes(), packed_game)?;
+            let mut write_tx = keyspace.write_tx();
+
+            write_tx.insert(&games_partition, prepared.game_id.to_bytes(), packed_game);
 
             for hash in prepared.hashes {
-                index_partition.update_fetch(u32::from(hash).to_be_bytes(), |value| {
-                    let value: &[u8] = value.map_or(&[], |v| v);
-                    let (chunks, tail) = value.as_chunks();
-                    assert!(tail.is_empty());
-                    let mut chunks: Vec<[u8; GameId::SIZE]> = chunks.to_owned();
-                    if chunks.len() < 20 {
-                        match chunks.binary_search(&prepared.game_id.to_bytes()) {
-                            Ok(_) => {} // already exists
-                            Err(pos) => chunks.insert(pos, prepared.game_id.to_bytes()),
+                write_tx.update_fetch(
+                    &index_partition,
+                    u32::from(hash).to_be_bytes(),
+                    |value| {
+                        let value: &[u8] = value.map_or(&[], |v| v);
+                        let (chunks, tail) = value.as_chunks();
+                        assert!(tail.is_empty());
+                        let mut chunks: Vec<[u8; GameId::SIZE]> = chunks.to_owned();
+                        if chunks.len() < 20 {
+                            match chunks.binary_search(&prepared.game_id.to_bytes()) {
+                                Ok(_) => {} // already exists
+                                Err(pos) => chunks.insert(pos, prepared.game_id.to_bytes()),
+                            }
                         }
-                    }
-                    Some(Slice::new(chunks.as_flattened()))
-                })?;
+                        Some(Slice::new(chunks.as_flattened()))
+                    },
+                )?;
             }
+
+            write_tx.commit()?;
         }
 
         progress.finish();
