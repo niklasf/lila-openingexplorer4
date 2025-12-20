@@ -1,26 +1,22 @@
+use std::{
+    ffi::OsStr,
+    fs::File,
+    io,
+    io::{BufWriter, Write},
+    ops::ControlFlow,
+    path::PathBuf,
+    thread,
+};
+
 use clap::Parser;
 use crossbeam::channel;
-use indicatif::ProgressBar;
-use indicatif::ProgressDrawTarget;
-use indicatif::ProgressStyle;
-use pgn_reader::Reader;
-use pgn_reader::Skip;
-use pgn_reader::Visitor;
-use shakmaty::Chess;
-use shakmaty::EnPassantMode;
-use shakmaty::Position;
-use shakmaty::san::San;
-use shakmaty::san::SanPlus;
-use shakmaty::zobrist::Zobrist64;
-use shakmaty::zobrist::ZobristHash;
-use std::ffi::OsStr;
-use std::fs::File;
-use std::io;
-use std::io::BufWriter;
-use std::io::Write;
-use std::ops::ControlFlow;
-use std::path::PathBuf;
-use std::thread;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use pgn_reader::{Reader, Skip, Visitor};
+use shakmaty::{
+    Chess, EnPassantMode, Position,
+    san::{San, SanPlus},
+    zobrist::{Zobrist64, ZobristHash},
+};
 
 struct Game {
     index: usize,
