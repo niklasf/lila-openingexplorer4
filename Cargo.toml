@@ -13,6 +13,7 @@ indicatif = "0.18.3"
 pgn-reader = { version = "0.28.0", git = "https://github.com/niklasf/shakmaty.git" }
 shakmaty = { version = "0.29.0", git = "https://github.com/niklasf/shakmaty.git", features = ["variant"] }
 thiserror = "2.0.12"
+zstd = "0.13.3"
 
 [dev-dependencies]
 quickcheck = "1.0.3"

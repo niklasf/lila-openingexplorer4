@@ -3,6 +3,7 @@ use indicatif::ProgressBar;
 use indicatif::ProgressDrawTarget;
 use indicatif::ProgressStyle;
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::ops::ControlFlow;
@@ -372,7 +373,15 @@ fn main() -> io::Result<()> {
         )
         .with_prefix(format!("{arg:?}"));
 
-        let mut reader = Reader::new(progress.wrap_read(file));
+        let file = progress.wrap_read(file);
+
+        let uncompressed: Box<dyn io::Read> = if arg.extension() == Some(OsStr::new("zst")) {
+            Box::new(zstd::Decoder::new(file)?)
+        } else {
+            Box::new(file)
+        };
+
+        let mut reader = Reader::new(uncompressed);
         for game in reader.read_games(&mut ToLichessGame) {
             let (_game_id, game) = game??;
             progress.set_message(game.date.to_string());
