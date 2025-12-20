@@ -40,7 +40,11 @@ impl Tags {
                     .map_err(|err| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("invalid game id in Site tag: {}", err),
+                            format!(
+                                "invalid game id in Site tag {:?}: {}",
+                                value.decode_utf8_lossy(),
+                                err
+                            ),
                         )
                     })?;
             }
@@ -49,7 +53,7 @@ impl Tags {
                     |err| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("invalid White tag: {}", err),
+                            format!("invalid White tag: {} @ {:?}", err, self.game_id),
                         )
                     },
                 )?);
@@ -59,7 +63,7 @@ impl Tags {
                     |err| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("invalid Black tag: {}", err),
+                            format!("invalid Black tag: {} @ {:?}", err, self.game_id),
                         )
                     },
                 )?);
@@ -68,7 +72,12 @@ impl Tags {
                 self.white_elo = Some(Rating::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("invalid WhiteElo tag: {}", err),
+                        format!(
+                            "invalid WhiteElo tag {:?}: {} @ {:?}",
+                            value.decode_utf8_lossy(),
+                            err,
+                            self.game_id
+                        ),
                     )
                 })?);
             }
@@ -76,7 +85,12 @@ impl Tags {
                 self.black_elo = Some(Rating::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("invalid BlackElo tag: {}", err),
+                        format!(
+                            "invalid BlackElo tag {:?}: {} @ {:?}",
+                            value.decode_utf8_lossy(),
+                            err,
+                            self.game_id
+                        ),
                     )
                 })?);
             }
@@ -85,7 +99,7 @@ impl Tags {
                     |err| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("invalid WhiteTitle tag: {}", err),
+                            format!("invalid WhiteTitle tag: {} @ {:?}", err, self.game_id),
                         )
                     },
                 )?);
@@ -95,7 +109,7 @@ impl Tags {
                     |err| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("invalid BlackTitle tag: {}", err),
+                            format!("invalid BlackTitle tag: {} @ {:?}", err, self.game_id),
                         )
                     },
                 )?);
@@ -104,7 +118,12 @@ impl Tags {
                 self.date = Some(LaxDate::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("invalid Date tag: {}", err),
+                        format!(
+                            "invalid Date tag {:?}: {} @ {:?}",
+                            value.decode_utf8_lossy(),
+                            err,
+                            self.game_id
+                        ),
                     )
                 })?);
             }
@@ -112,7 +131,12 @@ impl Tags {
                 self.variant = Some(Variant::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("invalid Variant tag: {}", err),
+                        format!(
+                            "invalid Variant tag {:?}: {} @ {:?}",
+                            value.decode_utf8_lossy(),
+                            err,
+                            self.game_id
+                        ),
                     )
                 })?);
             }
@@ -120,7 +144,12 @@ impl Tags {
                 self.fen = Some(Fen::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("invalid FEN tag: {}", err),
+                        format!(
+                            "invalid FEN tag {:?}: {} @ {:?}",
+                            value.decode_utf8_lossy(),
+                            err,
+                            self.game_id
+                        ),
                     )
                 })?);
             }
@@ -143,6 +172,10 @@ struct Movetext {
 
 impl Movetext {
     fn begin(tags: Tags) -> io::Result<Movetext> {
+        let game_id = tags
+            .game_id
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing game id"))?;
+
         let variant = tags.variant.unwrap_or_default();
         let (pos, need_setup) = match tags.fen {
             None => (VariantPosition::new(variant), variant != Variant::Chess),
@@ -151,7 +184,7 @@ impl Movetext {
                     .map_err(|err| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("invalid setup: {}", err),
+                            format!("invalid setup in game {}: {}", game_id, err),
                         )
                     })?,
                 true,
@@ -159,32 +192,43 @@ impl Movetext {
         };
 
         Ok(Movetext {
-            game_id: tags
-                .game_id
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing game id"))?,
+            game_id,
             players: ByColor {
                 white: GamePlayer {
                     title: tags.white_title,
                     name: tags.white.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "missing white name")
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("missing white name in game {}", game_id),
+                        )
                     })?,
                     rating: tags.white_elo.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "missing white rating")
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("missing white rating in game {}", game_id),
+                        )
                     })?,
                 },
                 black: GamePlayer {
                     title: tags.black_title,
                     name: tags.black.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "missing black name")
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("missing black name in game {}", game_id),
+                        )
                     })?,
                     rating: tags.black_elo.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "missing black rating")
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("missing black rating in game {}", game_id),
+                        )
                     })?,
                 },
             },
-            date: tags
-                .date
-                .ok_or(io::Error::new(io::ErrorKind::InvalidData, "missing date"))?,
+            date: tags.date.ok_or(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing date in game {}", game_id),
+            ))?,
             setup: need_setup.then(|| {
                 PackedSetup::pack_variant_normalized(
                     &pos.to_setup(shakmaty::EnPassantMode::Legal),
@@ -279,8 +323,8 @@ impl Visitor for ToLichessGame {
 fn main() -> io::Result<()> {
     let mut reader = Reader::new(io::stdin());
     for game in reader.read_games(&mut ToLichessGame) {
-        let (game_id, _) = game??;
-        println!("id: {}", game_id);
+        let (game_id, game) = game??;
+        //println!("id: {}", game_id);
     }
     Ok(())
 }
