@@ -1,4 +1,6 @@
 use crate::packed::{LaxDate, pack_bytes, pack_string, unpack_bytes, unpack_string};
+use btoi::btou;
+use thiserror::Error;
 
 use bytes::{Buf, BufMut};
 
@@ -67,6 +69,41 @@ pub enum Speed {
     Classical,
     Correspondence,
 }
+
+impl Speed {
+    fn from_seconds_and_increment(seconds: u32, increment: u32) -> Speed {
+        let total = seconds.saturating_add(increment.saturating_mul(40));
+
+        if total < 30 {
+            Speed::UltraBullet
+        } else if total < 100 {
+            Speed::Bullet
+        } else if total < 480 {
+            Speed::Blitz
+        } else if total < 1500 {
+            Speed::Rapid
+        } else if total < 21_600 {
+            Speed::Classical
+        } else {
+            Speed::Correspondence
+        }
+    }
+
+    pub fn from_time_control_tag(value: &[u8]) -> Result<Speed, InvalidSpeed> {
+        if value == b"-" {
+            return Ok(Speed::Correspondence);
+        }
+
+        let mut parts = value.splitn(2, |&ch| ch == b'+');
+        let seconds = btou(parts.next().expect("first part")).map_err(|_| InvalidSpeed)?;
+        let increment = btou(parts.next().ok_or(InvalidSpeed)?).map_err(|_| InvalidSpeed)?;
+        Ok(Speed::from_seconds_and_increment(seconds, increment))
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("Invalid speed")]
+pub struct InvalidSpeed;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum RatingMode {
@@ -164,5 +201,26 @@ impl LichessGame {
             setup,
             moves,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_speed_from_time_control_tag() {
+        assert_eq!(
+            Speed::from_time_control_tag(b"-").unwrap(),
+            Speed::Correspondence
+        );
+        assert_eq!(
+            Speed::from_time_control_tag(b"60+0").unwrap(),
+            Speed::Bullet
+        );
+        assert_eq!(
+            Speed::from_time_control_tag(b"120+2").unwrap(),
+            Speed::Blitz
+        );
     }
 }

@@ -1,5 +1,12 @@
+use clap::Parser;
+use indicatif::ProgressBar;
+use indicatif::ProgressDrawTarget;
+use indicatif::ProgressStyle;
+
+use std::fs::File;
 use std::io;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 
 use lila_openingexplorer4::packed::{
     GameId, GamePlayer, LaxDate, LichessGame, Rating, RatingMode, Speed,
@@ -23,6 +30,7 @@ struct Tags {
     black_elo: Option<Rating>,
     white_title: Option<String>,
     black_title: Option<String>,
+    speed: Option<Speed>,
     date: Option<LaxDate>,
     variant: Option<Variant>,
     fen: Option<Fen>,
@@ -127,6 +135,21 @@ impl Tags {
                     )
                 })?);
             }
+            b"TimeControl" => {
+                self.speed = Some(Speed::from_time_control_tag(value.as_bytes()).map_err(
+                    |err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid TimeControl tag {:?}: {} @ {:?}",
+                                value.decode_utf8_lossy(),
+                                err,
+                                self.game_id
+                            ),
+                        )
+                    },
+                )?);
+            }
             b"Variant" => {
                 self.variant = Some(Variant::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
@@ -163,6 +186,7 @@ struct Movetext {
     game_id: GameId,
     players: ByColor<GamePlayer>,
     date: LaxDate,
+    speed: Speed,
     setup: Option<PackedSetup>,
 
     pos: VariantPosition,
@@ -225,6 +249,12 @@ impl Movetext {
                     })?,
                 },
             },
+            speed: tags.speed.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing speed in game {}", game_id),
+                )
+            })?,
             date: tags.date.ok_or(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("missing date in game {}", game_id),
@@ -311,7 +341,7 @@ impl Visitor for ToLichessGame {
                 players: movetext.players,
                 date: movetext.date,
                 outcome: movetext.outcome,
-                speed: Speed::Classical, // todo
+                speed: movetext.speed,
                 rating_mode: RatingMode::Rated,
                 setup: movetext.setup,
                 moves: movetext.moves,
@@ -320,11 +350,35 @@ impl Visitor for ToLichessGame {
     }
 }
 
+#[derive(Parser)]
+struct Args {
+    pgns: Vec<PathBuf>,
+}
+
 fn main() -> io::Result<()> {
-    let mut reader = Reader::new(io::stdin());
-    for game in reader.read_games(&mut ToLichessGame) {
-        let (game_id, game) = game??;
-        //println!("id: {}", game_id);
+    let args = Args::parse();
+
+    for arg in args.pgns {
+        let file = File::open(&arg)?;
+        let progress = ProgressBar::with_draw_target(
+            Some(file.metadata()?.len()),
+            ProgressDrawTarget::stdout_with_hz(4),
+        )
+        .with_style(
+            ProgressStyle::with_template(
+                "{spinner} {prefix} {msg} {wide_bar} {bytes_per_sec:>14} {eta:>7}",
+            )
+            .expect("progress template"),
+        )
+        .with_prefix(format!("{arg:?}"));
+
+        let mut reader = Reader::new(progress.wrap_read(file));
+        for game in reader.read_games(&mut ToLichessGame) {
+            let (_game_id, game) = game??;
+            progress.set_message(game.date.to_string());
+        }
+
+        progress.finish();
     }
     Ok(())
 }
