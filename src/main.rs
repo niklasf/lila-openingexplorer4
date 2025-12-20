@@ -379,7 +379,9 @@ struct Args {
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
-    let keyspace = fjall::Config::new("_db").open_transactional()?;
+    let keyspace = fjall::Config::new("_db")
+        .cache_size(32 * 1024 * 1024 * 1024)
+        .open_transactional()?;
     let games_partition = keyspace.open_partition(
         "lichess_game",
         PartitionCreateOptions::default().max_memtable_size(64 * 1024 * 1024),
