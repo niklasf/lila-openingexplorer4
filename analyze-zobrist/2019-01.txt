@@ -1,5 +1,6 @@
 Processed 0 hashes
 Processed 1073741824 hashes
+
 1 positions with 33832852 occurences
 1 positions with 19735553 occurences
 1 positions with 8297398 occurences
@@ -9581,4 +9582,7 @@ Processed 1073741824 hashes
 6488789 positions with 3 occurences
 24284056 positions with 2 occurences
 1661813104 positions with 1 occurences
-1704763344 distinct positions, 2237864250 total possitions
+
+533100906 repeated positions
+1704763344 distinct positions
+2237864250 total positions

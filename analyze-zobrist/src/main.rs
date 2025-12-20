@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     fs::{File, OpenOptions},
     io,
@@ -59,11 +60,24 @@ fn main() -> io::Result<()> {
         *positions_by_occurences.entry(occurences).or_insert(0) += 1;
     }
 
+    println!();
+
     let mut positions_by_occurences = positions_by_occurences.into_iter().collect::<Vec<_>>();
-    positions_by_occurences.sort_by_key(|&(occurences, positions)| (positions, occurences));
-    for (occurences, positions) in positions_by_occurences {
+    positions_by_occurences
+        .sort_by_key(|&(occurences, positions)| (positions, Reverse(occurences)));
+    for (occurences, positions) in &positions_by_occurences {
         println!("{} positions with {} occurences", positions, occurences);
     }
+
+    println!();
+
+    let distinct_positions = positions_by_occurences
+        .iter()
+        .map(|&(_, positions)| positions)
+        .sum::<usize>();
+    println!("{} repeated positions", mmap.len() / 8 - distinct_positions);
+    println!("{} distinct positions", distinct_positions);
+    println!("{} total positions", mmap.len() / 8);
 
     Ok(())
 }
