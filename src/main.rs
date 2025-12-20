@@ -27,6 +27,8 @@ use shakmaty::{Outcome, fen::Fen, packed::PackedUciMove, variant::VariantPositio
 
 struct ToLichessGame;
 
+const MAX_PLIES: usize = 50;
+
 #[derive(Default)]
 struct Tags {
     game_id: Option<GameId>,
@@ -275,13 +277,17 @@ impl Movetext {
             }),
 
             pos,
-            moves: Vec::new(),
-            hashes: Vec::new(),
+            moves: Vec::with_capacity(MAX_PLIES),
+            hashes: Vec::with_capacity(MAX_PLIES),
             outcome: Outcome::Unknown,
         })
     }
 
     fn push(&mut self, san: SanPlus) -> io::Result<()> {
+        if self.moves.len() >= MAX_PLIES {
+            return Ok(());
+        }
+
         let m = san.san.to_move(&self.pos).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
