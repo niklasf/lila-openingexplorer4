@@ -13,8 +13,16 @@ pub struct LaxDate {
 }
 
 impl LaxDate {
-    fn year(&self) -> u32 {
+    pub fn year(&self) -> u32 {
         u32::from(self.year_since_1900) + 1900
+    }
+
+    pub fn month(&self) -> Option<u8> {
+        self.month.map(|m| m.get())
+    }
+
+    pub fn day(&self) -> Option<u8> {
+        self.day.map(|d| d.get())
     }
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
@@ -63,7 +71,7 @@ impl LaxDate {
                 .map(|part| {
                     btou::<u8>(part)
                         .ok()
-                        .filter(|&m| m <= 12)
+                        .filter(|&m| m <= 31)
                         .and_then(NonZeroU8::new)
                         .ok_or(InvalidLaxDate)
                 })
@@ -143,5 +151,13 @@ mod tests {
 
             left_buf.cmp(&right_buf) == left.cmp(&right)
         }
+    }
+
+    #[test]
+    fn test_from_ascii() {
+        let date = LaxDate::from_ascii(b"2025.11.13").expect("valid date");
+        assert_eq!(date.year(), 2025);
+        assert_eq!(date.month(), Some(11));
+        assert_eq!(date.day(), Some(13));
     }
 }
