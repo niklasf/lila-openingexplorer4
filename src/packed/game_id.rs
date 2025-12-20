@@ -8,7 +8,7 @@ use thiserror::Error;
 pub struct GameId(u64);
 
 impl GameId {
-    const SIZE: usize = 6;
+    pub const SIZE: usize = 6;
 
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; Self::SIZE];

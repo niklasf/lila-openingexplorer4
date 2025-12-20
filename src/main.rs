@@ -1,8 +1,11 @@
 use clap::Parser;
 use fjall::PartitionCreateOptions;
+use fjall::Slice;
 use indicatif::ProgressBar;
 use indicatif::ProgressDrawTarget;
 use indicatif::ProgressStyle;
+use shakmaty::zobrist::Zobrist32;
+use shakmaty::zobrist::ZobristHash;
 use std::error::Error;
 
 use std::ffi::OsStr;
@@ -194,6 +197,7 @@ struct Movetext {
 
     pos: VariantPosition,
     moves: Vec<PackedUciMove>,
+    hashes: Vec<Zobrist32>,
     outcome: Outcome,
 }
 
@@ -272,6 +276,7 @@ impl Movetext {
 
             pos,
             moves: Vec::new(),
+            hashes: Vec::new(),
             outcome: Outcome::Unknown,
         })
     }
@@ -283,17 +288,29 @@ impl Movetext {
                 format!("illegal san {} in game {}: {}", san, self.game_id, err),
             )
         })?;
+
+        let hash = self.pos.zobrist_hash(shakmaty::EnPassantMode::Legal);
+        self.hashes.push(hash);
+
         let uci = UciMove::from_chess960(m);
         self.moves.push(PackedUciMove::pack(uci));
+
         self.pos.play_unchecked(m);
+
         Ok(())
     }
+}
+
+struct PreparedLichessGame {
+    game_id: GameId,
+    game: LichessGame,
+    hashes: Vec<Zobrist32>,
 }
 
 impl Visitor for ToLichessGame {
     type Tags = Tags;
     type Movetext = Movetext;
-    type Output = io::Result<(GameId, LichessGame)>;
+    type Output = io::Result<PreparedLichessGame>;
 
     fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
         ControlFlow::Continue(Tags::default())
@@ -338,9 +355,9 @@ impl Visitor for ToLichessGame {
     }
 
     fn end_game(&mut self, movetext: Self::Movetext) -> Self::Output {
-        Ok((
-            movetext.game_id,
-            LichessGame {
+        Ok(PreparedLichessGame {
+            game_id: movetext.game_id,
+            game: LichessGame {
                 players: movetext.players,
                 date: movetext.date,
                 outcome: movetext.outcome,
@@ -349,7 +366,8 @@ impl Visitor for ToLichessGame {
                 setup: movetext.setup,
                 moves: movetext.moves,
             },
-        ))
+            hashes: movetext.hashes,
+        })
     }
 }
 
@@ -361,9 +379,13 @@ struct Args {
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
-    let keyspace = fjall::Config::new("_db").open()?;
+    let keyspace = fjall::Config::new("_db").open_transactional()?;
     let games_partition = keyspace.open_partition(
         "lichess_game",
+        PartitionCreateOptions::default().max_memtable_size(64 * 1024 * 1024),
+    )?;
+    let index_partition = keyspace.open_partition(
+        "lichess_index",
         PartitionCreateOptions::default().max_memtable_size(64 * 1024 * 1024),
     )?;
 
@@ -390,14 +412,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
 
         let mut reader = Reader::new(uncompressed);
-        for game in reader.read_games(&mut ToLichessGame) {
-            let (game_id, game) = game??;
-            progress.set_message(game.date.to_string());
+        for prepared in reader.read_games(&mut ToLichessGame) {
+            let prepared = prepared??;
+            progress.set_message(prepared.game.date.to_string());
 
             let mut packed_game = Vec::new();
-            game.pack_entire(&mut packed_game);
+            prepared.game.pack_entire(&mut packed_game);
 
-            games_partition.insert(game_id.to_bytes(), packed_game)?;
+            games_partition.insert(prepared.game_id.to_bytes(), packed_game)?;
+
+            for hash in prepared.hashes {
+                index_partition.update_fetch(u32::from(hash).to_be_bytes(), |value| {
+                    let value: &[u8] = value.map_or(&[], |v| v);
+                    let (chunks, tail) = value.as_chunks();
+                    assert!(tail.is_empty());
+                    let mut chunks: Vec<[u8; GameId::SIZE]> = chunks.to_owned();
+                    if chunks.len() < 20 {
+                        match chunks.binary_search(&prepared.game_id.to_bytes()) {
+                            Ok(_) => {} // already exists
+                            Err(pos) => chunks.insert(pos, prepared.game_id.to_bytes()),
+                        }
+                    }
+                    Some(Slice::new(chunks.as_flattened()))
+                })?;
+            }
         }
 
         progress.finish();
