@@ -1,7 +1,9 @@
 use clap::Parser;
+use fjall::PartitionCreateOptions;
 use indicatif::ProgressBar;
 use indicatif::ProgressDrawTarget;
 use indicatif::ProgressStyle;
+use std::error::Error;
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -356,8 +358,14 @@ struct Args {
     pgns: Vec<PathBuf>,
 }
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+
+    let keyspace = fjall::Config::new("_db").open()?;
+    let games_partition = keyspace.open_partition(
+        "lichess_game",
+        PartitionCreateOptions::default().max_memtable_size(64 * 1024 * 1024),
+    )?;
 
     for arg in args.pgns {
         let file = File::open(&arg)?;
@@ -383,8 +391,13 @@ fn main() -> io::Result<()> {
 
         let mut reader = Reader::new(uncompressed);
         for game in reader.read_games(&mut ToLichessGame) {
-            let (_game_id, game) = game??;
+            let (game_id, game) = game??;
             progress.set_message(game.date.to_string());
+
+            let mut packed_game = Vec::new();
+            game.pack_entire(&mut packed_game);
+
+            games_partition.insert(game_id.to_bytes(), packed_game)?;
         }
 
         progress.finish();
