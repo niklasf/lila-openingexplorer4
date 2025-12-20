@@ -442,7 +442,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let mut chunks: Vec<[u8; GameId::SIZE]> = chunks.to_owned();
                         if chunks.len() < 20 {
                             match chunks.binary_search(&prepared.game_id.to_bytes()) {
-                                Ok(_) => {} // already exists
+                                Ok(_) => {} // Already exists
                                 Err(pos) => chunks.insert(pos, prepared.game_id.to_bytes()),
                             }
                         }
