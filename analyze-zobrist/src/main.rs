@@ -17,11 +17,17 @@ struct Args {
     sort: bool,
     #[clap(long)]
     chunk_bytes: Option<usize>,
+    #[clap(long)]
+    take_chunks: Option<usize>,
 }
 
 impl Args {
     pub fn chunk_bytes(&self) -> usize {
         self.chunk_bytes.unwrap_or(128 * 1024 * 1024 * 1024)
+    }
+
+    pub fn take_chunks(&self) -> usize {
+        self.num_chunks.unwrap_or(usize::MAX)
     }
 }
 
@@ -44,6 +50,7 @@ fn main() -> io::Result<()> {
 
     for (i, (occurences, _hash)) in mmap
         .chunks(args.chunk_bytes())
+        .take(args.take_chunks())
         .map(|chunk| {
             let (hashes, tail) = chunk.as_chunks::<8>();
             assert!(tail.is_empty(), "expected multiple of 8 bytes");
@@ -88,7 +95,7 @@ fn do_sort(file: &File, args: &Args) -> io::Result<()> {
     let chunks = mmap.chunks_mut(args.chunk_bytes());
     let len = chunks.len();
 
-    for (i, chunk) in chunks.enumerate() {
+    for (i, chunk) in chunks.take(args.take_chunks()).enumerate() {
         println!("Sorting chunk {}/{} ...", i + 1, len);
         let (hashes, tail) = chunk.as_chunks_mut::<8>();
         assert!(tail.is_empty(), "expected multiple of 8 bytes");
