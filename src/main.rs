@@ -1,12 +1,14 @@
 use clap::Parser;
-use fjall::PartitionCreateOptions;
-use fjall::Slice;
+use fjall::KeyspaceCreateOptions;
+use fjall::SingleWriterTxDatabase;
 use indicatif::ProgressBar;
 use indicatif::ProgressDrawTarget;
 use indicatif::ProgressStyle;
-use shakmaty::zobrist::Zobrist32;
+use itertools::Itertools;
+use shakmaty::zobrist::Zobrist64;
 use shakmaty::zobrist::ZobristHash;
 use std::error::Error;
+use tikv_jemallocator::Jemalloc;
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -24,6 +26,9 @@ use shakmaty::uci::UciMove;
 use shakmaty::variant::Variant;
 use shakmaty::{ByColor, Position};
 use shakmaty::{Outcome, fen::Fen, packed::PackedUciMove, variant::VariantPosition};
+
+#[global_allocator]
+static ALLOC: Jemalloc = Jemalloc;
 
 struct ToLichessGame;
 
@@ -199,7 +204,7 @@ struct Movetext {
 
     pos: VariantPosition,
     moves: Vec<PackedUciMove>,
-    hashes: Vec<Zobrist32>,
+    hashes: Vec<Zobrist64>,
     outcome: Outcome,
 }
 
@@ -310,7 +315,7 @@ impl Movetext {
 struct PreparedLichessGame {
     game_id: GameId,
     game: LichessGame,
-    hashes: Vec<Zobrist32>,
+    hashes: Vec<Zobrist64>,
 }
 
 impl Visitor for ToLichessGame {
@@ -385,17 +390,11 @@ struct Args {
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
-    let keyspace = fjall::Config::new("_db")
+    let db = SingleWriterTxDatabase::builder("_db")
         .cache_size(32 * 1024 * 1024 * 1024)
-        .open_transactional()?;
-    let games_partition = keyspace.open_partition(
-        "lichess_game",
-        PartitionCreateOptions::default().max_memtable_size(64 * 1024 * 1024),
-    )?;
-    let index_partition = keyspace.open_partition(
-        "lichess_index",
-        PartitionCreateOptions::default().max_memtable_size(64 * 1024 * 1024),
-    )?;
+        .open()?;
+    let games_partition = db.keyspace("lichess_game", KeyspaceCreateOptions::default)?;
+    let index_partition = db.keyspace("lichess_index", KeyspaceCreateOptions::default)?;
 
     for arg in args.pgns {
         let file = File::open(&arg)?;
@@ -420,35 +419,49 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
 
         let mut reader = Reader::new(uncompressed);
-        for prepared in reader.read_games(&mut ToLichessGame) {
-            let prepared = prepared??;
-            progress.set_message(prepared.game.date.to_string());
+        for chunk in &reader
+            .read_games(&mut ToLichessGame)
+            .into_iter()
+            .chunks(10000)
+        {
+            let mut write_tx = db.write_tx();
 
-            let mut packed_game = Vec::new();
-            prepared.game.pack_entire(&mut packed_game);
+            for prepared in chunk {
+                let mut prepared = prepared??;
+                progress.set_message(prepared.game.date.to_string());
 
-            let mut write_tx = keyspace.write_tx();
+                let mut packed_game = Vec::new();
+                prepared.game.pack_entire(&mut packed_game);
 
-            write_tx.insert(&games_partition, prepared.game_id.to_bytes(), packed_game);
+                write_tx.insert(&games_partition, prepared.game_id.to_bytes(), packed_game);
 
-            for hash in prepared.hashes {
-                write_tx.update_fetch(
-                    &index_partition,
-                    u32::from(hash).to_be_bytes(),
-                    |value| {
-                        let value: &[u8] = value.map_or(&[], |v| v);
-                        let (chunks, tail) = value.as_chunks();
-                        assert!(tail.is_empty());
-                        let mut chunks: Vec<[u8; GameId::SIZE]> = chunks.to_owned();
-                        if chunks.len() < 20 {
-                            match chunks.binary_search(&prepared.game_id.to_bytes()) {
-                                Ok(_) => {} // Already exists
-                                Err(pos) => chunks.insert(pos, prepared.game_id.to_bytes()),
-                            }
-                        }
-                        Some(Slice::new(chunks.as_flattened()))
-                    },
-                )?;
+                for hash in prepared.hashes {
+                    write_tx.insert(
+                        &index_partition,
+                        &u64::from(hash).to_be_bytes()[0..5],
+                        prepared.game_id.to_bytes(),
+                    );
+                }
+
+                //for hash in prepared.hashes {
+                //    write_tx.update_fetch(
+                //        &index_partition,
+                //        u32::from(hash).to_be_bytes(),
+                //        |value| {
+                //            let value: &[u8] = value.map_or(&[], |v| v);
+                //            let (chunks, tail) = value.as_chunks();
+                //            assert!(tail.is_empty());
+                //            let mut chunks: Vec<[u8; GameId::SIZE]> = chunks.to_owned();
+                //            if chunks.len() < 20 {
+                //                match chunks.binary_search(&prepared.game_id.to_bytes()) {
+                //                    Ok(_) => {} // Already exists
+                //                    Err(pos) => chunks.insert(pos, prepared.game_id.to_bytes()),
+                //                }
+                //            }
+                //            Some(Slice::new(chunks.as_flattened()))
+                //        },
+                //    )?;
+                //}
             }
 
             write_tx.commit()?;
