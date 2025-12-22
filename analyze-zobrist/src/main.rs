@@ -27,7 +27,7 @@ impl Args {
     }
 
     pub fn take_chunks(&self) -> usize {
-        self.num_chunks.unwrap_or(usize::MAX)
+        self.take_chunks.unwrap_or(usize::MAX)
     }
 }
 
@@ -72,16 +72,23 @@ fn main() -> io::Result<()> {
     let mut positions_by_occurences = positions_by_occurences.into_iter().collect::<Vec<_>>();
     positions_by_occurences
         .sort_by_key(|&(occurences, positions)| (positions, Reverse(occurences)));
-    for (occurences, positions) in &positions_by_occurences {
-        println!("{} positions with {} occurences", positions, occurences);
-    }
-
-    println!();
 
     let distinct_positions = positions_by_occurences
         .iter()
         .map(|&(_, positions)| positions)
         .sum::<usize>();
+
+    for &(occurences, positions) in &positions_by_occurences {
+        println!(
+            "{} occurences: {} positions ({:.3}% of distinct)",
+            occurences,
+            positions,
+            positions as f64 / distinct_positions as f64 * 100.0
+        );
+    }
+
+    println!();
+
     println!("{} repeated positions", mmap.len() / 8 - distinct_positions);
     println!("{} distinct positions", distinct_positions);
     println!("{} total positions", mmap.len() / 8);

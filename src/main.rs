@@ -1,6 +1,8 @@
 use clap::Parser;
+use fjall::CompressionType;
 use fjall::KeyspaceCreateOptions;
 use fjall::SingleWriterTxDatabase;
+use fjall::config::CompressionPolicy;
 use indicatif::ProgressBar;
 use indicatif::ProgressDrawTarget;
 use indicatif::ProgressStyle;
@@ -391,10 +393,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     let db = SingleWriterTxDatabase::builder("_db")
-        .cache_size(32 * 1024 * 1024 * 1024)
+        .cache_size(1024 * 1024 * 1024)
+        .journal_compression(CompressionType::None)
         .open()?;
     let games_partition = db.keyspace("lichess_game", KeyspaceCreateOptions::default)?;
-    let index_partition = db.keyspace("lichess_index", KeyspaceCreateOptions::default)?;
+    let index_partition = db.keyspace("lichess_index", || {
+        KeyspaceCreateOptions::default()
+            .data_block_compression_policy(CompressionPolicy::disabled())
+    })?;
 
     for arg in args.pgns {
         let file = File::open(&arg)?;
@@ -419,15 +425,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
 
         let mut reader = Reader::new(uncompressed);
-        for chunk in &reader
-            .read_games(&mut ToLichessGame)
-            .into_iter()
-            .chunks(10000)
-        {
+        for chunk in &reader.read_games(&mut ToLichessGame).into_iter().chunks(1) {
             let mut write_tx = db.write_tx();
 
             for prepared in chunk {
-                let mut prepared = prepared??;
+                let prepared = prepared??;
                 progress.set_message(prepared.game.date.to_string());
 
                 let mut packed_game = Vec::new();
