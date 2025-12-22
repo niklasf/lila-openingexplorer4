@@ -89,9 +89,16 @@ fn main() -> io::Result<()> {
 
     println!();
 
-    println!("{} repeated positions", mmap.len() / 8 - distinct_positions);
+    let total_positions = min(
+        mmap.len(),
+        args.take_chunks().saturating_mul(args.chunk_bytes()),
+    ) / 8;
+    println!(
+        "{} repeated positions",
+        total_positions - distinct_positions
+    );
     println!("{} distinct positions", distinct_positions);
-    println!("{} total positions", mmap.len() / 8);
+    println!("{} total positions", total_positions);
 
     Ok(())
 }
