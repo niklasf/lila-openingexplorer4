@@ -61,7 +61,7 @@ fn main() -> io::Result<()> {
         .enumerate()
     {
         if i.is_multiple_of(1024 * 1024 * 1024) {
-            println!("Processed {} hashes", i);
+            println!("Processed {} runs", i);
         }
 
         *positions_by_occurences.entry(occurences).or_insert(0) += 1;
