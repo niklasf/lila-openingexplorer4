@@ -1,5 +1,6 @@
 use std::{
     cmp::Reverse,
+    cmp::min,
     collections::HashMap,
     fs::{File, OpenOptions},
     io,
