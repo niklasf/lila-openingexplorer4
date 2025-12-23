@@ -15,11 +15,28 @@ static ALLOC: Jemalloc = Jemalloc;
 struct Args {
     pgns: Vec<PathBuf>,
     #[clap(long, default_value = "_db")]
-    db: String,
+    db: PathBuf,
 }
 
 fn main() -> Result<(), io::Error> {
     let args = Args::parse();
+
+    let db = Database::builder(args.db)
+        .cache_size(1024 * 1024 * 1024)
+        .open()
+        .expect("open db");
+
+    //let db = SingleWriterTxDatabase::builder("_db")
+    //    .cache_size(1024 * 1024 * 1024)
+    //    .journal_compression(CompressionType::None)
+    //    .open()?;
+    //let games_partition = db.keyspace("lichess_game", KeyspaceCreateOptions::default)?;
+    let index_partition = db
+        .keyspace("lichess_index", || {
+            KeyspaceCreateOptions::default()
+                .data_block_compression_policy(CompressionPolicy::disabled())
+        })
+        .expect("open keyspace");
 
     thread::scope(|s| {
         let (parsed_tx, parsed_rx) = channel::bounded(128);
@@ -37,19 +54,10 @@ fn main() -> Result<(), io::Error> {
             });
         }
 
-        for i in 0..2 {
-            let path = format!("{}_{}", &args.db, i);
+        for _ in 0..1 {
             let prepared_rx = prepared_rx.clone();
+            let index_partition = index_partition.clone();
             s.spawn(move || {
-                let db = Database::builder(path)
-                    .cache_size(1024 * 1024 * 1024)
-                    .open()
-                    .expect("open db");
-
-                let index_partition = db
-                    .keyspace("lichess_index", KeyspaceCreateOptions::default)
-                    .expect("open keyspace");
-
                 for prepared in prepared_rx {
                     for hash in prepared.hashes {
                         index_partition
@@ -94,7 +102,6 @@ fn main() -> Result<(), io::Error> {
 
             progress.finish();
         }
-
         Ok(())
     })
 }
