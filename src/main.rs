@@ -6,6 +6,7 @@ use fjall::{Database, KeyspaceCreateOptions, config::CompressionPolicy};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame};
 use pgn_reader::Reader;
+use rocksdb::{BlockBasedOptions, Cache, WriteBatchWithTransaction};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -20,23 +21,6 @@ struct Args {
 
 fn main() -> Result<(), io::Error> {
     let args = Args::parse();
-
-    let db = Database::builder(args.db)
-        .cache_size(4 * 1024 * 1024 * 1024)
-        .open()
-        .expect("open db");
-
-    //let db = SingleWriterTxDatabase::builder("_db")
-    //    .cache_size(1024 * 1024 * 1024)
-    //    .journal_compression(CompressionType::None)
-    //    .open()?;
-    //let games_partition = db.keyspace("lichess_game", KeyspaceCreateOptions::default)?;
-    let index_partition = db
-        .keyspace("lichess_index", || {
-            KeyspaceCreateOptions::default()
-                .data_block_compression_policy(CompressionPolicy::disabled())
-        })
-        .expect("open keyspace");
 
     thread::scope(|s| {
         let (parsed_tx, parsed_rx) = channel::bounded(128);
@@ -54,23 +38,29 @@ fn main() -> Result<(), io::Error> {
             });
         }
 
-        for _ in 0..1 {
+        {
+            let mut block_opts = BlockBasedOptions::default();
+            block_opts.set_block_cache(&Cache::new_lru_cache(4 * 1024 * 1024 * 1024));
+
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            opts.set_block_based_table_factory(&block_opts);
+
+            let db = rocksdb::DB::open(&opts, args.db).unwrap();
             let prepared_rx = prepared_rx.clone();
-            let db = db.clone();
-            let index_partition = index_partition.clone();
             s.spawn(move || {
                 for prepared in prepared_rx {
-                    let mut write_batch = db.batch();
+                    let mut write_batch = WriteBatchWithTransaction::<false>::default();
 
                     for hash in prepared.hashes {
-                        write_batch.insert(
-                            &index_partition,
+                        write_batch.put(
                             &u64::from(hash).to_be_bytes()[0..5],
                             prepared.game_id.to_bytes(),
                         );
                     }
 
-                    write_batch.commit().expect("commit write batch");
+                    db.write(write_batch).expect("write batch");
                 }
             });
         }
