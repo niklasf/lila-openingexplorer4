@@ -22,7 +22,7 @@ fn main() -> Result<(), io::Error> {
     let args = Args::parse();
 
     let db = Database::builder(args.db)
-        .cache_size(1024 * 1024 * 1024)
+        .cache_size(4 * 1024 * 1024 * 1024)
         .open()
         .expect("open db");
 
@@ -56,17 +56,21 @@ fn main() -> Result<(), io::Error> {
 
         for _ in 0..1 {
             let prepared_rx = prepared_rx.clone();
+            let db = db.clone();
             let index_partition = index_partition.clone();
             s.spawn(move || {
                 for prepared in prepared_rx {
+                    let mut write_batch = db.batch();
+
                     for hash in prepared.hashes {
-                        index_partition
-                            .insert(
-                                &u64::from(hash).to_be_bytes()[0..5],
-                                prepared.game_id.to_bytes(),
-                            )
-                            .expect("insert hash")
+                        write_batch.insert(
+                            &index_partition,
+                            &u64::from(hash).to_be_bytes()[0..5],
+                            prepared.game_id.to_bytes(),
+                        );
                     }
+
+                    write_batch.commit().expect("commit write batch");
                 }
             });
         }
