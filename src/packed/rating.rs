@@ -1,10 +1,10 @@
-use crate::packed::{pack_int, unpack_int};
+use std::{fmt, str::FromStr};
+
 use btoi::btoi;
-use std::fmt;
-use std::str::FromStr;
+use bytes::{Buf, BufMut};
 use thiserror::Error;
 
-use bytes::{Buf, BufMut};
+use crate::packed::{pack_int, unpack_int};
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rating {
@@ -27,7 +27,7 @@ impl Rating {
     pub fn from_ascii(bytes: &[u8]) -> Result<Self, InvalidRating> {
         btoi::<i32>(bytes)
             .map_err(|_| InvalidRating)
-            .and_then(|value| Rating::try_from(value))
+            .and_then(Rating::try_from)
     }
 }
 

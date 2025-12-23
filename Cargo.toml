@@ -8,6 +8,7 @@ anyhow = "1.0.100"
 btoi = "0.5.0"
 bytes = "1.11.0"
 clap = { version = "4.5.53", features = ["derive"] }
+crossbeam = "0.8.4"
 fjall = { git = "https://github.com/fjall-rs/fjall.git" }
 indicatif = "0.18.3"
 itertools = "0.14.0"

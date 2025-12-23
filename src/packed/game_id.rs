@@ -1,7 +1,6 @@
-use bytes::Buf;
-use bytes::BufMut;
 use std::{fmt, fmt::Write, str::FromStr};
 
+use bytes::{Buf, BufMut};
 use thiserror::Error;
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -32,7 +31,7 @@ impl GameId {
         }
 
         let mut base62 = 0;
-        for c in bytes.into_iter().rev() {
+        for c in bytes.iter().rev() {
             base62 = u64::from(match c {
                 b'0'..=b'9' => c - b'0',
                 b'A'..=b'Z' => c - b'A' + 10,

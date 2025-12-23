@@ -1,8 +1,7 @@
+use std::{fmt, num::NonZeroU8, str::FromStr};
+
 use btoi::btou;
-use bytes::Buf;
-use bytes::BufMut;
-use std::str::FromStr;
-use std::{fmt, num::NonZeroU8};
+use bytes::{Buf, BufMut};
 use thiserror::Error;
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]

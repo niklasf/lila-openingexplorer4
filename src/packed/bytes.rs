@@ -1,7 +1,6 @@
 use bytes::{Buf, BufMut};
 
-use crate::packed::pack_uint;
-use crate::packed::unpack_uint;
+use crate::packed::{pack_uint, unpack_uint};
 
 pub fn pack_bytes<B: BufMut>(buf: &mut B, bytes: &[u8]) {
     pack_uint(buf, bytes.len() as u64);

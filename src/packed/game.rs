@@ -1,15 +1,12 @@
-use crate::packed::{LaxDate, pack_bytes, pack_string, unpack_bytes, unpack_string};
 use btoi::btou;
-use thiserror::Error;
-
 use bytes::{Buf, BufMut};
-
 use shakmaty::{
     ByColor, Color, KnownOutcome, Outcome,
     packed::{PackedSetup, PackedUciMove},
 };
+use thiserror::Error;
 
-use crate::packed::Rating;
+use crate::packed::{LaxDate, Rating, pack_bytes, pack_string, unpack_bytes, unpack_string};
 
 pub fn pack_outcome<B: BufMut>(buf: &mut B, outcome: Outcome) {
     buf.put_u8(match outcome {
@@ -46,7 +43,7 @@ pub struct GamePlayer {
 
 impl GamePlayer {
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        pack_string(buf, &self.title.as_ref().unwrap_or(&String::new()));
+        pack_string(buf, self.title.as_ref().unwrap_or(&String::new()));
         pack_string(buf, &self.name);
         self.rating.pack(buf);
     }
