@@ -5,7 +5,7 @@ use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame};
 use pgn_reader::Reader;
-use rocksdb::{SingleThreaded, SliceTransform, WriteBatchWithTransaction};
+use rocksdb::{SingleThreaded, WriteBatchWithTransaction};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -46,11 +46,7 @@ fn main() -> Result<(), io::Error> {
                 opts.optimize_for_point_lookup(8 * 1024);
                 opts.optimize_level_style_compaction(1024 * 1024 * 1024);
                 opts.set_max_background_jobs(6);
-                opts.set_memtable_factory(rocksdb::MemtableFactory::HashLinkList {
-                    bucket_count: 1024 * 1024,
-                });
-                opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(4));
-                opts.set_allow_concurrent_memtable_write(false);
+                opts.set_memtable_factory(rocksdb::MemtableFactory::Vector);
 
                 let db: rocksdb::DBWithThreadMode<SingleThreaded> =
                     rocksdb::DBWithThreadMode::open(&opts, args.db).unwrap();
