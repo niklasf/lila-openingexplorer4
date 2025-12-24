@@ -2,7 +2,7 @@ use std::{ffi::OsStr, fs::File, io, path::PathBuf, thread};
 
 use clap::Parser;
 use crossbeam::channel;
-use fjall::{Database, KeyspaceCreateOptions};
+use fjall::{Database, KeyspaceCreateOptions, config::CompressionPolicy};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame};
 use pgn_reader::Reader;
@@ -23,8 +23,6 @@ fn main() -> Result<(), io::Error> {
 
     let db = Database::builder(args.db)
         .cache_size(4 * 1024 * 1024 * 1024)
-        .worker_threads(6)
-        .max_cached_files(Some(500000))
         .open()
         .expect("open db");
 
@@ -34,7 +32,10 @@ fn main() -> Result<(), io::Error> {
     //    .open()?;
     //let games_partition = db.keyspace("lichess_game", KeyspaceCreateOptions::default)?;
     let index_partition = db
-        .keyspace("lichess_index", KeyspaceCreateOptions::default)
+        .keyspace("lichess_index", || {
+            KeyspaceCreateOptions::default()
+                .data_block_compression_policy(CompressionPolicy::disabled())
+        })
         .expect("open keyspace");
 
     thread::scope(|s| {
