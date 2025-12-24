@@ -520,6 +520,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58db607ef63b47ede3640944f69e0872bc169e938253bcaa8dcf32631638ceab"
 dependencies = [
  "byteorder-lite",
+ "bytes",
  "byteview",
  "crossbeam-skiplist",
  "enum_dispatch",
