@@ -1,12 +1,12 @@
+use std::sync::Arc;
 use std::{ffi::OsStr, fs::File, io, path::PathBuf, thread};
 
 use clap::Parser;
 use crossbeam::channel;
-use fjall::{Database, KeyspaceCreateOptions, config::CompressionPolicy};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame};
 use pgn_reader::Reader;
-use rocksdb::{BlockBasedOptions, Cache, WriteBatchWithTransaction};
+use rocksdb::WriteBatchWithTransaction;
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -38,16 +38,17 @@ fn main() -> Result<(), io::Error> {
             });
         }
 
-        {
-            let mut block_opts = BlockBasedOptions::default();
-            block_opts.set_block_cache(&Cache::new_lru_cache(4 * 1024 * 1024 * 1024));
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        opts.optimize_for_point_lookup(8 * 1024);
+        opts.optimize_level_style_compaction(1024 * 1024 * 1024);
+        opts.set_max_background_jobs(6);
+        opts.set_memtable_factory(rocksdb::MemtableFactory::Vector);
 
-            let mut opts = rocksdb::Options::default();
-            opts.create_if_missing(true);
-            opts.create_missing_column_families(true);
-            opts.set_block_based_table_factory(&block_opts);
-
-            let db = rocksdb::DB::open(&opts, args.db).unwrap();
+        let db = Arc::new(rocksdb::DB::open(&opts, args.db).unwrap());
+        for _ in 0..1 {
+            let db = db.clone();
             let prepared_rx = prepared_rx.clone();
             s.spawn(move || {
                 for prepared in prepared_rx {
