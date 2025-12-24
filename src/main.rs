@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::{ffi::OsStr, fs::File, io, path::PathBuf, thread};
 
 use clap::Parser;
@@ -6,7 +5,7 @@ use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame};
 use pgn_reader::Reader;
-use rocksdb::WriteBatchWithTransaction;
+use rocksdb::{SingleThreaded, SliceTransform, WriteBatchWithTransaction};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -38,19 +37,23 @@ fn main() -> Result<(), io::Error> {
             });
         }
 
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        opts.optimize_for_point_lookup(8 * 1024);
-        opts.optimize_level_style_compaction(1024 * 1024 * 1024);
-        opts.set_max_background_jobs(6);
-        opts.set_memtable_factory(rocksdb::MemtableFactory::Vector);
-
-        let db = Arc::new(rocksdb::DB::open(&opts, args.db).unwrap());
-        for _ in 0..1 {
-            let db = db.clone();
+        {
             let prepared_rx = prepared_rx.clone();
             s.spawn(move || {
+                let mut opts = rocksdb::Options::default();
+                opts.create_if_missing(true);
+                opts.create_missing_column_families(true);
+                opts.optimize_for_point_lookup(8 * 1024);
+                opts.optimize_level_style_compaction(1024 * 1024 * 1024);
+                opts.set_max_background_jobs(6);
+                opts.set_memtable_factory(rocksdb::MemtableFactory::HashLinkList {
+                    bucket_count: 1024 * 1024,
+                });
+                opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(4));
+                opts.set_allow_concurrent_memtable_write(false);
+
+                let db: rocksdb::DBWithThreadMode<SingleThreaded> =
+                    rocksdb::DBWithThreadMode::open(&opts, args.db).unwrap();
                 for prepared in prepared_rx {
                     let mut write_batch = WriteBatchWithTransaction::<false>::default();
 
