@@ -6,7 +6,9 @@ use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame};
 use pgn_reader::Reader;
-use rocksdb::{DB, WriteBatchWithTransaction};
+use rocksdb::{
+    BlockBasedOptions, Cache, DB, DataBlockIndexType, Options, WriteBatchWithTransaction,
+};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -41,13 +43,31 @@ fn main() -> Result<(), io::Error> {
         {
             let prepared_rx = prepared_rx.clone();
             s.spawn(move || {
-                let mut opts = rocksdb::Options::default();
+                let cache = Cache::new_lru_cache(8 * 1024 * 1024 * 1024);
+
+                let mut table_opts = BlockBasedOptions::default();
+                table_opts.set_block_cache(&cache);
+                table_opts.set_block_size(16 * 1024);
+                table_opts.set_cache_index_and_filter_blocks(true);
+                table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+                table_opts.set_hybrid_ribbon_filter(10.0, 1);
+                table_opts.set_whole_key_filtering(true);
+                table_opts.set_format_version(7);
+                table_opts.set_optimize_filters_for_memory(true);
+                table_opts.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
+
+                let mut opts = Options::default();
                 opts.create_if_missing(true);
                 opts.create_missing_column_families(true);
+                opts.set_compaction_readahead_size(2 * 1024 * 1024);
+                opts.set_max_background_jobs(2);
                 opts.optimize_level_style_compaction(512 * 1024 * 1024);
-                opts.optimize_for_point_lookup(8 * 1024);
-                opts.set_max_background_jobs(3);
-                opts.set_max_subcompactions(2);
+                opts.set_track_and_verify_wals_in_manifest(true);
+                opts.set_memtable_prefix_bloom_ratio(0.02);
+                opts.set_memtable_whole_key_filtering(true);
+
+                opts.set_use_direct_io_for_flush_and_compaction(true);
+                opts.set_level_compaction_dynamic_level_bytes(false);
 
                 let db = DB::open(&opts, args.db).unwrap();
                 for prepared in prepared_rx {
