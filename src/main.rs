@@ -44,8 +44,8 @@ fn main() -> Result<(), io::Error> {
                 let mut opts = rocksdb::Options::default();
                 opts.create_if_missing(true);
                 opts.create_missing_column_families(true);
-                opts.optimize_level_style_compaction(1024 * 1024 * 1024);
-                opts.optimize_for_point_lookup(8 * 1024 * 1025 * 1024);
+                opts.optimize_level_style_compaction(512 * 1024 * 1024);
+                opts.optimize_for_point_lookup(8 * 1024);
                 opts.set_max_background_jobs(3);
                 opts.set_max_subcompactions(2);
 
