@@ -7,7 +7,8 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame};
 use pgn_reader::Reader;
 use rocksdb::{
-    BlockBasedOptions, Cache, DB, DataBlockIndexType, Options, WriteBatchWithTransaction,
+    BlockBasedOptions, Cache, DB, DataBlockIndexType, MemtableFactory, Options,
+    WriteBatchWithTransaction,
 };
 use tikv_jemallocator::Jemalloc;
 
@@ -68,6 +69,11 @@ fn main() -> Result<(), io::Error> {
 
                 opts.set_use_direct_io_for_flush_and_compaction(true);
                 opts.set_level_compaction_dynamic_level_bytes(false);
+                opts.set_block_based_table_factory(&table_opts);
+                opts.set_allow_concurrent_memtable_write(false);
+                opts.set_memtable_factory(MemtableFactory::HashLinkList {
+                    bucket_count: 128 * 1024 * 1024 / 5 / 10,
+                });
 
                 let db = DB::open(&opts, args.db).unwrap();
                 for prepared in prepared_rx {
