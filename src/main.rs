@@ -1,3 +1,4 @@
+use std::iter;
 use std::{ffi::OsStr, fs::File, io, path::PathBuf, thread};
 
 use clap::Parser;
@@ -5,7 +6,7 @@ use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame};
 use pgn_reader::Reader;
-use rocksdb::{SingleThreaded, WriteBatchWithTransaction};
+use rocksdb::{DB, WriteBatchWithTransaction};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -43,21 +44,23 @@ fn main() -> Result<(), io::Error> {
                 let mut opts = rocksdb::Options::default();
                 opts.create_if_missing(true);
                 opts.create_missing_column_families(true);
-                opts.optimize_for_point_lookup(8 * 1024);
                 opts.optimize_level_style_compaction(1024 * 1024 * 1024);
-                opts.set_max_background_jobs(6);
-                opts.set_memtable_factory(rocksdb::MemtableFactory::Vector);
+                opts.optimize_for_point_lookup(8 * 1024 * 1025 * 1024);
+                opts.set_max_background_jobs(3);
+                opts.set_max_subcompactions(2);
 
-                let db: rocksdb::DBWithThreadMode<SingleThreaded> =
-                    rocksdb::DBWithThreadMode::open(&opts, args.db).unwrap();
+                let db = DB::open(&opts, args.db).unwrap();
                 for prepared in prepared_rx {
+                    let existing_positions =
+                        db.multi_get(prepared.positions.iter().map(|p| p.short_key()));
+
                     let mut write_batch = WriteBatchWithTransaction::<false>::default();
 
-                    for hash in prepared.hashes {
-                        write_batch.put(
-                            &u64::from(hash).to_be_bytes()[0..5],
-                            prepared.game_id.to_bytes(),
-                        );
+                    for (pos, existing) in iter::zip(prepared.positions, existing_positions) {
+                        let existing = existing.expect("multi get");
+                        if existing.is_none() {
+                            write_batch.put(pos.short_key(), prepared.game_id.to_bytes());
+                        }
                     }
 
                     db.write(write_batch).expect("write batch");

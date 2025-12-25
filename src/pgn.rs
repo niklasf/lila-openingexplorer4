@@ -7,7 +7,7 @@ use shakmaty::{
     packed::PackedSetup,
     san::{San, SanPlus},
     variant::{Variant, VariantPosition},
-    zobrist::{Zobrist64, ZobristHash},
+    zobrist::{Zobrist128, ZobristHash},
 };
 
 use crate::packed::{GameId, GamePlayer, LaxDate, Rating, Speed};
@@ -192,7 +192,7 @@ pub struct PreparedGame {
     pub date: LaxDate,
     pub outcome: Outcome,
     pub setup: Option<PackedSetup>,
-    pub hashes: Vec<Zobrist64>,
+    pub positions: Vec<PositionEntry>,
 }
 
 impl PreparedGame {
@@ -268,7 +268,7 @@ impl PreparedGame {
                 .expect("legal setup")
             }),
             outcome: parsed.outcome.unwrap_or(Outcome::Unknown),
-            hashes: Vec::with_capacity(parsed.moves.len()),
+            positions: Vec::with_capacity(parsed.moves.len()),
         };
 
         for san in parsed.moves {
@@ -278,13 +278,29 @@ impl PreparedGame {
                     format!("illegal san {} in game {}: {}", san, game_id, err),
                 )
             })?;
-            prepared
-                .hashes
-                .push(pos.zobrist_hash(shakmaty::EnPassantMode::Legal));
+            prepared.positions.push(PositionEntry::new(
+                pos.zobrist_hash(shakmaty::EnPassantMode::Legal),
+            ));
             pos.play_unchecked(m);
         }
 
         Ok(prepared)
+    }
+}
+
+pub struct PositionEntry {
+    key: [u8; 16],
+}
+
+impl PositionEntry {
+    pub fn new(hash: Zobrist128) -> Self {
+        PositionEntry {
+            key: u128::from(hash).to_be_bytes(),
+        }
+    }
+
+    pub fn short_key(&self) -> &[u8] {
+        &self.key[0..5]
     }
 }
 
