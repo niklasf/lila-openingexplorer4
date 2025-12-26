@@ -31,7 +31,7 @@ impl Bitmap {
             .create(true)
             .open(path)?;
 
-        file.set_len(0xff_ffff_ffff)?;
+        file.set_len(0xff_ffff_ffff / 8)?;
 
         Ok(Bitmap {
             mmap: unsafe { MmapOptions::new().map_mut(&file)? },
@@ -39,14 +39,15 @@ impl Bitmap {
     }
 
     pub fn acquire(&mut self, index: [u8; 5]) -> bool {
-        let byte_index = u32::from_be_bytes([index[0], index[1], index[2], index[3]]);
-        let bit_index = index[4];
+        let index = u64::from_be_bytes([index[0], index[1], index[2], index[3], index[4], 0, 0, 0]);
+        let byte_index = index / 8;
+        let bit_index = index % 8;
 
-        let byte = self.mmap[byte_index as usize];
+        let byte = &mut self.mmap[byte_index as usize];
         let mask = 1 << bit_index;
 
-        if byte & mask == 0 {
-            self.mmap[byte_index as usize] |= mask;
+        if *byte & mask == 0 {
+            *byte |= mask;
             true
         } else {
             false
@@ -207,7 +208,7 @@ fn main() -> Result<(), io::Error> {
                 for prepared in prepared_rx {
                     indexer.push(prepared);
 
-                    if indexer.len() >= 100_000_000 {
+                    if indexer.len() >= 200_000_000 {
                         indexer.flush(&mut bitmap);
                     }
                 }
