@@ -575,6 +575,7 @@ dependencies = [
  "pgn-reader",
  "quickcheck",
  "rocksdb",
+ "rustc-hash",
  "shakmaty",
  "thiserror",
  "tikv-jemallocator",

@@ -1,10 +1,11 @@
+use rustc_hash::FxHashMap;
 use std::{io, ops::ControlFlow};
 
 use pgn_reader::{RawTag, Skip, Visitor};
 use shakmaty::{
-    ByColor, Outcome, Position,
+    ByColor, CastlingMode, Outcome, Position,
     fen::Fen,
-    packed::PackedSetup,
+    packed::{PackedSetup, PackedUciMove},
     san::{San, SanPlus},
     variant::{Variant, VariantPosition},
     zobrist::{Zobrist128, ZobristHash},
@@ -192,7 +193,7 @@ pub struct PreparedGame {
     pub date: LaxDate,
     pub outcome: Outcome,
     pub setup: Option<PackedSetup>,
-    pub positions: Vec<PositionEntry>,
+    pub positions: FxHashMap<Zobrist128, PackedUciMove>,
 }
 
 impl PreparedGame {
@@ -268,7 +269,7 @@ impl PreparedGame {
                 .expect("legal setup")
             }),
             outcome: parsed.outcome.unwrap_or(Outcome::Unknown),
-            positions: Vec::with_capacity(parsed.moves.len()),
+            positions: FxHashMap::with_capacity_and_hasher(parsed.moves.len(), Default::default()),
         };
 
         for san in parsed.moves {
@@ -278,29 +279,14 @@ impl PreparedGame {
                     format!("illegal san {} in game {}: {}", san, game_id, err),
                 )
             })?;
-            prepared.positions.push(PositionEntry::new(
+            prepared.positions.insert(
                 pos.zobrist_hash(shakmaty::EnPassantMode::Legal),
-            ));
+                PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
+            );
             pos.play_unchecked(m);
         }
 
         Ok(prepared)
-    }
-}
-
-pub struct PositionEntry {
-    key: [u8; 16],
-}
-
-impl PositionEntry {
-    pub fn new(hash: Zobrist128) -> Self {
-        PositionEntry {
-            key: u128::from(hash).to_be_bytes(),
-        }
-    }
-
-    pub fn short_key(&self) -> &[u8] {
-        &self.key[0..5]
     }
 }
 
