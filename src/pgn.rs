@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use nohash_hasher::IntMap;
 use std::{io, ops::ControlFlow};
 
 use pgn_reader::{RawTag, Skip, Visitor};
@@ -186,14 +186,18 @@ impl ParsedGame {
     }
 }
 
-pub struct PreparedGame {
+pub struct PreparedGameMeta {
     pub game_id: GameId,
     pub players: ByColor<GamePlayer>,
     pub speed: Speed,
     pub date: LaxDate,
     pub outcome: Outcome,
     pub setup: Option<PackedSetup>,
-    pub positions: FxHashMap<Zobrist128, PackedUciMove>,
+}
+
+pub struct PreparedGame {
+    pub meta: PreparedGameMeta,
+    pub positions: IntMap<Zobrist128, PackedUciMove>,
 }
 
 impl PreparedGame {
@@ -217,7 +221,7 @@ impl PreparedGame {
             ),
         };
 
-        let mut prepared = PreparedGame {
+        let meta = PreparedGameMeta {
             game_id,
             players: ByColor {
                 white: GamePlayer {
@@ -269,8 +273,10 @@ impl PreparedGame {
                 .expect("legal setup")
             }),
             outcome: parsed.outcome.unwrap_or(Outcome::Unknown),
-            positions: FxHashMap::with_capacity_and_hasher(parsed.moves.len(), Default::default()),
         };
+
+        let mut positions =
+            IntMap::with_capacity_and_hasher(parsed.moves.len(), Default::default());
 
         for san in parsed.moves {
             let m = san.to_move(&pos).map_err(|err| {
@@ -279,14 +285,14 @@ impl PreparedGame {
                     format!("illegal san {} in game {}: {}", san, game_id, err),
                 )
             })?;
-            prepared.positions.insert(
+            positions.insert(
                 pos.zobrist_hash(shakmaty::EnPassantMode::Legal),
                 PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
             );
             pos.play_unchecked(m);
         }
 
-        Ok(prepared)
+        Ok(PreparedGame { meta, positions })
     }
 }
 
