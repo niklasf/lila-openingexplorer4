@@ -565,6 +565,7 @@ name = "lila-openingexplorer4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags",
  "btoi",
  "bytes",
  "clap",
