@@ -3,8 +3,10 @@ use bitflags::bitflags;
 use btoi::btou;
 use bytes::{Buf, BufMut};
 use shakmaty::{
-    ByColor, Color, KnownOutcome, Outcome,
+    ByColor, Color, KnownOutcome, Outcome, Position,
     packed::{PackedSetup, PackedUciMove},
+    uci::UciMove,
+    variant::VariantPosition,
 };
 use thiserror::Error;
 
@@ -37,7 +39,7 @@ pub fn unpack_outcome<B: Buf>(buf: &mut B) -> Outcome {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GamePlayer {
     pub title: Option<String>,
     pub name: String,
@@ -181,7 +183,7 @@ impl Arbitrary<'_> for IndexStatus {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LichessGame {
     pub index_status: IndexStatus,
     pub players: ByColor<GamePlayer>,
@@ -244,8 +246,34 @@ impl LichessGame {
     }
 }
 
+impl Arbitrary<'_> for LichessGame {
+    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(LichessGame {
+            index_status: u.arbitrary()?,
+            players: u.arbitrary()?,
+            date: u.arbitrary()?,
+            outcome: u.arbitrary()?,
+            speed: u.arbitrary()?,
+            rating_mode: u.arbitrary()?,
+            setup: Option::<VariantPosition>::arbitrary(u)?.map(|pos| {
+                PackedSetup::pack_variant(
+                    &pos.to_setup(shakmaty::EnPassantMode::Always),
+                    pos.variant(),
+                )
+                .expect("can losslessly pack position")
+            }),
+            moves: Vec::<UciMove>::arbitrary(u)?
+                .into_iter()
+                .map(PackedUciMove::pack)
+                .collect(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use arbtest::arbtest;
+
     use super::*;
 
     #[test]
@@ -262,5 +290,17 @@ mod tests {
             Speed::from_time_control_tag(b"120+2").unwrap(),
             Speed::Blitz
         );
+    }
+
+    #[test]
+    fn test_pack_roundtrip() {
+        arbtest(|u| {
+            let game: LichessGame = u.arbitrary()?;
+
+            let mut buf = Vec::new();
+            game.pack_entire(&mut buf);
+            assert_eq!(LichessGame::unpack_entire(&mut &buf[..]), game);
+            Ok(())
+        });
     }
 }
