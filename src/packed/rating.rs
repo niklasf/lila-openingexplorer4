@@ -70,27 +70,39 @@ impl fmt::Debug for Rating {
 
 #[cfg(test)]
 mod tests {
-    use quickcheck::{Arbitrary, Gen, quickcheck};
+    use arbitrary::Arbitrary;
+    use arbitrary::Unstructured;
+    use arbtest::arbtest;
 
     use super::*;
 
-    impl Arbitrary for Rating {
-        fn arbitrary(g: &mut Gen) -> Self {
-            Rating {
-                offset: i16::arbitrary(g),
-            }
+    impl Arbitrary<'_> for Rating {
+        fn arbitrary(u: &mut Unstructured) -> arbitrary::Result<Self> {
+            Ok(Rating {
+                offset: u.arbitrary()?,
+            })
         }
     }
 
-    quickcheck! {
-        fn i32_roundtrip(rating: Rating) -> bool {
-            Rating::try_from(i32::from(rating)).unwrap() == rating
-        }
+    #[test]
+    fn test_i32_roundtrip() {
+        arbtest(|u| {
+            let rating: Rating = u.arbitrary()?;
 
-        fn pack_roundtrip(rating: Rating) -> bool {
+            assert_eq!(Rating::try_from(i32::from(rating)).unwrap(), rating);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_pack_roundtrip() {
+        arbtest(|u| {
+            let rating: Rating = u.arbitrary()?;
+
             let mut buf = Vec::new();
             rating.pack(&mut buf);
-            Rating::unpack(&mut &buf[..]) == rating
-        }
+            assert_eq!(Rating::unpack(&mut &buf[..]), rating);
+            Ok(())
+        });
     }
 }

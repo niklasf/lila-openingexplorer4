@@ -24,21 +24,31 @@ pub fn unpack_string<B: Buf>(buf: &mut B) -> String {
 
 #[cfg(test)]
 mod tests {
-    use quickcheck::quickcheck;
+    use arbtest::arbtest;
 
     use super::*;
 
-    quickcheck! {
-        fn pack_bytes_roundtrip(bytes: Vec<u8>) -> bool {
+    #[test]
+    fn test_pack_bytes_roundtrip() {
+        arbtest(|u| {
+            let bytes: Vec<u8> = u.arbitrary()?;
+
             let mut buf = Vec::new();
             pack_bytes(&mut buf, &bytes);
-            unpack_bytes(&mut &buf[..]) == bytes
-        }
+            assert_eq!(unpack_bytes(&mut &buf[..]), bytes);
+            Ok(())
+        });
+    }
 
-        fn pack_string_roundtrip(s: String) -> bool {
+    #[test]
+    fn test_pack_string_roundtrip() {
+        arbtest(|u| {
+            let s: String = u.arbitrary()?;
+
             let mut buf = Vec::new();
             pack_string(&mut buf, &s);
-            unpack_string(&mut &buf[..]) == s
-        }
+            assert_eq!(unpack_string(&mut &buf[..]), s);
+            Ok(())
+        });
     }
 }

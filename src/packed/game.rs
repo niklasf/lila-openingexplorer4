@@ -145,6 +145,7 @@ pub fn unpack_speed_and_rating_mode<B: Buf>(buf: &mut B) -> (Speed, RatingMode) 
 }
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct IndexStatus: u8 {
         const LICHESS = 1 << 0;
         const PLAYER_WHITE = 1 << 1;

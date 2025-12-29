@@ -82,35 +82,53 @@ impl fmt::Debug for GameId {
 
 #[cfg(test)]
 mod tests {
-    use quickcheck::{Arbitrary, Gen, quickcheck};
+    use arbitrary::Arbitrary;
+    use arbitrary::Unstructured;
+    use arbtest::arbtest;
 
     use super::*;
 
-    impl Arbitrary for GameId {
-        fn arbitrary(g: &mut Gen) -> Self {
-            GameId(u64::arbitrary(g) % 62u64.pow(8))
+    impl Arbitrary<'_> for GameId {
+        fn arbitrary(g: &mut Unstructured) -> arbitrary::Result<Self> {
+            Ok(GameId(g.int_in_range(0..=(62u64.pow(8) - 1))?))
         }
     }
 
-    quickcheck! {
-        fn str_roundtrip(game_id: GameId) -> bool {
-            GameId::from_str(&game_id.to_string()).unwrap() == game_id
-        }
+    #[test]
+    fn test_str_roundtrip() {
+        arbtest(|u| {
+            let game_id: GameId = u.arbitrary()?;
+            assert_eq!(GameId::from_str(&game_id.to_string()).unwrap(), game_id);
+            Ok(())
+        });
+    }
 
-        fn pack_roundtrip(game_id: GameId) -> bool {
+    #[test]
+    fn test_pack_roundtrip() {
+        arbtest(|u| {
+            let game_id: GameId = u.arbitrary()?;
+
             let mut buf = Vec::new();
             game_id.pack(&mut buf);
-            GameId::unpack(&mut &buf[..]) == game_id
-        }
+            assert_eq!(GameId::unpack(&mut &buf[..]), game_id);
+            Ok(())
+        });
+    }
 
-        fn packed_ord(left: GameId, right: GameId) -> bool {
+    #[test]
+    fn test_packed_ord() {
+        arbtest(|u| {
+            let left: GameId = u.arbitrary()?;
+            let right: GameId = u.arbitrary()?;
+
             let mut left_buf = Vec::new();
             left.pack(&mut left_buf);
 
             let mut right_buf = Vec::new();
             right.pack(&mut right_buf);
 
-            left_buf.cmp(&right_buf) == left.cmp(&right)
-        }
+            assert_eq!(left_buf.cmp(&right_buf), left.cmp(&right));
+            Ok(())
+        });
     }
 }

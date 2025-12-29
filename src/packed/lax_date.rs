@@ -113,43 +113,58 @@ impl fmt::Debug for LaxDate {
 
 #[cfg(test)]
 mod tests {
-    use quickcheck::{Arbitrary, Gen, quickcheck};
+    use arbitrary::{Arbitrary, Unstructured};
+    use arbtest::arbtest;
 
     use super::*;
 
-    impl Arbitrary for LaxDate {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let year_since_1900 = u8::arbitrary(g);
-            let month = NonZeroU8::new(u8::arbitrary(g) % (12 + 1));
-            let day = month.and_then(|_| NonZeroU8::new(u8::arbitrary(g) % (31 + 1)));
-            LaxDate {
-                year_since_1900,
-                month,
-                day,
-            }
+    impl Arbitrary<'_> for LaxDate {
+        fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+            Ok(LaxDate {
+                year_since_1900: u.arbitrary()?,
+                month: NonZeroU8::new(u.int_in_range(0..=12)?),
+                day: NonZeroU8::new(u.int_in_range(0..=31)?),
+            })
         }
     }
 
-    quickcheck! {
-        fn str_roundtrip(lax_date: LaxDate) -> bool {
-            LaxDate::from_str(&lax_date.to_string()).unwrap() == lax_date
-        }
+    #[test]
+    fn test_str_roundtrip() {
+        arbtest(|u| {
+            let lax_date: LaxDate = u.arbitrary()?;
 
-        fn pack_roundtrip(lax_date: LaxDate) -> bool {
+            assert_eq!(LaxDate::from_str(&lax_date.to_string()).unwrap(), lax_date);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_pack_roundtrip() {
+        arbtest(|u| {
+            let lax_date: LaxDate = u.arbitrary()?;
+
             let mut buf = Vec::new();
             lax_date.pack(&mut buf);
-            LaxDate::unpack(&mut &buf[..]) == lax_date
-        }
+            assert_eq!(LaxDate::unpack(&mut &buf[..]), lax_date);
+            Ok(())
+        });
+    }
 
-        fn packed_ord(left: LaxDate, right: LaxDate) -> bool {
+    #[test]
+    fn test_packed_ord() {
+        arbtest(|u| {
+            let left: LaxDate = u.arbitrary()?;
+            let right: LaxDate = u.arbitrary()?;
+
             let mut left_buf = Vec::new();
             left.pack(&mut left_buf);
 
             let mut right_buf = Vec::new();
             right.pack(&mut right_buf);
 
-            left_buf.cmp(&right_buf) == left.cmp(&right)
-        }
+            assert_eq!(left_buf.cmp(&right_buf), left.cmp(&right));
+            Ok(())
+        });
     }
 
     #[test]

@@ -33,21 +33,31 @@ pub fn unpack_int<B: Buf>(buf: &mut B) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use quickcheck::quickcheck;
+    use arbtest::arbtest;
 
     use super::*;
 
-    quickcheck! {
-        fn pack_uint_roundtrip(n: u64) -> bool {
+    #[test]
+    fn test_pack_uint_roundtrip() {
+        arbtest(|u| {
+            let n: u64 = u.arbitrary()?;
+
             let mut buf = Vec::new();
             pack_uint(&mut buf, n);
-            unpack_uint(&mut &buf[..]) == n
-        }
+            assert_eq!(unpack_uint(&mut &buf[..]), n);
+            Ok(())
+        });
+    }
 
-        fn pack_int_roundtrip(n: i64) -> bool {
+    #[test]
+    fn test_pack_int_roundtrip() {
+        arbtest(|u| {
+            let n: i64 = u.arbitrary()?;
+
             let mut buf = Vec::new();
             pack_int(&mut buf, n);
-            unpack_int(&mut &buf[..]) == n
-        }
+            assert_eq!(unpack_int(&mut &buf[..]), n);
+            Ok(())
+        });
     }
 }
