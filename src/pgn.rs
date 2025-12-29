@@ -1,6 +1,6 @@
-use nohash_hasher::IntMap;
 use std::{io, ops::ControlFlow};
 
+use nohash_hasher::IntMap;
 use pgn_reader::{RawTag, Skip, Visitor};
 use shakmaty::{
     ByColor, CastlingMode, Outcome, Position,

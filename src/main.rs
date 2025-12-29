@@ -1,12 +1,18 @@
-use std::fs::OpenOptions;
-use std::path::Path;
-use std::{ffi::OsStr, fs::File, io, path::PathBuf, thread};
+use std::{
+    ffi::OsStr,
+    fs::{File, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+    thread,
+};
 
 use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use lila_openingexplorer4::packed::GameId;
-use lila_openingexplorer4::pgn::{GameVisitor, PreparedGame, PreparedGameMeta};
+use lila_openingexplorer4::{
+    packed::GameId,
+    pgn::{GameVisitor, PreparedGame, PreparedGameMeta},
+};
 use memmap2::{MmapMut, MmapOptions};
 use pgn_reader::Reader;
 use rocksdb::{

@@ -1,12 +1,13 @@
 use std::{fmt, str::FromStr};
 
+use arbitrary::Arbitrary;
 use btoi::btoi;
 use bytes::{Buf, BufMut};
 use thiserror::Error;
 
 use crate::packed::{pack_int, unpack_int};
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Arbitrary, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rating {
     offset: i16,
 }
@@ -70,19 +71,9 @@ impl fmt::Debug for Rating {
 
 #[cfg(test)]
 mod tests {
-    use arbitrary::Arbitrary;
-    use arbitrary::Unstructured;
     use arbtest::arbtest;
 
     use super::*;
-
-    impl Arbitrary<'_> for Rating {
-        fn arbitrary(u: &mut Unstructured) -> arbitrary::Result<Self> {
-            Ok(Rating {
-                offset: u.arbitrary()?,
-            })
-        }
-    }
 
     #[test]
     fn test_i32_roundtrip() {

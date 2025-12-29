@@ -1,5 +1,6 @@
 use std::{fmt, num::NonZeroU8, str::FromStr};
 
+use arbitrary::{Arbitrary, Unstructured};
 use btoi::btou;
 use bytes::{Buf, BufMut};
 use thiserror::Error;
@@ -35,7 +36,7 @@ impl LaxDate {
         let month = NonZeroU8::new(buf.get_u8());
         assert!(month.is_none_or(|m| m.get() <= 12));
         let day = NonZeroU8::new(buf.get_u8());
-        assert!(day.is_none_or(|d| d.get() <= 31));
+        assert!(day.is_none_or(|d| month.is_some() && d.get() <= 31));
 
         LaxDate {
             year_since_1900,
@@ -46,35 +47,40 @@ impl LaxDate {
 
     pub fn from_ascii(bytes: &[u8]) -> Result<Self, InvalidLaxDate> {
         let mut parts = bytes.splitn(3, |&b| b == b'-' || b == b'.');
+        let year_since_1900 = parts
+            .next()
+            .and_then(|part| btou::<u32>(part).ok())
+            .and_then(|year| year.checked_sub(1900))
+            .and_then(|year_since_1900| u8::try_from(year_since_1900).ok())
+            .ok_or(InvalidLaxDate)?;
+        let month = parts
+            .next()
+            .filter(|part| part != b"?" && part != b"??")
+            .map(|part| {
+                btou::<u8>(part)
+                    .ok()
+                    .filter(|&m| m <= 12)
+                    .and_then(NonZeroU8::new)
+                    .ok_or(InvalidLaxDate)
+            })
+            .transpose()?;
+        let day = parts
+            .next()
+            .filter(|part| part != b"?" && part != b"??")
+            .map(|part| {
+                btou::<u8>(part)
+                    .ok()
+                    .filter(|&m| m <= 31)
+                    .and_then(NonZeroU8::new)
+                    .ok_or(InvalidLaxDate)
+            })
+            .transpose()?
+            .filter(|_| month.is_some());
+
         Ok(LaxDate {
-            year_since_1900: parts
-                .next()
-                .and_then(|part| btou::<u32>(part).ok())
-                .and_then(|year| year.checked_sub(1900))
-                .and_then(|year_since_1900| u8::try_from(year_since_1900).ok())
-                .ok_or(InvalidLaxDate)?,
-            month: parts
-                .next()
-                .filter(|part| part != b"?" && part != b"??")
-                .map(|part| {
-                    btou::<u8>(part)
-                        .ok()
-                        .filter(|&m| m <= 12)
-                        .and_then(NonZeroU8::new)
-                        .ok_or(InvalidLaxDate)
-                })
-                .transpose()?,
-            day: parts
-                .next()
-                .filter(|part| part != b"?" && part != b"??")
-                .map(|part| {
-                    btou::<u8>(part)
-                        .ok()
-                        .filter(|&m| m <= 31)
-                        .and_then(NonZeroU8::new)
-                        .ok_or(InvalidLaxDate)
-                })
-                .transpose()?,
+            year_since_1900,
+            month,
+            day,
         })
     }
 }
@@ -111,22 +117,24 @@ impl fmt::Debug for LaxDate {
     }
 }
 
+impl Arbitrary<'_> for LaxDate {
+    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        let year_since_1900 = u.arbitrary()?;
+        let month = NonZeroU8::new(u.int_in_range(0..=12)?);
+        let day = NonZeroU8::new(u.int_in_range(0..=31)?).filter(|_| month.is_some());
+        Ok(LaxDate {
+            year_since_1900,
+            month,
+            day,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use arbitrary::{Arbitrary, Unstructured};
     use arbtest::arbtest;
 
     use super::*;
-
-    impl Arbitrary<'_> for LaxDate {
-        fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
-            Ok(LaxDate {
-                year_since_1900: u.arbitrary()?,
-                month: NonZeroU8::new(u.int_in_range(0..=12)?),
-                day: NonZeroU8::new(u.int_in_range(0..=31)?),
-            })
-        }
-    }
 
     #[test]
     fn test_str_roundtrip() {

@@ -1,5 +1,6 @@
 use std::{fmt, fmt::Write, str::FromStr};
 
+use arbitrary::{Arbitrary, Unstructured};
 use bytes::{Buf, BufMut};
 use thiserror::Error;
 
@@ -80,24 +81,23 @@ impl fmt::Debug for GameId {
     }
 }
 
+impl Arbitrary<'_> for GameId {
+    fn arbitrary(g: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(GameId(g.int_in_range(0..=(62u64.pow(8) - 1))?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use arbitrary::Arbitrary;
-    use arbitrary::Unstructured;
     use arbtest::arbtest;
 
     use super::*;
-
-    impl Arbitrary<'_> for GameId {
-        fn arbitrary(g: &mut Unstructured) -> arbitrary::Result<Self> {
-            Ok(GameId(g.int_in_range(0..=(62u64.pow(8) - 1))?))
-        }
-    }
 
     #[test]
     fn test_str_roundtrip() {
         arbtest(|u| {
             let game_id: GameId = u.arbitrary()?;
+
             assert_eq!(GameId::from_str(&game_id.to_string()).unwrap(), game_id);
             Ok(())
         });

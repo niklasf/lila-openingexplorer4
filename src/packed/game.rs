@@ -1,3 +1,4 @@
+use arbitrary::{Arbitrary, Unstructured};
 use bitflags::bitflags;
 use btoi::btou;
 use bytes::{Buf, BufMut};
@@ -36,6 +37,7 @@ pub fn unpack_outcome<B: Buf>(buf: &mut B) -> Outcome {
     }
 }
 
+#[derive(Debug)]
 pub struct GamePlayer {
     pub title: Option<String>,
     pub name: String,
@@ -58,7 +60,17 @@ impl GamePlayer {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+impl Arbitrary<'_> for GamePlayer {
+    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(GamePlayer {
+            title: Some(u.arbitrary::<String>()?).filter(|s| !s.is_empty()),
+            name: u.arbitrary()?,
+            rating: u.arbitrary()?,
+        })
+    }
+}
+
+#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Speed {
     UltraBullet,
     Bullet,
@@ -103,7 +115,7 @@ impl Speed {
 #[error("Invalid speed")]
 pub struct InvalidSpeed;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum RatingMode {
     Unrated,
     Rated,
@@ -163,6 +175,13 @@ impl IndexStatus {
     }
 }
 
+impl Arbitrary<'_> for IndexStatus {
+    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(IndexStatus::from_bits_truncate(u.arbitrary()?))
+    }
+}
+
+#[derive(Debug)]
 pub struct LichessGame {
     pub index_status: IndexStatus,
     pub players: ByColor<GamePlayer>,
