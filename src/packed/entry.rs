@@ -22,11 +22,11 @@ pub enum RatingGroup {
     Group3200,
 }
 
-#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct GameIdx(pub u64);
+#[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GameIdx(pub usize);
 
 impl GameIdx {
-    pub fn add(self, offset: u64) -> GameIdx {
+    pub fn add(self, offset: usize) -> GameIdx {
         GameIdx(self.0 + offset)
     }
 }
@@ -112,7 +112,7 @@ impl SubEntry {
         pack_uint(buf, self.draws);
         pack_uint(buf, self.games.len() as u64);
         for (GameIdx(idx), game_id) in &self.games {
-            pack_uint(buf, *idx);
+            pack_uint(buf, *idx as u64);
             game_id.pack(buf);
         }
     }
@@ -128,7 +128,7 @@ impl SubEntry {
         let game_count = unpack_uint(buf) as usize;
         self.games.extend(
             iter::repeat_with(|| {
-                let idx = base_game_idx.add(unpack_uint(buf));
+                let idx = base_game_idx.add(unpack_uint(buf) as usize);
                 next_game_idx = max(next_game_idx, idx.add(1));
                 let game_id = GameId::unpack(buf);
                 (idx, game_id)
@@ -140,7 +140,7 @@ impl SubEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct LichessEntry {
     moves: FxHashMap<PackedUciMove, FxHashMap<Header, SubEntry>>,
     next_game_idx: GameIdx,
@@ -159,10 +159,7 @@ impl Arbitrary<'_> for LichessEntry {
 
 impl LichessEntry {
     pub fn new() -> Self {
-        LichessEntry {
-            moves: FxHashMap::default(),
-            next_game_idx: GameIdx(0),
-        }
+        LichessEntry::default()
     }
 
     pub fn add_game(
@@ -254,12 +251,12 @@ impl LichessEntry {
         for move_entries in self.moves.values_mut() {
             for sub_entry in move_entries.values_mut() {
                 for (idx, _) in &mut sub_entry.games {
-                    idx.0 -= deleted_indexes.partition_point(|deleted| deleted < idx) as u64;
+                    idx.0 -= deleted_indexes.partition_point(|deleted| deleted < idx);
                 }
             }
         }
 
-        self.next_game_idx.0 -= deleted_indexes.len() as u64;
+        self.next_game_idx.0 -= deleted_indexes.len();
     }
 }
 
@@ -298,19 +295,31 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_unpack() {
+    fn test_merge_unpack_truncate() {
         arbtest(|u| {
             let mut lichess_entry = LichessEntry::new();
 
             for merge_entry in u.arbitrary_iter()? {
                 let merge_entry: LichessEntry = merge_entry?;
-                let total_games = lichess_entry.next_game_idx.0 + merge_entry.next_game_idx.0;
 
+                // Merge
+                let total_games = lichess_entry.next_game_idx.0 + merge_entry.next_game_idx.0;
                 let mut buf = Vec::new();
                 merge_entry.pack_entire(&mut buf);
                 lichess_entry.merge_unpack_entire(&mut &buf[..]);
-
                 assert_eq!(lichess_entry.next_game_idx.0, total_games);
+
+                // Check invariants
+                lichess_entry.truncate_games(2);
+                let mut indexes: Vec<GameIdx> = Vec::new();
+                for move_entries in lichess_entry.moves.values() {
+                    for sub_entry in move_entries.values() {
+                        assert!(sub_entry.games.is_sorted());
+                        indexes.extend(sub_entry.games.iter().map(|(idx, _)| idx));
+                    }
+                }
+                indexes.sort_unstable();
+                assert_eq!(indexes, (0..indexes.len()).map(GameIdx).collect::<Vec<_>>());
             }
 
             Ok(())

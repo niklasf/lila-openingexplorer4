@@ -35,6 +35,7 @@ impl Bitmap {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         file.set_len(0xff_ffff_ffff / 8)?;
