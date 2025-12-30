@@ -1,4 +1,5 @@
 mod bytes;
+mod entry;
 mod game;
 mod game_id;
 mod int;

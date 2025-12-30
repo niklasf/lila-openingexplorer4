@@ -186,7 +186,7 @@ fn main() -> Result<(), io::Error> {
         bucket_count: 128 * 1024 * 1024 / 5 / 10,
     });
 
-    let db = DB::open(&opts, args.db).unwrap();
+    //let db = DB::open(&opts, args.db).unwrap();
 
     let mut bitmap = Bitmap::open(&args.bitmap).unwrap();
 
