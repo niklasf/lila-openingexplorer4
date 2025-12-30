@@ -1,14 +1,14 @@
-use crate::packed::{GameId, Speed, pack_int, pack_uint, unpack_int, unpack_uint};
-use arbitrary::Arbitrary;
-use arbitrary::Unstructured;
-use bytes::Buf;
-use bytes::BufMut;
+use std::{cmp::max, iter};
+
+use arbitrary::{Arbitrary, Unstructured};
+use bytes::{Buf, BufMut};
 use rustc_hash::FxHashMap;
-use shakmaty::packed::PackedUciMove;
-use shakmaty::uci::UciMove;
+use shakmaty::{Color, KnownOutcome, packed::PackedUciMove};
+
+use crate::packed::{GameId, Speed, pack_int, pack_uint, unpack_int, unpack_uint};
 
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum RatingGroup {
+pub enum RatingGroup {
     Low,
     Group1000,
     Group1200,
@@ -24,6 +24,12 @@ enum RatingGroup {
 
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GameIdx(pub u64);
+
+impl GameIdx {
+    pub fn add(self, offset: u64) -> GameIdx {
+        GameIdx(self.0 + offset)
+    }
+}
 
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq, Hash)]
 struct Header {
@@ -111,48 +117,86 @@ impl SubEntry {
         }
     }
 
-    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        let rating_offset_sum = unpack_int(buf);
-        let white = unpack_uint(buf);
-        let black = unpack_uint(buf);
-        let draws = unpack_uint(buf);
+    pub fn merge_unpack<B: Buf>(&mut self, buf: &mut B, base_game_idx: GameIdx) -> GameIdx {
+        self.rating_offset_sum += unpack_int(buf);
+        self.white += unpack_uint(buf);
+        self.black += unpack_uint(buf);
+        self.draws += unpack_uint(buf);
+
+        let mut next_game_idx = base_game_idx;
 
         let game_count = unpack_uint(buf) as usize;
-        let mut games = Vec::with_capacity(game_count as usize);
-        for _ in 0..game_count {
-            let idx = GameIdx(unpack_uint(buf));
-            let game_id = GameId::unpack(buf);
-            games.push((idx, game_id));
-        }
+        self.games.extend(
+            iter::repeat_with(|| {
+                let idx = base_game_idx.add(unpack_uint(buf));
+                next_game_idx = max(next_game_idx, idx.add(1));
+                let game_id = GameId::unpack(buf);
+                (idx, game_id)
+            })
+            .take(game_count),
+        );
 
-        SubEntry {
-            white,
-            black,
-            draws,
-            rating_offset_sum,
-            games,
-        }
+        next_game_idx
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LichessEntry {
     moves: FxHashMap<PackedUciMove, FxHashMap<Header, SubEntry>>,
+    next_game_idx: GameIdx,
 }
 
 impl Arbitrary<'_> for LichessEntry {
     fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
-        let moves: FxHashMap<UciMove, FxHashMap<Header, SubEntry>> = u.arbitrary()?;
-        Ok(LichessEntry {
-            moves: moves
-                .into_iter()
-                .map(|(m, move_entries)| (PackedUciMove::pack(m), move_entries))
-                .collect(),
-        })
+        let mut entry = LichessEntry::new();
+        for part in u.arbitrary_iter()? {
+            let (m, speed, rating_group, outcome, game) = part?;
+            entry.add_game(PackedUciMove::pack(m), speed, rating_group, outcome, game);
+        }
+        Ok(entry)
     }
 }
 
 impl LichessEntry {
+    pub fn new() -> Self {
+        LichessEntry {
+            moves: FxHashMap::default(),
+            next_game_idx: GameIdx(0),
+        }
+    }
+
+    pub fn add_game(
+        &mut self,
+        m: PackedUciMove,
+        speed: Speed,
+        rating_group: RatingGroup,
+        outcome: KnownOutcome,
+        game: GameId,
+    ) {
+        let sub_entry = self
+            .moves
+            .entry(m)
+            .or_default()
+            .entry(Header {
+                speed,
+                rating_group,
+            })
+            .or_default();
+
+        match outcome {
+            KnownOutcome::Decisive {
+                winner: Color::White,
+            } => sub_entry.white += 1,
+            KnownOutcome::Decisive {
+                winner: Color::Black,
+            } => sub_entry.black += 1,
+            KnownOutcome::Draw => sub_entry.draws += 1,
+        }
+
+        sub_entry.games.push((self.next_game_idx, game));
+        self.next_game_idx = self.next_game_idx.add(1);
+    }
+
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
         for (i, (m, move_entries)) in self.moves.iter().enumerate() {
             if i > 0 {
@@ -166,26 +210,56 @@ impl LichessEntry {
         }
     }
 
-    pub fn unpack_entire<B: Buf>(buf: &mut B) -> Self {
-        let mut entry = LichessEntry::default();
+    pub fn merge_unpack_entire<B: Buf>(&mut self, buf: &mut B) {
+        let base_game_idx = self.next_game_idx;
+
         while buf.has_remaining() {
             let mut packed_bytes = [0; 2];
             buf.copy_to_slice(&mut packed_bytes);
             let m = PackedUciMove::from_bytes(packed_bytes);
 
-            let sub_entries = entry.moves.entry(m).or_default();
+            let sub_entries = self.moves.entry(m).or_default();
 
             while buf.has_remaining() {
                 match Header::from_byte(buf.get_u8()) {
                     None => break,
                     Some(header) => {
-                        let sub_entry = SubEntry::unpack(buf);
-                        sub_entries.insert(header, sub_entry);
+                        self.next_game_idx = max(
+                            self.next_game_idx,
+                            sub_entries
+                                .entry(header)
+                                .or_default()
+                                .merge_unpack(buf, base_game_idx),
+                        );
                     }
                 }
             }
         }
-        entry
+    }
+
+    pub fn truncate_games(&mut self, limit: usize) {
+        let mut deleted_indexes = Vec::new();
+        for move_entries in self.moves.values_mut() {
+            for sub_entry in move_entries.values_mut() {
+                deleted_indexes.extend(
+                    sub_entry
+                        .games
+                        .drain(..sub_entry.games.len().saturating_sub(limit))
+                        .map(|(idx, _)| idx),
+                )
+            }
+        }
+
+        deleted_indexes.sort_unstable();
+        for move_entries in self.moves.values_mut() {
+            for sub_entry in move_entries.values_mut() {
+                for (idx, _) in &mut sub_entry.games {
+                    idx.0 -= deleted_indexes.partition_point(|deleted| deleted < idx) as u64;
+                }
+            }
+        }
+
+        self.next_game_idx.0 -= deleted_indexes.len() as u64;
     }
 }
 
@@ -202,7 +276,8 @@ mod tests {
 
             let mut buf = Vec::new();
             sub_entry.pack(&mut buf);
-            let unpacked = SubEntry::unpack(&mut &buf[..]);
+            let mut unpacked = SubEntry::default();
+            unpacked.merge_unpack(&mut &buf[..], GameIdx(0));
             assert_eq!(sub_entry, unpacked);
             Ok(())
         });
@@ -215,7 +290,8 @@ mod tests {
 
             let mut buf = Vec::new();
             lichess_entry.pack_entire(&mut buf);
-            let unpacked = LichessEntry::unpack_entire(&mut &buf[..]);
+            let mut unpacked = LichessEntry::new();
+            unpacked.merge_unpack_entire(&mut &buf[..]);
             assert_eq!(lichess_entry, unpacked);
             Ok(())
         });

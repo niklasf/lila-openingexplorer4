@@ -7,6 +7,7 @@ mod lax_date;
 mod rating;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
+pub use entry::{LichessEntry, RatingGroup};
 pub use game::{GamePlayer, LichessGame, RatingMode, Speed};
 pub use game_id::{GameId, InvalidGameId};
 pub use int::{pack_int, pack_uint, unpack_int, unpack_uint};
