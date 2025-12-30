@@ -74,12 +74,12 @@ impl Arbitrary<'_> for GamePlayer {
 
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Speed {
-    UltraBullet,
-    Bullet,
-    Blitz,
-    Rapid,
-    Classical,
-    Correspondence,
+    UltraBullet = 1,
+    Bullet = 2,
+    Blitz = 3,
+    Rapid = 4,
+    Classical = 5,
+    Correspondence = 6,
 }
 
 impl Speed {
@@ -125,32 +125,32 @@ pub enum RatingMode {
 
 pub fn pack_speed_and_rating_mode<B: BufMut>(buf: &mut B, speed: Speed, rating_mode: RatingMode) {
     let packed_speed = match speed {
-        Speed::UltraBullet => 0,
-        Speed::Bullet => 1,
-        Speed::Blitz => 2,
-        Speed::Rapid => 3,
-        Speed::Classical => 4,
-        Speed::Correspondence => 5,
+        Speed::UltraBullet => 1,
+        Speed::Bullet => 2,
+        Speed::Blitz => 3,
+        Speed::Rapid => 4,
+        Speed::Classical => 5,
+        Speed::Correspondence => 6,
     };
     let packed_rating_mode = match rating_mode {
         RatingMode::Unrated => 0,
         RatingMode::Rated => 1,
     };
-    buf.put_u8(packed_speed | (packed_rating_mode << 7));
+    buf.put_u8(packed_speed | (packed_rating_mode << 3));
 }
 
 pub fn unpack_speed_and_rating_mode<B: Buf>(buf: &mut B) -> (Speed, RatingMode) {
     let packed = buf.get_u8();
-    let speed = match packed & 0x7F {
-        0 => Speed::UltraBullet,
-        1 => Speed::Bullet,
-        2 => Speed::Blitz,
-        3 => Speed::Rapid,
-        4 => Speed::Classical,
-        5 => Speed::Correspondence,
+    let speed = match packed & 0b111 {
+        1 => Speed::UltraBullet,
+        2 => Speed::Bullet,
+        3 => Speed::Blitz,
+        4 => Speed::Rapid,
+        5 => Speed::Classical,
+        6 => Speed::Correspondence,
         _ => panic!("invalid speed"),
     };
-    let rating_mode = match packed >> 7 {
+    let rating_mode = match packed >> 3 {
         0 => RatingMode::Unrated,
         1 => RatingMode::Rated,
         _ => panic!("invalid rating mode"),
