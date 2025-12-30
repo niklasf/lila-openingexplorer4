@@ -296,4 +296,24 @@ mod tests {
             Ok(())
         });
     }
+
+    #[test]
+    fn test_merge_unpack() {
+        arbtest(|u| {
+            let mut lichess_entry = LichessEntry::new();
+
+            for merge_entry in u.arbitrary_iter()? {
+                let merge_entry: LichessEntry = merge_entry?;
+                let total_games = lichess_entry.next_game_idx.0 + merge_entry.next_game_idx.0;
+
+                let mut buf = Vec::new();
+                merge_entry.pack_entire(&mut buf);
+                lichess_entry.merge_unpack_entire(&mut &buf[..]);
+
+                assert_eq!(lichess_entry.next_game_idx.0, total_games);
+            }
+
+            Ok(())
+        });
+    }
 }
