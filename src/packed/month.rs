@@ -1,8 +1,7 @@
-use btoi::btou;
-use std::fmt;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use arbitrary::Arbitrary;
+use btoi::btou;
 use bytes::{Buf, BufMut};
 use thiserror::Error;
 
@@ -71,8 +70,9 @@ pub struct InvalidMonth;
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use arbtest::arbtest;
+
+    use super::*;
 
     #[test]
     fn test_str_roundtrip() {

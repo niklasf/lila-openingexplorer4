@@ -1,23 +1,15 @@
+use std::{
+    fs::File,
+    io,
+    io::{BufWriter, Write},
+    path::Path,
+};
+
 use arbitrary::Arbitrary;
-use bytes::Buf;
 use bytes::BufMut;
-use shakmaty::Outcome;
-use shakmaty::uci::UciMove;
-use std::fs::File;
-use std::io;
-use std::io::BufWriter;
-use std::path::Path;
+use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove, zobrist::Zobrist128};
 
-use shakmaty::KnownOutcome;
-use shakmaty::zobrist::Zobrist128;
-
-use crate::packed::GameId;
-use crate::packed::GroupHeader;
-use crate::packed::Month;
-use crate::packed::RatingGroup;
-use crate::packed::Speed;
-use crate::packed::pack_outcome;
-use shakmaty::packed::PackedUciMove;
+use crate::packed::{GameId, GroupHeader, Month, RatingGroup, Speed, pack_outcome};
 
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Zobrist96 {
@@ -70,7 +62,7 @@ impl IntermediateEntry {
     }
 
     pub fn partition(&self) -> usize {
-        (u128::from(self.hash) >> (128 - 10)) as usize
+        self.hash.partition()
     }
 }
 
@@ -89,16 +81,25 @@ impl IntermediateSink {
         })
     }
 
-    pub fn write(&mut self, entry: &IntermediateEntry) {
+    pub fn write(&mut self, entry: &IntermediateEntry) -> io::Result<()> {
         let mut bytes = [0; IntermediateEntry::SIZE];
         entry.pack(&mut &mut bytes[..]);
+        self.partitions[entry.partition()].write_all(&bytes)
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        for partition in &mut self.partitions {
+            partition.flush()?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use arbtest::arbtest;
+
+    use super::*;
 
     #[test]
     fn test_packed_ord() {
@@ -111,12 +112,12 @@ mod tests {
             let mut right_buf = [0; IntermediateEntry::SIZE];
             right.pack(&mut &mut right_buf[..]);
 
-            if left.partition() <= right.partition() {
-                assert!(left_buf <= right_buf);
+            if left.partition() < right.partition() {
+                assert!(left_buf < right_buf);
             }
 
-            if (left.hash, left.month) <= (right.hash, right.month) {
-                assert!(left_buf <= right_buf);
+            if (left.hash, left.month) < (right.hash, right.month) {
+                assert!(left_buf < right_buf);
             }
 
             Ok(())
