@@ -10,7 +10,7 @@ use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
-    indexing::{GameVisitor, PreparedGame, PreparedGameMeta},
+    indexing::{GameVisitor, IntermediateSink, PreparedGame, PreparedGameMeta},
     packed::GameId,
 };
 use memmap2::{MmapMut, MmapOptions};
@@ -25,7 +25,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
 
-struct Bitmap {
+/*struct Bitmap {
     mmap: MmapMut,
 }
 
@@ -140,7 +140,7 @@ impl Indexer {
         self.games.clear();
         self.positions.clear();
     }
-}
+} */
 
 #[derive(Parser)]
 struct Args {
@@ -149,14 +149,12 @@ struct Args {
     db: PathBuf,
     #[clap(long)]
     workspace: PathBuf,
-    #[clap(long)]
-    bitmap: PathBuf,
 }
 
 fn main() -> Result<(), io::Error> {
     let args = Args::parse();
 
-    let cache = Cache::new_lru_cache(8 * 1024 * 1024 * 1024);
+    /* let cache = Cache::new_lru_cache(8 * 1024 * 1024 * 1024);
 
     let mut table_opts = BlockBasedOptions::default();
     table_opts.set_block_cache(&cache);
@@ -189,7 +187,7 @@ fn main() -> Result<(), io::Error> {
 
     //let db = DB::open(&opts, args.db).unwrap();
 
-    let mut bitmap = Bitmap::open(&args.bitmap).unwrap();
+    let mut bitmap = Bitmap::open(&args.bitmap).unwrap(); */
 
     thread::scope(|s| {
         let (parsed_tx, parsed_rx) = channel::bounded(128);
@@ -210,17 +208,11 @@ fn main() -> Result<(), io::Error> {
         {
             let prepared_rx = prepared_rx.clone();
             s.spawn(move || {
-                let mut indexer = Indexer::new(args.workspace.clone());
+                let sink = IntermediateSink::new(&args.workspace).expect("sink");
 
                 for prepared in prepared_rx {
-                    indexer.push(prepared);
-
-                    if indexer.len() >= 200_000_000 {
-                        indexer.flush(&mut bitmap);
-                    }
+                    // TODO
                 }
-
-                indexer.flush(&mut bitmap);
             });
         }
 
