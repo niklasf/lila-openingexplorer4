@@ -32,12 +32,12 @@ impl GameIdx {
 }
 
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq, Hash)]
-struct Header {
-    speed: Speed,
-    rating_group: RatingGroup,
+pub struct GroupHeader {
+    pub speed: Speed,
+    pub rating_group: RatingGroup,
 }
 
-impl Header {
+impl GroupHeader {
     pub fn to_byte(&self) -> u8 {
         let packed_speed = match self.speed {
             Speed::UltraBullet => 1,
@@ -63,7 +63,7 @@ impl Header {
         packed_speed | (packed_rating_group << 3)
     }
 
-    pub fn from_byte(packed: u8) -> Option<Header> {
+    pub fn from_byte(packed: u8) -> Option<GroupHeader> {
         let speed = match packed & 0b111 {
             0 => return None,
             1 => Speed::UltraBullet,
@@ -88,7 +88,7 @@ impl Header {
             10 => RatingGroup::Group3200,
             _ => panic!("invalid rating group"),
         };
-        Some(Header {
+        Some(GroupHeader {
             speed,
             rating_group,
         })
@@ -142,7 +142,7 @@ impl SubEntry {
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct LichessEntry {
-    moves: FxHashMap<PackedUciMove, FxHashMap<Header, SubEntry>>,
+    moves: FxHashMap<PackedUciMove, FxHashMap<GroupHeader, SubEntry>>,
     next_game_idx: GameIdx,
 }
 
@@ -174,7 +174,7 @@ impl LichessEntry {
             .moves
             .entry(m)
             .or_default()
-            .entry(Header {
+            .entry(GroupHeader {
                 speed,
                 rating_group,
             })
@@ -218,7 +218,7 @@ impl LichessEntry {
             let sub_entries = self.moves.entry(m).or_default();
 
             while buf.has_remaining() {
-                match Header::from_byte(buf.get_u8()) {
+                match GroupHeader::from_byte(buf.get_u8()) {
                     None => break,
                     Some(header) => {
                         self.next_game_idx = max(

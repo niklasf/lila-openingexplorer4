@@ -1,3 +1,8 @@
+use arbitrary::Arbitrary;
+use bytes::Buf;
+use bytes::BufMut;
+use shakmaty::Outcome;
+use shakmaty::uci::UciMove;
 use std::fs::File;
 use std::io;
 use std::io::BufWriter;
@@ -7,10 +12,67 @@ use shakmaty::KnownOutcome;
 use shakmaty::zobrist::Zobrist128;
 
 use crate::packed::GameId;
+use crate::packed::GroupHeader;
 use crate::packed::Month;
 use crate::packed::RatingGroup;
 use crate::packed::Speed;
+use crate::packed::pack_outcome;
 use shakmaty::packed::PackedUciMove;
+
+#[derive(Arbitrary, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Zobrist96 {
+    inner: [u8; 12],
+}
+
+impl Zobrist96 {
+    pub fn partition(&self) -> usize {
+        usize::from(u16::from_be_bytes([self.inner[0], self.inner[1]]) >> (16 - 10))
+    }
+}
+
+impl From<Zobrist128> for Zobrist96 {
+    fn from(zobrist: Zobrist128) -> Self {
+        Zobrist96 {
+            inner: u128::from(zobrist).to_be_bytes()[..12]
+                .try_into()
+                .expect("96 bits"),
+        }
+    }
+}
+
+#[derive(Arbitrary)]
+pub struct IntermediateEntry {
+    pub hash: Zobrist96,
+    pub month: Month,
+    pub m: PackedUciMove,
+    pub game: GameId,
+    pub speed: Speed,
+    pub rating_group: RatingGroup,
+    pub outcome: KnownOutcome,
+}
+
+impl IntermediateEntry {
+    const SIZE: usize = 24;
+
+    pub fn pack<B: BufMut>(&self, buf: &mut B) {
+        buf.put_slice(&self.hash.inner);
+        self.month.pack(buf);
+        buf.put_slice(&self.m.to_bytes());
+        self.game.pack(buf);
+        buf.put_u8(
+            GroupHeader {
+                speed: self.speed,
+                rating_group: self.rating_group,
+            }
+            .to_byte(),
+        );
+        pack_outcome(buf, Outcome::Known(self.outcome));
+    }
+
+    pub fn partition(&self) -> usize {
+        (u128::from(self.hash) >> (128 - 10)) as usize
+    }
+}
 
 pub struct IntermediateSink {
     partitions: Vec<BufWriter<File>>,
@@ -27,15 +89,37 @@ impl IntermediateSink {
         })
     }
 
-    pub fn write(
-        &mut self,
-        hash: Zobrist128,
-        month: Month,
-        m: PackedUciMove,
-        game: GameId,
-        speed: Speed,
-        rating_group: RatingGroup,
-        outcome: KnownOutcome,
-    ) {
+    pub fn write(&mut self, entry: &IntermediateEntry) {
+        let mut bytes = [0; IntermediateEntry::SIZE];
+        entry.pack(&mut &mut bytes[..]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arbtest::arbtest;
+
+    #[test]
+    fn test_packed_ord() {
+        arbtest(|u| {
+            let left: IntermediateEntry = u.arbitrary()?;
+            let mut left_buf = [0; IntermediateEntry::SIZE];
+            left.pack(&mut &mut left_buf[..]);
+
+            let right: IntermediateEntry = u.arbitrary()?;
+            let mut right_buf = [0; IntermediateEntry::SIZE];
+            right.pack(&mut &mut right_buf[..]);
+
+            if left.partition() <= right.partition() {
+                assert!(left_buf <= right_buf);
+            }
+
+            if (left.hash, left.month) <= (right.hash, right.month) {
+                assert!(left_buf <= right_buf);
+            }
+
+            Ok(())
+        });
     }
 }
