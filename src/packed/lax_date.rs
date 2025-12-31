@@ -5,6 +5,8 @@ use btoi::btou;
 use bytes::{Buf, BufMut};
 use thiserror::Error;
 
+use crate::packed::Month;
+
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct LaxDate {
     year_since_1900: u8,
@@ -23,6 +25,12 @@ impl LaxDate {
 
     pub fn day(&self) -> Option<u8> {
         self.day.map(|d| d.get())
+    }
+
+    pub fn earliest_month(&self) -> Month {
+        Month::from_months_since_jan_1900(
+            u16::from(self.year_since_1900) * 12 + u16::from(self.month().unwrap_or(1)) - 1,
+        )
     }
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {

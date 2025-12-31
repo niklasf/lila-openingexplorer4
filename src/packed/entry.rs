@@ -5,7 +5,7 @@ use bytes::{Buf, BufMut};
 use rustc_hash::FxHashMap;
 use shakmaty::{Color, KnownOutcome, packed::PackedUciMove};
 
-use crate::packed::{GameId, Speed, pack_int, pack_uint, unpack_int, unpack_uint};
+use crate::packed::{GameId, Rating, Speed, pack_int, pack_uint, unpack_int, unpack_uint};
 
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RatingGroup {
@@ -20,6 +20,36 @@ pub enum RatingGroup {
     Group2500,
     Group2800,
     Group3200,
+}
+
+impl RatingGroup {
+    pub fn select(rating: Rating) -> RatingGroup {
+        let rating = i32::from(rating);
+
+        if rating < 1000 {
+            RatingGroup::Low
+        } else if rating < 1200 {
+            RatingGroup::Group1000
+        } else if rating < 1400 {
+            RatingGroup::Group1200
+        } else if rating < 1600 {
+            RatingGroup::Group1400
+        } else if rating < 1800 {
+            RatingGroup::Group1600
+        } else if rating < 2000 {
+            RatingGroup::Group1800
+        } else if rating < 2200 {
+            RatingGroup::Group2000
+        } else if rating < 2500 {
+            RatingGroup::Group2200
+        } else if rating < 2800 {
+            RatingGroup::Group2500
+        } else if rating < 3200 {
+            RatingGroup::Group2800
+        } else {
+            RatingGroup::Group3200
+        }
+    }
 }
 
 #[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]

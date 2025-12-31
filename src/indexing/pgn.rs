@@ -1,3 +1,4 @@
+use shakmaty::Color;
 use std::{io, ops::ControlFlow};
 
 use nohash_hasher::IntMap;
@@ -197,7 +198,7 @@ pub struct PreparedGameMeta {
 
 pub struct PreparedGame {
     pub meta: PreparedGameMeta,
-    pub positions: IntMap<Zobrist128, PackedUciMove>,
+    pub positions: IntMap<Zobrist128, (Color, PackedUciMove)>,
 }
 
 impl PreparedGame {
@@ -287,7 +288,10 @@ impl PreparedGame {
             })?;
             positions.insert(
                 pos.zobrist_hash(shakmaty::EnPassantMode::Legal),
-                PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
+                (
+                    pos.turn(),
+                    PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
+                ),
             );
             pos.play_unchecked(m);
         }

@@ -9,7 +9,7 @@ use arbitrary::Arbitrary;
 use bytes::BufMut;
 use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove, zobrist::Zobrist128};
 
-use crate::packed::{GameId, GroupHeader, Month, RatingGroup, Speed, pack_outcome};
+use crate::packed::{GameId, Month, Rating, Speed, outcome_bits};
 
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Zobrist96 {
@@ -37,28 +37,22 @@ pub struct IntermediateEntry {
     pub hash: Zobrist96,
     pub month: Month,
     pub m: PackedUciMove,
-    pub game: GameId,
+    pub game_id: GameId,
     pub speed: Speed,
-    pub rating_group: RatingGroup,
+    pub rating: Rating,
     pub outcome: KnownOutcome,
 }
 
 impl IntermediateEntry {
-    const SIZE: usize = 24;
+    const SIZE: usize = 25;
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        buf.put_slice(&self.hash.inner);
-        self.month.pack(buf);
-        buf.put_slice(&self.m.to_bytes());
-        self.game.pack(buf);
-        buf.put_u8(
-            GroupHeader {
-                speed: self.speed,
-                rating_group: self.rating_group,
-            }
-            .to_byte(),
-        );
-        pack_outcome(buf, Outcome::Known(self.outcome));
+        buf.put_slice(&self.hash.inner); // 12 bytes
+        self.month.pack(buf); // 2 bytes
+        buf.put_slice(&self.m.to_bytes()); // 2 bytes
+        self.game_id.pack(buf); // 6 bytes
+        buf.put_u8(self.speed.bits() | outcome_bits(Outcome::Known(self.outcome)) << 3); // 1 byte
+        self.rating.pack_fixed(buf); // 2 bytes
     }
 
     pub fn partition(&self) -> usize {

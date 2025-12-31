@@ -11,6 +11,10 @@ pub struct Month {
 }
 
 impl Month {
+    pub fn from_months_since_jan_1900(since_jan_1900: u16) -> Self {
+        Self { since_jan_1900 }
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         buf.put_u16(self.since_jan_1900);
     }

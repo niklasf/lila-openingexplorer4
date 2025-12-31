@@ -19,9 +19,19 @@ impl Rating {
         pack_int(buf, self.offset as i64);
     }
 
+    pub fn pack_fixed<B: BufMut>(&self, buf: &mut B) {
+        buf.put_i16(self.offset);
+    }
+
     pub fn unpack<B: Buf>(buf: &mut B) -> Self {
         Rating {
             offset: unpack_int(buf) as i16,
+        }
+    }
+
+    pub fn unpack_fixed<B: Buf>(buf: &mut B) -> Self {
+        Rating {
+            offset: buf.get_i16(),
         }
     }
 
@@ -93,6 +103,18 @@ mod tests {
             let mut buf = Vec::new();
             rating.pack(&mut buf);
             assert_eq!(Rating::unpack(&mut &buf[..]), rating);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_pack_fixed_roundtrip() {
+        arbtest(|u| {
+            let rating: Rating = u.arbitrary()?;
+
+            let mut buf = [0; 2];
+            rating.pack_fixed(&mut &mut buf[..]);
+            assert_eq!(Rating::unpack_fixed(&mut &buf[..]), rating);
             Ok(())
         });
     }

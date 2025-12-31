@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::packed::{LaxDate, Rating, pack_bytes, pack_string, unpack_bytes, unpack_string};
 
-pub fn pack_outcome<B: BufMut>(buf: &mut B, outcome: Outcome) {
-    buf.put_u8(match outcome {
+pub fn outcome_bits(outcome: Outcome) -> u8 {
+    match outcome {
         Outcome::Unknown => 0,
         Outcome::Known(KnownOutcome::Decisive {
             winner: Color::White,
@@ -22,11 +22,11 @@ pub fn pack_outcome<B: BufMut>(buf: &mut B, outcome: Outcome) {
             winner: Color::Black,
         }) => 2,
         Outcome::Known(KnownOutcome::Draw) => 3,
-    });
+    }
 }
 
-pub fn unpack_outcome<B: Buf>(buf: &mut B) -> Outcome {
-    match buf.get_u8() {
+pub fn outcome_from_bits(bits: u8) -> Option<Outcome> {
+    Some(match bits {
         0 => Outcome::Unknown,
         1 => Outcome::Known(KnownOutcome::Decisive {
             winner: Color::White,
@@ -35,8 +35,8 @@ pub fn unpack_outcome<B: Buf>(buf: &mut B) -> Outcome {
             winner: Color::Black,
         }),
         3 => Outcome::Known(KnownOutcome::Draw),
-        _ => panic!("invalid outcome"),
-    }
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +83,29 @@ pub enum Speed {
 }
 
 impl Speed {
+    pub fn bits(self) -> u8 {
+        match self {
+            Speed::UltraBullet => 1,
+            Speed::Bullet => 2,
+            Speed::Blitz => 3,
+            Speed::Rapid => 4,
+            Speed::Classical => 5,
+            Speed::Correspondence => 6,
+        }
+    }
+
+    pub fn from_bits(bits: u8) -> Option<Speed> {
+        Some(match bits {
+            1 => Speed::UltraBullet,
+            2 => Speed::Bullet,
+            3 => Speed::Blitz,
+            4 => Speed::Rapid,
+            5 => Speed::Classical,
+            6 => Speed::Correspondence,
+            _ => return None,
+        })
+    }
+
     fn from_seconds_and_increment(seconds: u32, increment: u32) -> Speed {
         let total = seconds.saturating_add(increment.saturating_mul(40));
 
@@ -123,38 +146,31 @@ pub enum RatingMode {
     Rated,
 }
 
+impl RatingMode {
+    pub fn bits(self) -> u8 {
+        match self {
+            RatingMode::Unrated => 0,
+            RatingMode::Rated => 1,
+        }
+    }
+
+    pub fn from_bits(bits: u8) -> Option<RatingMode> {
+        Some(match bits {
+            0 => RatingMode::Unrated,
+            1 => RatingMode::Rated,
+            _ => return None,
+        })
+    }
+}
+
 pub fn pack_speed_and_rating_mode<B: BufMut>(buf: &mut B, speed: Speed, rating_mode: RatingMode) {
-    let packed_speed = match speed {
-        Speed::UltraBullet => 1,
-        Speed::Bullet => 2,
-        Speed::Blitz => 3,
-        Speed::Rapid => 4,
-        Speed::Classical => 5,
-        Speed::Correspondence => 6,
-    };
-    let packed_rating_mode = match rating_mode {
-        RatingMode::Unrated => 0,
-        RatingMode::Rated => 1,
-    };
-    buf.put_u8(packed_speed | (packed_rating_mode << 3));
+    buf.put_u8(speed.bits() | (rating_mode.bits() << 3));
 }
 
 pub fn unpack_speed_and_rating_mode<B: Buf>(buf: &mut B) -> (Speed, RatingMode) {
     let packed = buf.get_u8();
-    let speed = match packed & 0b111 {
-        1 => Speed::UltraBullet,
-        2 => Speed::Bullet,
-        3 => Speed::Blitz,
-        4 => Speed::Rapid,
-        5 => Speed::Classical,
-        6 => Speed::Correspondence,
-        _ => panic!("invalid speed"),
-    };
-    let rating_mode = match packed >> 3 {
-        0 => RatingMode::Unrated,
-        1 => RatingMode::Rated,
-        _ => panic!("invalid rating mode"),
-    };
+    let speed = Speed::from_bits(packed & 0b111).expect("valid speed");
+    let rating_mode = RatingMode::from_bits(packed >> 3).expect("valid rating mode");
     (speed, rating_mode)
 }
 
@@ -201,7 +217,7 @@ impl LichessGame {
         self.players.white.pack(buf);
         self.players.black.pack(buf);
         self.date.pack(buf);
-        pack_outcome(buf, self.outcome);
+        buf.put_u8(outcome_bits(self.outcome));
         pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
         pack_bytes(
             buf,
@@ -219,7 +235,7 @@ impl LichessGame {
             black: GamePlayer::unpack(buf),
         };
         let date = LaxDate::unpack(buf);
-        let outcome = unpack_outcome(buf);
+        let outcome = outcome_from_bits(buf.get_u8()).expect("valid outcome");
         let (speed, rating_mode) = unpack_speed_and_rating_mode(buf);
 
         let setup = Some(unpack_bytes(buf))
