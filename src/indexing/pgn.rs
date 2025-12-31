@@ -119,7 +119,7 @@ impl ParsedGame {
                     },
                 )?);
             }
-            b"Date" => {
+            b"UTCDate" => {
                 self.date = Some(LaxDate::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
