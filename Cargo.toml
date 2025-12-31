@@ -13,10 +13,10 @@ clap = { version = "4.5.53", features = ["derive"] }
 crossbeam = "0.8.4"
 indicatif = "0.18.3"
 nohash-hasher = "0.2.0"
-pgn-reader = { version = "0.28.0", git = "https://github.com/niklasf/shakmaty.git" }
+pgn-reader = { version = "0.28.0", git = "https://github.com/niklasf/shakmaty.git", branch = "incremental-zobrist-hash" }
 #rocksdb = { version ="0.24.0", features = ["lz4", "jemalloc"], default-features = false }
 rustc-hash = "2.1.1"
-shakmaty = { version = "0.29.0", git = "https://github.com/niklasf/shakmaty.git", features = ["arbitrary", "variant", "nohash-hasher"] }
+shakmaty = { version = "0.29.0", git = "https://github.com/niklasf/shakmaty.git", branch = "incremental-zobrist-hash", features = ["arbitrary", "variant", "nohash-hasher"] }
 thiserror = "2.0.12"
 tikv-jemallocator = "0.6.1"
 zstd = "0.13.3"

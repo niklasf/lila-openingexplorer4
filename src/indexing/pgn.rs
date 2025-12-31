@@ -4,12 +4,12 @@ use std::{io, ops::ControlFlow};
 use nohash_hasher::IntMap;
 use pgn_reader::{RawTag, Skip, Visitor};
 use shakmaty::{
-    ByColor, CastlingMode, Outcome, Position,
+    ByColor, CastlingMode, EnPassantMode, Outcome, Position,
     fen::Fen,
     packed::{PackedSetup, PackedUciMove},
     san::{San, SanPlus},
     variant::{Variant, VariantPosition},
-    zobrist::{Zobrist128, ZobristHash},
+    zobrist::Zobrist128,
 };
 
 use crate::packed::{GameId, GamePlayer, LaxDate, Rating, Speed};
@@ -279,6 +279,8 @@ impl PreparedGame {
         let mut positions =
             IntMap::with_capacity_and_hasher(parsed.moves.len(), Default::default());
 
+        let mut updated_hash = None;
+
         for san in parsed.moves {
             let m = san.to_move(&pos).map_err(|err| {
                 io::Error::new(
@@ -286,13 +288,17 @@ impl PreparedGame {
                     format!("illegal san {} in game {}: {}", san, game_id, err),
                 )
             })?;
+
+            let hash = updated_hash.unwrap_or_else(|| pos.zobrist_hash(EnPassantMode::Legal));
             positions.insert(
-                pos.zobrist_hash(shakmaty::EnPassantMode::Legal),
+                hash,
                 (
                     pos.turn(),
                     PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
                 ),
             );
+
+            updated_hash = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
             pos.play_unchecked(m);
         }
 

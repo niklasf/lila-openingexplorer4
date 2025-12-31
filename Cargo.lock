@@ -392,7 +392,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "pgn-reader"
 version = "0.28.0"
-source = "git+https://github.com/niklasf/shakmaty.git#63c2a55a7228bc43bfd49584d858770ebaf60e60"
+source = "git+https://github.com/niklasf/shakmaty.git?branch=incremental-zobrist-hash#b9b8f07b6e1a0c2f7db377ea804e5b93a638129c"
 dependencies = [
  "btoi",
  "memchr",
@@ -479,7 +479,7 @@ dependencies = [
 [[package]]
 name = "shakmaty"
 version = "0.29.4"
-source = "git+https://github.com/niklasf/shakmaty.git#63c2a55a7228bc43bfd49584d858770ebaf60e60"
+source = "git+https://github.com/niklasf/shakmaty.git?branch=incremental-zobrist-hash#b9b8f07b6e1a0c2f7db377ea804e5b93a638129c"
 dependencies = [
  "arbitrary",
  "arrayvec",
