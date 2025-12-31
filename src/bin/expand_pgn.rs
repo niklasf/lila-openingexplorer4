@@ -1,6 +1,5 @@
 use lila_openingexplorer4::indexing::IntermediateEntry;
 use shakmaty::Outcome;
-use std::sync::Arc;
 use std::{ffi::OsStr, fs::File, io, path::PathBuf, thread};
 
 use clap::Parser;
@@ -27,7 +26,7 @@ fn main() -> Result<(), io::Error> {
         let (parsed_tx, parsed_rx) = channel::bounded(128);
         let (prepared_tx, prepared_rx) = channel::bounded(1000 * 1000);
 
-        for _ in 0..2 {
+        for _ in 0..1 {
             let parsed_rx = parsed_rx.clone();
             let prepared_tx = prepared_tx.clone();
             s.spawn(move || {
@@ -39,12 +38,11 @@ fn main() -> Result<(), io::Error> {
             });
         }
 
-        let sink = Arc::new(IntermediateSink::new(&args.workspace).expect("sink"));
-
-        for _ in 0..2 {
+        {
             let prepared_rx = prepared_rx.clone();
-            let sink = sink.clone();
             s.spawn(move || {
+                let mut sink = IntermediateSink::new(&args.workspace).expect("sink");
+
                 for prepared in prepared_rx {
                     if let Outcome::Known(outcome) = prepared.meta.outcome {
                         for (hash, (turn, m)) in prepared.positions {

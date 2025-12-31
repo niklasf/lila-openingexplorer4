@@ -1,4 +1,3 @@
-use std::sync::Mutex;
 use std::{
     fs::File,
     io,
@@ -62,7 +61,7 @@ impl IntermediateEntry {
 }
 
 pub struct IntermediateSink {
-    partitions: Vec<Mutex<BufWriter<File>>>,
+    partitions: Vec<BufWriter<File>>,
 }
 
 impl IntermediateSink {
@@ -70,26 +69,21 @@ impl IntermediateSink {
         Ok(IntermediateSink {
             partitions: (0..1024)
                 .map(|i| {
-                    File::create(workspace.join(format!("partition_{}", i)))
-                        .map(BufWriter::new)
-                        .map(Mutex::new)
+                    File::create(workspace.join(format!("partition_{}", i))).map(BufWriter::new)
                 })
                 .collect::<Result<_, _>>()?,
         })
     }
 
-    pub fn write(&self, entry: &IntermediateEntry) -> io::Result<()> {
+    pub fn write(&mut self, entry: &IntermediateEntry) -> io::Result<()> {
         let mut bytes = [0; IntermediateEntry::SIZE];
         entry.pack(&mut &mut bytes[..]);
-        self.partitions[entry.partition()]
-            .lock()
-            .expect("poison")
-            .write_all(&bytes)
+        self.partitions[entry.partition()].write_all(&bytes)
     }
 
-    pub fn flush(&self) -> io::Result<()> {
-        for partition in &self.partitions {
-            partition.lock().expect("poison").flush()?;
+    pub fn flush(&mut self) -> io::Result<()> {
+        for partition in &mut self.partitions {
+            partition.flush()?;
         }
         Ok(())
     }
