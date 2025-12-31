@@ -26,7 +26,7 @@ fn main() -> Result<(), io::Error> {
         let (parsed_tx, parsed_rx) = channel::bounded(128);
         let (prepared_tx, prepared_rx) = channel::bounded(1000 * 1000);
 
-        for _ in 0..1 {
+        for _ in 0..2 {
             let parsed_rx = parsed_rx.clone();
             let prepared_tx = prepared_tx.clone();
             s.spawn(move || {
