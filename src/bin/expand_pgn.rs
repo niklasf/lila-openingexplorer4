@@ -24,15 +24,26 @@ fn main() -> Result<(), io::Error> {
 
     thread::scope(|s| {
         let (parsed_tx, parsed_rx) = channel::bounded(128);
-        //let (prepared_tx, prepared_rx) = channel::bounded(1000 * 1000);
+        let (prepared_tx, prepared_rx) = channel::bounded(1000 * 1000);
 
-        {
+        for _ in 0..2 {
             let parsed_rx = parsed_rx.clone();
-            //let prepared_tx = prepared_tx.clone();
-            let mut sink = IntermediateSink::new(&args.workspace).expect("sink");
+            let prepared_tx = prepared_tx.clone();
             s.spawn(move || {
                 for parsed in parsed_rx {
-                    let prepared = PreparedGame::prepare(parsed).expect("prepare game");
+                    prepared_tx
+                        .send(PreparedGame::prepare(parsed).expect("prepare game"))
+                        .expect("send prepared game");
+                }
+            });
+        }
+
+        {
+            let prepared_rx = prepared_rx.clone();
+            s.spawn(move || {
+                let mut sink = IntermediateSink::new(&args.workspace).expect("sink");
+
+                for prepared in prepared_rx {
                     if let Outcome::Known(outcome) = prepared.meta.outcome {
                         for (hash, (turn, m)) in prepared.positions {
                             sink.write(&IntermediateEntry {
@@ -48,6 +59,7 @@ fn main() -> Result<(), io::Error> {
                         }
                     }
                 }
+
                 sink.flush().expect("flush sink");
             });
         }
