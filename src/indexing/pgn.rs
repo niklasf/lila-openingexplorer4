@@ -73,7 +73,7 @@ impl ParsedGame {
                     },
                 )?);
             }
-            b"WhiteElo" => {
+            b"WhiteElo" if value.as_bytes() != b"?" => {
                 self.white_elo = Some(Rating::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -86,7 +86,7 @@ impl ParsedGame {
                     )
                 })?);
             }
-            b"BlackElo" => {
+            b"BlackElo" if value.as_bytes() != b"?" => {
                 self.black_elo = Some(Rating::from_ascii(value.as_bytes()).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,

@@ -69,7 +69,8 @@ impl IntermediateSink {
         Ok(IntermediateSink {
             partitions: (0..1024)
                 .map(|i| {
-                    File::create(workspace.join(format!("partition_{}", i))).map(BufWriter::new)
+                    File::create(workspace.join(format!("expanded_{:04}.bin", i)))
+                        .map(BufWriter::new)
                 })
                 .collect::<Result<_, _>>()?,
         })

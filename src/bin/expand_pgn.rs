@@ -31,9 +31,14 @@ fn main() -> Result<(), io::Error> {
             let prepared_tx = prepared_tx.clone();
             s.spawn(move || {
                 for parsed in parsed_rx {
-                    prepared_tx
-                        .send(PreparedGame::prepare(parsed).expect("prepare game"))
-                        .expect("send prepared game");
+                    match PreparedGame::prepare(parsed) {
+                        Ok(prepared) => {
+                            prepared_tx.send(prepared).expect("send prepared game");
+                        }
+                        Err(err) => {
+                            eprintln!("skipping game: {}", err);
+                        }
+                    }
                 }
             });
         }
