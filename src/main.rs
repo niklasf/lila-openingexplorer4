@@ -10,8 +10,8 @@ use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
+    indexing::{GameVisitor, PreparedGame, PreparedGameMeta},
     packed::GameId,
-    pgn::{GameVisitor, PreparedGame, PreparedGameMeta},
 };
 use memmap2::{MmapMut, MmapOptions};
 use pgn_reader::Reader;
