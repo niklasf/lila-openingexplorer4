@@ -50,7 +50,7 @@ impl fmt::Display for Month {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let year = self.since_jan_1900 / 12 + 1900;
         let month = self.since_jan_1900 % 12 + 1;
-        write!(f, "{}-{}", year, month)
+        write!(f, "{}-{:02}", year, month)
     }
 }
 
@@ -77,6 +77,11 @@ mod test {
     use arbtest::arbtest;
 
     use super::*;
+
+    #[test]
+    fn test_str() {
+        assert_eq!(Month::from_months_since_jan_1900(0).to_string(), "1900-01");
+    }
 
     #[test]
     fn test_str_roundtrip() {
