@@ -39,7 +39,7 @@ impl Bitmap {
 
         file.read_to_end(&mut bitmap.buffer)?;
 
-        bitmap.buffer.resize((1 << (42 - 10)) - 1, 0);
+        bitmap.buffer.resize(1 << (42 - 10 - 3), 0);
 
         Ok(bitmap)
     }

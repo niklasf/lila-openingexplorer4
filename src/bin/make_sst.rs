@@ -79,9 +79,12 @@ fn main() -> io::Result<()> {
             }
         }
         println!(
-            "acquired {} entries, failed to acquire {} entries",
-            success, fail
+            "comitting bitmap (acquired {} entries ({:.2}%), failed to acquire {} entries) ...",
+            success,
+            success as f64 / (success + fail) as f64 * 100.0,
+            fail
         );
+        bitmap.commit()?;
     }
 
     Ok(())
