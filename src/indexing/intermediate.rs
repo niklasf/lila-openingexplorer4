@@ -44,7 +44,8 @@ pub struct IntermediateEntry {
 }
 
 impl IntermediateEntry {
-    const SIZE: usize = 25;
+    pub const KEY_SIZE: usize = 12 + 2;
+    pub const SIZE: usize = Self::KEY_SIZE + 2 + 6 + 1 + 2;
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         buf.put_slice(&self.hash.inner); // 12 bytes
