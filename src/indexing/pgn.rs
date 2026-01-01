@@ -1,10 +1,9 @@
-use shakmaty::Color;
 use std::{io, ops::ControlFlow};
 
 use nohash_hasher::IntMap;
 use pgn_reader::{RawTag, Skip, Visitor};
 use shakmaty::{
-    ByColor, CastlingMode, EnPassantMode, Outcome, Position,
+    ByColor, CastlingMode, Color, EnPassantMode, Outcome, Position,
     fen::Fen,
     packed::{PackedSetup, PackedUciMove},
     san::{San, SanPlus},

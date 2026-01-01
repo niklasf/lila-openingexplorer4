@@ -6,8 +6,7 @@ use std::{
 };
 
 use arbitrary::Arbitrary;
-use bytes::Buf;
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove, zobrist::Zobrist128};
 
 use crate::packed::{
@@ -32,6 +31,12 @@ impl Zobrist96 {
 
     pub fn partition(&self) -> usize {
         usize::from(u16::from_be_bytes([self.inner[0], self.inner[1]]) >> (16 - 10))
+    }
+
+    pub fn bitmap_index(&self) -> usize {
+        let zobrist64 = u64::from_be_bytes(self.inner[..8].try_into().expect("8 bytes"));
+        let index = zobrist64 >> (64 - 42); // Select 42 top bits
+        (index & ((1 << (42 - 10)) - 1)) as usize // Remove 10 partitions bits
     }
 }
 

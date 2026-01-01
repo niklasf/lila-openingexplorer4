@@ -1,12 +1,13 @@
-use lila_openingexplorer4::indexing::IntermediateEntry;
-use shakmaty::Outcome;
 use std::{ffi::OsStr, fs::File, io, path::PathBuf, thread};
 
 use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use lila_openingexplorer4::indexing::{GameVisitor, IntermediateSink, PreparedGame};
+use lila_openingexplorer4::indexing::{
+    GameVisitor, IntermediateEntry, IntermediateSink, PreparedGame,
+};
 use pgn_reader::Reader;
+use shakmaty::Outcome;
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]

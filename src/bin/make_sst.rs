@@ -1,9 +1,12 @@
+use std::{
+    cmp::min,
+    fs::File,
+    io::{self, Read},
+    path::PathBuf,
+};
+
 use clap::Parser;
-use lila_openingexplorer4::indexing::IntermediateEntry;
-use std::cmp::min;
-use std::fs::File;
-use std::io::{self, Read};
-use std::path::PathBuf;
+use lila_openingexplorer4::indexing::{Bitmap, IntermediateEntry};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -12,6 +15,8 @@ static ALLOC: Jemalloc = Jemalloc;
 #[derive(Parser)]
 struct Args {
     intermediate: PathBuf,
+    #[clap(long)]
+    workspace: PathBuf,
 }
 
 fn main() -> io::Result<()> {
@@ -55,6 +60,27 @@ fn main() -> io::Result<()> {
             "{:?} from partition {:04}",
             first_entry,
             first_entry.hash.partition()
+        );
+
+        println!("loading bitmap ...");
+        let mut bitmap = Bitmap::load(&args.workspace, first_entry.partition())?;
+
+        println!("reading entries ...");
+        let mut success: u64 = 0;
+        let mut fail: u64 = 0;
+        for chunk in chunks {
+            let entry = IntermediateEntry::unpack(&mut &chunk[..]);
+            assert_eq!(first_entry.partition(), entry.partition());
+
+            if bitmap.acquire(entry.hash) {
+                success += 1;
+            } else {
+                fail += 1;
+            }
+        }
+        println!(
+            "acquired {} entries, failed to acquire {} entries",
+            success, fail
         );
     }
 
