@@ -48,6 +48,14 @@ fn main() -> io::Result<()> {
                 chunk[..IntermediateEntry::KEY_SIZE].try_into().unwrap();
             key
         });
+
+        println!("checking first entry ...");
+        let first_entry = IntermediateEntry::unpack(&mut &chunks[0][..]);
+        println!(
+            "{:?} from partition {:04}",
+            first_entry,
+            first_entry.hash.partition()
+        );
     }
 
     Ok(())

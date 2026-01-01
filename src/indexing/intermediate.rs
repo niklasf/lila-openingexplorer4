@@ -6,10 +6,13 @@ use std::{
 };
 
 use arbitrary::Arbitrary;
+use bytes::Buf;
 use bytes::BufMut;
 use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove, zobrist::Zobrist128};
 
-use crate::packed::{GameId, Month, Rating, Speed, outcome_bits};
+use crate::packed::{
+    GameId, Month, Rating, Speed, outcome_bits, outcome_from_bits, unpack_uci_move,
+};
 
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Zobrist96 {
@@ -17,6 +20,16 @@ pub struct Zobrist96 {
 }
 
 impl Zobrist96 {
+    pub fn pack<B: BufMut>(&self, buf: &mut B) {
+        buf.put_slice(&self.inner);
+    }
+
+    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
+        let mut hash = Zobrist96 { inner: [0; 12] };
+        buf.copy_to_slice(&mut hash.inner);
+        hash
+    }
+
     pub fn partition(&self) -> usize {
         usize::from(u16::from_be_bytes([self.inner[0], self.inner[1]]) >> (16 - 10))
     }
@@ -32,7 +45,7 @@ impl From<Zobrist128> for Zobrist96 {
     }
 }
 
-#[derive(Arbitrary)]
+#[derive(Arbitrary, Debug, Clone, Eq, PartialEq)]
 pub struct IntermediateEntry {
     pub hash: Zobrist96,
     pub month: Month,
@@ -48,12 +61,36 @@ impl IntermediateEntry {
     pub const SIZE: usize = Self::KEY_SIZE + 2 + 6 + 1 + 2;
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        buf.put_slice(&self.hash.inner); // 12 bytes
+        self.hash.pack(buf); // 12 bytes
         self.month.pack(buf); // 2 bytes
         buf.put_slice(&self.m.to_bytes()); // 2 bytes
         self.game_id.pack(buf); // 6 bytes
         buf.put_u8(self.speed.bits() | outcome_bits(Outcome::Known(self.outcome)) << 3); // 1 byte
         self.rating.pack_fixed(buf); // 2 bytes
+    }
+
+    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
+        let hash = Zobrist96::unpack(buf);
+        let month = Month::unpack(buf);
+        let m = unpack_uci_move(buf);
+        let game_id = GameId::unpack(buf);
+        let speed_and_outcome = buf.get_u8();
+        let speed = Speed::from_bits(speed_and_outcome & 0b111).expect("valid speed");
+        let outcome = outcome_from_bits(speed_and_outcome >> 3)
+            .expect("valid outcome")
+            .known()
+            .expect("known outcome");
+        let rating = Rating::unpack_fixed(buf);
+
+        IntermediateEntry {
+            hash,
+            month,
+            m,
+            game_id,
+            speed,
+            rating,
+            outcome,
+        }
     }
 
     pub fn partition(&self) -> usize {
@@ -116,6 +153,19 @@ mod tests {
                 assert!(left_buf < right_buf);
             }
 
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_pack_roundtrip() {
+        arbtest(|u| {
+            let entry: IntermediateEntry = u.arbitrary()?;
+
+            let mut buf = [0; IntermediateEntry::SIZE];
+            entry.pack(&mut &mut buf[..]);
+            let unpacked = IntermediateEntry::unpack(&mut &buf[..]);
+            assert_eq!(entry, unpacked);
             Ok(())
         });
     }

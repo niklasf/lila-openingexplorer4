@@ -12,6 +12,12 @@ use thiserror::Error;
 
 use crate::packed::{LaxDate, Rating, pack_bytes, pack_string, unpack_bytes, unpack_string};
 
+pub fn unpack_uci_move<B: Buf>(buf: &mut B) -> PackedUciMove {
+    let mut bytes = [0; PackedUciMove::BYTES];
+    buf.copy_to_slice(&mut bytes);
+    PackedUciMove::from_bytes(bytes)
+}
+
 pub fn outcome_bits(outcome: Outcome) -> u8 {
     match outcome {
         Outcome::Unknown => 0,
@@ -244,9 +250,7 @@ impl LichessGame {
 
         let mut moves = Vec::with_capacity(buf.remaining() / 2);
         while buf.has_remaining() {
-            let mut packed_bytes = [0; 2];
-            buf.copy_to_slice(&mut packed_bytes);
-            moves.push(PackedUciMove::from_bytes(packed_bytes));
+            moves.push(unpack_uci_move(buf));
         }
 
         Self {
