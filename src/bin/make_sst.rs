@@ -68,7 +68,8 @@ fn main() -> io::Result<()> {
         println!("reading entries ...");
         let mut success: u64 = 0;
         let mut fail: u64 = 0;
-        for chunk in chunks {
+        let mut chunks = chunks.into_iter().peekable();
+        while let Some(chunk) = chunks.next() {
             let entry = IntermediateEntry::unpack(&mut &chunk[..]);
             assert_eq!(first_entry.partition(), entry.partition());
 
@@ -76,6 +77,12 @@ fn main() -> io::Result<()> {
                 success += 1;
             } else {
                 fail += 1;
+                while chunks
+                    .next_if(|c| {
+                        c[..IntermediateEntry::KEY_SIZE] == chunk[..IntermediateEntry::KEY_SIZE]
+                    })
+                    .is_some()
+                {}
             }
         }
         println!(
