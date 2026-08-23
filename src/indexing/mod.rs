@@ -1,4 +1,5 @@
 mod bitmap;
+mod game_id_set;
 mod intermediate;
 mod pgn;
 

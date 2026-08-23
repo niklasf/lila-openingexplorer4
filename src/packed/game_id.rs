@@ -16,6 +16,10 @@ impl GameId {
         bytes
     }
 
+    pub fn to_u64(self) -> u64 {
+        self.0
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         buf.put_uint(self.0, Self::SIZE);
     }
