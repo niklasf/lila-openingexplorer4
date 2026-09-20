@@ -11,7 +11,7 @@ use bytes::Bytes;
 use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use lila_openingexplorer4::indexing::{FlatGame, FlatPlayer, GameVisitor};
+use lila_openingexplorer4::indexing::{FlatGame, FlatPlayer, GameVisitor, ParsedGame};
 use parquet::{
     basic::{Compression, LogicalType, Repetition, Type as PhysicalType, ZstdLevel},
     data_type::{ByteArray, ByteArrayType, DataType, Int32Type},
@@ -29,6 +29,10 @@ use tikv_jemallocator::Jemalloc;
 static ALLOC: Jemalloc = Jemalloc;
 
 const ROW_GROUP_LEN: usize = 100_000;
+
+const FLATTEN_THREADS: usize = 2;
+
+const CHANNEL_LEN: usize = 8192;
 
 #[derive(Parser)]
 struct Args {
@@ -286,17 +290,25 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
 
     thread::scope(|s| {
-        let (parsed_tx, parsed_rx) = channel::bounded(128);
-        let (flat_tx, flat_rx) = channel::bounded(128);
+        // Flatten in round robin, so that games can be collected in the
+        // original order.
+        let mut parsed_txs = Vec::with_capacity(FLATTEN_THREADS);
+        let mut flat_rxs = Vec::with_capacity(FLATTEN_THREADS);
 
-        s.spawn(move || {
-            for parsed in parsed_rx {
-                match FlatGame::flatten(parsed) {
-                    Ok(flat) => flat_tx.send(flat).expect("send flat game"),
-                    Err(err) => eprintln!("skipping game: {}", err),
+        for _ in 0..FLATTEN_THREADS {
+            let (parsed_tx, parsed_rx) = channel::bounded::<ParsedGame>(CHANNEL_LEN);
+            let (flat_tx, flat_rx) = channel::bounded::<io::Result<FlatGame>>(CHANNEL_LEN);
+            parsed_txs.push(parsed_tx);
+            flat_rxs.push(flat_rx);
+
+            s.spawn(move || {
+                for parsed in parsed_rx {
+                    flat_tx
+                        .send(FlatGame::flatten(parsed))
+                        .expect("send flat game");
                 }
-            }
-        });
+            });
+        }
 
         s.spawn(move || {
             let file = BufWriter::new(File::create(&args.out).expect("create parquet file"));
@@ -305,16 +317,26 @@ fn main() -> io::Result<()> {
 
             let mut columns = GameColumns::default();
 
-            for flat in flat_rx {
-                columns.push(flat);
-                if columns.len >= ROW_GROUP_LEN {
-                    columns.write(&mut writer).expect("write row group");
+            'collect: loop {
+                for flat_rx in &flat_rxs {
+                    match flat_rx.recv() {
+                        Ok(Ok(flat)) => {
+                            columns.push(flat);
+                            if columns.len >= ROW_GROUP_LEN {
+                                columns.write(&mut writer).expect("write row group");
+                            }
+                        }
+                        Ok(Err(err)) => eprintln!("skipping game: {}", err),
+                        Err(channel::RecvError) => break 'collect,
+                    }
                 }
             }
 
             columns.write(&mut writer).expect("write final row group");
             writer.close().expect("close parquet file");
         });
+
+        let mut next_thread = 0;
 
         for arg in args.pgns {
             let file = File::open(&arg)?;
@@ -341,7 +363,8 @@ fn main() -> io::Result<()> {
             let mut reader = Reader::new(uncompressed);
 
             for parsed in reader.read_games(&mut GameVisitor) {
-                parsed_tx.send(parsed??).expect("send parsed game");
+                parsed_txs[next_thread].send(parsed??).expect("send parsed");
+                next_thread = (next_thread + 1) % FLATTEN_THREADS;
             }
 
             progress.finish();
