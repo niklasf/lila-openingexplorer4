@@ -13,6 +13,7 @@ clap = { version = "4.5.53", features = ["derive"] }
 crossbeam = "0.8.4"
 indicatif = "0.18.3"
 nohash-hasher = "0.2.0"
+parquet = { version = "60.0.0", default-features = false, features = ["zstd"] }
 pgn-reader = { version = "0.28.0", git = "https://github.com/niklasf/shakmaty.git", branch = "incremental-zobrist-hash" }
 roaring = "0.11.4"
 #rocksdb = { version ="0.24.0", features = ["lz4", "jemalloc"], default-features = false }

@@ -6,4 +6,4 @@ mod pgn;
 pub use bitmap::Bitmap;
 pub use game_id_set::GameIdSet;
 pub use intermediate::{IntermediateEntry, IntermediateSink};
-pub use pgn::{GameVisitor, ParsedGame, PreparedGame, PreparedGameMeta};
+pub use pgn::{FlatGame, FlatPlayer, GameVisitor, ParsedGame, PreparedGame, PreparedGameMeta};

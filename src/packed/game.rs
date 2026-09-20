@@ -112,6 +112,17 @@ impl Speed {
         })
     }
 
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Speed::UltraBullet => "ultraBullet",
+            Speed::Bullet => "bullet",
+            Speed::Blitz => "blitz",
+            Speed::Rapid => "rapid",
+            Speed::Classical => "classical",
+            Speed::Correspondence => "correspondence",
+        }
+    }
+
     fn from_seconds_and_increment(seconds: u32, increment: u32) -> Speed {
         let total = seconds.saturating_add(increment.saturating_mul(40));
 
@@ -166,6 +177,13 @@ impl RatingMode {
             1 => RatingMode::Rated,
             _ => return None,
         })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RatingMode::Unrated => "unrated",
+            RatingMode::Rated => "rated",
+        }
     }
 }
 

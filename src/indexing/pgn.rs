@@ -11,7 +11,7 @@ use shakmaty::{
     zobrist::Zobrist128,
 };
 
-use crate::packed::{GameId, GamePlayer, LaxDate, Rating, Speed};
+use crate::packed::{GameId, GamePlayer, LaxDate, Rating, RatingMode, Speed};
 
 pub struct GameVisitor;
 
@@ -184,6 +184,32 @@ impl ParsedGame {
     fn visit_outcome(&mut self, outcome: Outcome) {
         self.outcome = Some(outcome);
     }
+
+    fn initial_position(&self) -> io::Result<(VariantPosition, Option<PackedSetup>)> {
+        let variant = self.variant.unwrap_or_default();
+
+        let (pos, need_setup) = match self.fen.clone() {
+            None => (VariantPosition::new(variant), variant != Variant::Chess),
+            Some(fen) => (
+                VariantPosition::from_setup(variant, fen.into(), CastlingMode::Chess960).map_err(
+                    |err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid setup: {} @ {:?}", err, self.game_id),
+                        )
+                    },
+                )?,
+                true,
+            ),
+        };
+
+        let setup = need_setup.then(|| {
+            PackedSetup::pack_variant_normalized(&pos.to_setup(EnPassantMode::Legal), variant)
+                .expect("legal setup")
+        });
+
+        Ok((pos, setup))
+    }
 }
 
 pub struct PreparedGameMeta {
@@ -206,20 +232,7 @@ impl PreparedGame {
             .game_id
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing game id"))?;
 
-        let variant = parsed.variant.unwrap_or_default();
-        let (mut pos, need_setup) = match parsed.fen {
-            None => (VariantPosition::new(variant), variant != Variant::Chess),
-            Some(fen) => (
-                VariantPosition::from_setup(variant, fen.into(), shakmaty::CastlingMode::Chess960)
-                    .map_err(|err| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid setup in game {}: {}", game_id, err),
-                        )
-                    })?,
-                true,
-            ),
-        };
+        let (mut pos, setup) = parsed.initial_position()?;
 
         let meta = PreparedGameMeta {
             game_id,
@@ -265,13 +278,7 @@ impl PreparedGame {
                 io::ErrorKind::InvalidData,
                 format!("missing date in game {}", game_id),
             ))?,
-            setup: need_setup.then(|| {
-                PackedSetup::pack_variant_normalized(
-                    &pos.to_setup(shakmaty::EnPassantMode::Legal),
-                    variant,
-                )
-                .expect("legal setup")
-            }),
+            setup,
             outcome: parsed.outcome.unwrap_or(Outcome::Unknown),
         };
 
@@ -302,6 +309,73 @@ impl PreparedGame {
         }
 
         Ok(PreparedGame { meta, positions })
+    }
+}
+
+pub struct FlatPlayer {
+    pub title: Option<String>,
+    pub name: String,
+    pub rating: Option<Rating>,
+}
+
+pub struct FlatGame {
+    pub players: ByColor<FlatPlayer>,
+    pub date: Option<LaxDate>,
+    pub outcome: Outcome,
+    pub speed: Option<Speed>,
+    pub rating_mode: RatingMode,
+    pub setup: Option<PackedSetup>,
+    pub moves: Vec<PackedUciMove>,
+}
+
+impl FlatGame {
+    pub fn flatten(parsed: ParsedGame) -> io::Result<FlatGame> {
+        let (mut pos, setup) = parsed.initial_position()?;
+
+        let mut moves = Vec::with_capacity(parsed.moves.len());
+
+        for san in &parsed.moves {
+            let m = san.to_move(&pos).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("illegal san {}: {} @ {:?}", san, err, parsed.game_id),
+                )
+            })?;
+
+            moves.push(PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)));
+            pos.play_unchecked(m);
+        }
+
+        Ok(FlatGame {
+            players: ByColor {
+                white: FlatPlayer {
+                    title: parsed.white_title,
+                    name: parsed.white.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("missing white name @ {:?}", parsed.game_id),
+                        )
+                    })?,
+                    rating: parsed.white_elo,
+                },
+                black: FlatPlayer {
+                    title: parsed.black_title,
+                    name: parsed.black.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("missing black name @ {:?}", parsed.game_id),
+                        )
+                    })?,
+                    rating: parsed.black_elo,
+                },
+            },
+            date: parsed.date,
+            outcome: parsed.outcome.unwrap_or(Outcome::Unknown),
+            speed: parsed.speed,
+            rating_mode: RatingMode::Rated, // TODO: from Event tag
+            setup,
+            moves,
+        })
     }
 }
 
