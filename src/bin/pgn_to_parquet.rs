@@ -30,9 +30,9 @@ static ALLOC: Jemalloc = Jemalloc;
 
 const ROW_GROUP_LEN: usize = 100_000;
 
-const FLATTEN_THREADS: usize = 2;
+const FLATTEN_THREADS: usize = 2; // Enough to keep up with parsed games
 
-const CHANNEL_LEN: usize = 8192;
+const CHANNEL_LEN: usize = 32768; // Enough to buffer while previous row group is being written
 
 #[derive(Parser)]
 struct Args {
@@ -100,8 +100,10 @@ fn schema() -> TypePtr {
 fn properties() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(3).expect("zstd level"),
+            ZstdLevel::try_new(9).expect("zstd level"),
         ))
+        .set_data_page_size_limit(8 * 1024 * 1024)
+        .set_data_page_row_count_limit(usize::MAX)
         .set_column_dictionary_enabled(ColumnPath::from("moves"), false)
         .set_column_statistics_enabled(ColumnPath::from("moves"), EnabledStatistics::None)
         .set_column_dictionary_enabled(ColumnPath::from("setup"), false)
