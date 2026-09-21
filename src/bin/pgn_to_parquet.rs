@@ -11,10 +11,15 @@ use bytes::Bytes;
 use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use lila_openingexplorer4::indexing::{FlatGame, FlatPlayer, GameVisitor, ParsedGame};
+use lila_openingexplorer4::{
+    indexing::{FlatGame, FlatPlayer, GameVisitor, ParsedGame},
+    packed::GameId,
+};
 use parquet::{
     basic::{Compression, LogicalType, Repetition, Type as PhysicalType, ZstdLevel},
-    data_type::{ByteArray, ByteArrayType, DataType, Int32Type},
+    data_type::{
+        ByteArray, ByteArrayType, DataType, FixedLenByteArray, FixedLenByteArrayType, Int32Type,
+    },
     file::{
         properties::{EnabledStatistics, WriterProperties},
         writer::{SerializedFileWriter, SerializedRowGroupWriter},
@@ -73,10 +78,21 @@ fn binary(name: &str, repetition: Repetition) -> TypePtr {
     primitive(name, PhysicalType::BYTE_ARRAY, None, repetition)
 }
 
+fn fixed_binary(name: &str, len: i32, repetition: Repetition) -> TypePtr {
+    Arc::new(
+        Type::primitive_type_builder(name, PhysicalType::FIXED_LEN_BYTE_ARRAY)
+            .with_length(len)
+            .with_repetition(repetition)
+            .build()
+            .expect("fixed len byte array type"),
+    )
+}
+
 fn schema() -> TypePtr {
     Arc::new(
         Type::group_type_builder("game")
             .with_fields(vec![
+                fixed_binary("game_id", GameId::SIZE as i32, Repetition::REQUIRED),
                 string("white_title", Repetition::OPTIONAL),
                 string("white_name", Repetition::REQUIRED),
                 int32("white_rating", Repetition::OPTIONAL),
@@ -104,6 +120,8 @@ fn properties() -> WriterProperties {
         ))
         .set_data_page_size_limit(8 * 1024 * 1024)
         .set_data_page_row_count_limit(usize::MAX)
+        .set_column_dictionary_enabled(ColumnPath::from("game_id"), false)
+        .set_column_statistics_enabled(ColumnPath::from("game_id"), EnabledStatistics::None)
         .set_column_dictionary_enabled(ColumnPath::from("moves"), false)
         .set_column_statistics_enabled(ColumnPath::from("moves"), EnabledStatistics::None)
         .set_column_dictionary_enabled(ColumnPath::from("setup"), false)
@@ -169,6 +187,7 @@ fn write_required<T: DataType, W: Write + Send>(
 #[derive(Default)]
 struct GameColumns {
     len: usize,
+    game_id: Vec<FixedLenByteArray>,
     white_title: OptionalColumn<ByteArray>,
     white_name: Vec<ByteArray>,
     white_rating: OptionalColumn<i32>,
@@ -187,6 +206,9 @@ struct GameColumns {
 
 impl GameColumns {
     fn push(&mut self, game: FlatGame) {
+        self.game_id
+            .push(FixedLenByteArray::from(game.game_id.to_bytes().to_vec()));
+
         push_player(
             &mut self.white_title,
             &mut self.white_name,
@@ -234,6 +256,7 @@ impl GameColumns {
         }
 
         let mut row_group = writer.next_row_group()?;
+        write_required::<FixedLenByteArrayType, _>(&mut row_group, &self.game_id)?;
         write_optional::<ByteArrayType, _>(&mut row_group, &self.white_title)?;
         write_required::<ByteArrayType, _>(&mut row_group, &self.white_name)?;
         write_optional::<Int32Type, _>(&mut row_group, &self.white_rating)?;
@@ -256,6 +279,7 @@ impl GameColumns {
 
     fn clear(&mut self) {
         self.len = 0;
+        self.game_id.clear();
         self.white_title.clear();
         self.white_name.clear();
         self.white_rating.clear();

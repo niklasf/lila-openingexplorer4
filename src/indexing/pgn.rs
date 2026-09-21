@@ -319,6 +319,7 @@ pub struct FlatPlayer {
 }
 
 pub struct FlatGame {
+    pub game_id: GameId,
     pub players: ByColor<FlatPlayer>,
     pub date: Option<LaxDate>,
     pub outcome: Outcome,
@@ -330,6 +331,10 @@ pub struct FlatGame {
 
 impl FlatGame {
     pub fn flatten(parsed: ParsedGame) -> io::Result<FlatGame> {
+        let game_id = parsed
+            .game_id
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing game id"))?;
+
         let (mut pos, setup) = parsed.initial_position()?;
 
         let mut moves = Vec::with_capacity(parsed.moves.len());
@@ -338,7 +343,7 @@ impl FlatGame {
             let m = san.to_move(&pos).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("illegal san {}: {} @ {:?}", san, err, parsed.game_id),
+                    format!("illegal san {}: {} @ {:?}", san, err, game_id),
                 )
             })?;
 
@@ -347,13 +352,14 @@ impl FlatGame {
         }
 
         Ok(FlatGame {
+            game_id,
             players: ByColor {
                 white: FlatPlayer {
                     title: parsed.white_title,
                     name: parsed.white.ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("missing white name @ {:?}", parsed.game_id),
+                            format!("missing white name @ {:?}", game_id),
                         )
                     })?,
                     rating: parsed.white_elo,
@@ -363,7 +369,7 @@ impl FlatGame {
                     name: parsed.black.ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("missing black name @ {:?}", parsed.game_id),
+                            format!("missing black name @ {:?}", game_id),
                         )
                     })?,
                     rating: parsed.black_elo,
