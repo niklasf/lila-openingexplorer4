@@ -185,6 +185,10 @@ impl ParsedGame {
         self.outcome = Some(outcome);
     }
 
+    pub fn game_id(&self) -> Option<GameId> {
+        self.game_id
+    }
+
     fn initial_position(&self) -> io::Result<(VariantPosition, Option<PackedSetup>)> {
         let variant = self.variant.unwrap_or_default();
 

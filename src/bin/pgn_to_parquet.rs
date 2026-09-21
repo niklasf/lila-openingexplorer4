@@ -12,7 +12,7 @@ use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
-    indexing::{FlatGame, FlatPlayer, GameVisitor, ParsedGame},
+    indexing::{FlatGame, FlatPlayer, GameVisitor, ParsedGame, RecentGameIds},
     packed::GameId,
 };
 use parquet::{
@@ -364,6 +364,10 @@ fn main() -> io::Result<()> {
 
         let mut next_thread = 0;
 
+        // Consecutive database files can overlap, so that some games appear
+        // twice.
+        let mut recent_game_ids = RecentGameIds::new();
+
         for arg in args.pgns {
             let file = File::open(&arg)?;
             let progress = ProgressBar::with_draw_target(
@@ -389,11 +393,24 @@ fn main() -> io::Result<()> {
             let mut reader = Reader::new(uncompressed);
 
             for parsed in reader.read_games(&mut GameVisitor) {
-                parsed_txs[next_thread].send(parsed??).expect("send parsed");
+                let parsed = parsed??;
+
+                if parsed
+                    .game_id()
+                    .is_some_and(|game_id| !recent_game_ids.insert(game_id))
+                {
+                    continue;
+                }
+
+                parsed_txs[next_thread].send(parsed).expect("send parsed");
                 next_thread = (next_thread + 1) % FLATTEN_THREADS;
             }
 
             progress.finish();
+        }
+
+        if recent_game_ids.duplicates() > 0 {
+            eprintln!("skipped {} duplicate games", recent_game_ids.duplicates());
         }
 
         Ok(())
