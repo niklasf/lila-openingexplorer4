@@ -393,7 +393,13 @@ fn main() -> io::Result<()> {
             let mut reader = Reader::new(uncompressed);
 
             for parsed in reader.read_games(&mut GameVisitor) {
-                let parsed = parsed??;
+                let parsed = match parsed? {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        eprintln!("skipping game: {}", err);
+                        continue;
+                    }
+                };
 
                 if parsed
                     .game_id()
