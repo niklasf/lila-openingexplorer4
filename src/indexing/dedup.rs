@@ -13,9 +13,10 @@ pub struct RecentGameIds {
 
 impl RecentGameIds {
     pub fn new() -> Self {
-        // Enough to dedup *consecutive* overlapping monthly databases in mixed
-        // timezones (such as March/April 2018).
-        Self::with_generation_len(1_000_000)
+        // Enough to deal with historical timezone inconsistency, causing
+        // March/April 2018 games to overlap (assuming the monthly files are
+        // indexed consecutively).
+        Self::with_generation_len(100_000)
     }
 
     pub fn with_generation_len(generation_len: usize) -> Self {
