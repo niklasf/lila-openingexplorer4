@@ -14,6 +14,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
     indexing::{FlatGame, FlatPlayer, GameVisitor, ParsedGame, RecentGameIds},
     packed::GameId,
+    parquet::OptionalColumn,
 };
 use parquet::{
     basic::{Compression, LogicalType, Repetition, Type as PhysicalType, ZstdLevel},
@@ -133,45 +134,14 @@ fn static_byte_array(value: &'static str) -> ByteArray {
     ByteArray::from(Bytes::from_static(value.as_bytes()))
 }
 
-struct OptionalColumn<T> {
-    values: Vec<T>,
-    def_levels: Vec<i16>,
-}
-
-impl<T> Default for OptionalColumn<T> {
-    fn default() -> Self {
-        OptionalColumn {
-            values: Vec::new(),
-            def_levels: Vec::new(),
-        }
-    }
-}
-
-impl<T> OptionalColumn<T> {
-    fn push(&mut self, value: Option<T>) {
-        match value {
-            Some(value) => {
-                self.values.push(value);
-                self.def_levels.push(1);
-            }
-            None => self.def_levels.push(0),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.values.clear();
-        self.def_levels.clear();
-    }
-}
-
 fn write_optional<T: DataType, W: Write + Send>(
     row_group: &mut SerializedRowGroupWriter<'_, W>,
-    column: &OptionalColumn<T::T>,
+    column: &OptionalColumn<T>,
 ) -> parquet::errors::Result<()> {
     let mut writer = row_group.next_column()?.expect("column");
     writer
         .typed::<T>()
-        .write_batch(&column.values, Some(&column.def_levels), None)?;
+        .write_batch(column.values(), Some(column.def_levels()), None)?;
     writer.close()
 }
 
@@ -188,19 +158,19 @@ fn write_required<T: DataType, W: Write + Send>(
 struct GameColumns {
     len: usize,
     game_id: Vec<FixedLenByteArray>,
-    white_title: OptionalColumn<ByteArray>,
+    white_title: OptionalColumn<ByteArrayType>,
     white_name: Vec<ByteArray>,
-    white_rating: OptionalColumn<i32>,
-    black_title: OptionalColumn<ByteArray>,
+    white_rating: OptionalColumn<Int32Type>,
+    black_title: OptionalColumn<ByteArrayType>,
     black_name: Vec<ByteArray>,
-    black_rating: OptionalColumn<i32>,
-    date_year: OptionalColumn<i32>,
-    date_month: OptionalColumn<i32>,
-    date_day: OptionalColumn<i32>,
+    black_rating: OptionalColumn<Int32Type>,
+    date_year: OptionalColumn<Int32Type>,
+    date_month: OptionalColumn<Int32Type>,
+    date_day: OptionalColumn<Int32Type>,
     outcome: Vec<ByteArray>,
-    speed: OptionalColumn<ByteArray>,
+    speed: OptionalColumn<ByteArrayType>,
     rating_mode: Vec<ByteArray>,
-    setup: OptionalColumn<ByteArray>,
+    setup: OptionalColumn<ByteArrayType>,
     moves: Vec<ByteArray>,
 }
 
@@ -298,9 +268,9 @@ impl GameColumns {
 }
 
 fn push_player(
-    titles: &mut OptionalColumn<ByteArray>,
+    titles: &mut OptionalColumn<ByteArrayType>,
     names: &mut Vec<ByteArray>,
-    ratings: &mut OptionalColumn<i32>,
+    ratings: &mut OptionalColumn<Int32Type>,
     player: FlatPlayer,
 ) {
     titles.push(
