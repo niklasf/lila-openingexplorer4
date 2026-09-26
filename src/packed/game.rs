@@ -123,6 +123,18 @@ impl Speed {
         }
     }
 
+    pub fn from_ascii(bytes: &[u8]) -> Result<Speed, InvalidSpeed> {
+        Ok(match bytes {
+            b"ultraBullet" => Speed::UltraBullet,
+            b"bullet" => Speed::Bullet,
+            b"blitz" => Speed::Blitz,
+            b"rapid" => Speed::Rapid,
+            b"classical" => Speed::Classical,
+            b"correspondence" => Speed::Correspondence,
+            _ => return Err(InvalidSpeed),
+        })
+    }
+
     fn from_seconds_and_increment(seconds: u32, increment: u32) -> Speed {
         let total = seconds.saturating_add(increment.saturating_mul(40));
 
@@ -185,7 +197,19 @@ impl RatingMode {
             RatingMode::Rated => "rated",
         }
     }
+
+    pub fn from_ascii(bytes: &[u8]) -> Result<RatingMode, InvalidRatingMode> {
+        Ok(match bytes {
+            b"unrated" => RatingMode::Unrated,
+            b"rated" => RatingMode::Rated,
+            _ => return Err(InvalidRatingMode),
+        })
+    }
 }
+
+#[derive(Debug, Error)]
+#[error("invalid rating mode")]
+pub struct InvalidRatingMode;
 
 pub fn pack_speed_and_rating_mode<B: BufMut>(buf: &mut B, speed: Speed, rating_mode: RatingMode) {
     buf.put_u8(speed.bits() | (rating_mode.bits() << 3));
@@ -313,6 +337,30 @@ mod tests {
     use arbtest::arbtest;
 
     use super::*;
+
+    #[test]
+    fn test_speed_str_roundtrip() {
+        for speed in [
+            Speed::UltraBullet,
+            Speed::Bullet,
+            Speed::Blitz,
+            Speed::Rapid,
+            Speed::Classical,
+            Speed::Correspondence,
+        ] {
+            assert_eq!(Speed::from_ascii(speed.as_str().as_bytes()).unwrap(), speed);
+        }
+    }
+
+    #[test]
+    fn test_rating_mode_str_roundtrip() {
+        for rating_mode in [RatingMode::Unrated, RatingMode::Rated] {
+            assert_eq!(
+                RatingMode::from_ascii(rating_mode.as_str().as_bytes()).unwrap(),
+                rating_mode
+            );
+        }
+    }
 
     #[test]
     fn test_speed_from_time_control_tag() {

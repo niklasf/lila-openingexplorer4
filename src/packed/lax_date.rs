@@ -33,6 +33,30 @@ impl LaxDate {
         )
     }
 
+    pub fn from_ymd(year: u32, month: Option<u8>, day: Option<u8>) -> Result<Self, InvalidLaxDate> {
+        Ok(LaxDate {
+            year_since_1900: year
+                .checked_sub(1900)
+                .and_then(|year_since_1900| u8::try_from(year_since_1900).ok())
+                .ok_or(InvalidLaxDate)?,
+            month: month
+                .map(|month| {
+                    NonZeroU8::new(month)
+                        .filter(|m| m.get() <= 12)
+                        .ok_or(InvalidLaxDate)
+                })
+                .transpose()?,
+            day: day
+                .map(|day| {
+                    NonZeroU8::new(day)
+                        .filter(|d| d.get() <= 31)
+                        .ok_or(InvalidLaxDate)
+                })
+                .transpose()?
+                .filter(|_| month.is_some()),
+        })
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         buf.put_u8(self.year_since_1900);
         buf.put_u8(self.month.map_or(0, |m| m.get()));
@@ -179,6 +203,19 @@ mod tests {
             right.pack(&mut right_buf);
 
             assert_eq!(left_buf.cmp(&right_buf), left.cmp(&right));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_from_parts_roundtrip() {
+        arbtest(|u| {
+            let lax_date: LaxDate = u.arbitrary()?;
+
+            assert_eq!(
+                LaxDate::from_ymd(lax_date.year(), lax_date.month(), lax_date.day()).unwrap(),
+                lax_date
+            );
             Ok(())
         });
     }
