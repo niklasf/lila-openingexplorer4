@@ -1,4 +1,6 @@
-use parquet::data_type::DataType;
+use parquet::{
+    column::reader::get_typed_column_reader, data_type::DataType, file::reader::RowGroupReader,
+};
 
 pub struct OptionalColumn<T: DataType> {
     values: Vec<T::T>,
@@ -36,5 +38,38 @@ impl<T: DataType> OptionalColumn<T> {
     pub fn clear(&mut self) {
         self.values.clear();
         self.def_levels.clear();
+    }
+
+    pub fn reserve(&mut self, additional_rows: usize) {
+        self.values.reserve(additional_rows);
+        self.def_levels.reserve(additional_rows);
+    }
+
+    pub fn fill_rows(
+        &mut self,
+        reader: &dyn RowGroupReader,
+        column: usize,
+        num_rows: usize,
+    ) -> parquet::errors::Result<()> {
+        self.clear();
+        self.reserve(num_rows);
+
+        let mut column_reader = get_typed_column_reader::<T>(reader.get_column_reader(column)?);
+
+        let mut records = 0;
+        while records < num_rows {
+            let (read, _, _) = column_reader.read_records(
+                num_rows - records,
+                Some(&mut self.def_levels),
+                None,
+                &mut self.values,
+            )?;
+            if read == 0 {
+                break;
+            }
+            records += read;
+        }
+
+        Ok(())
     }
 }

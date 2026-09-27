@@ -157,21 +157,21 @@ fn write_required<T: DataType, W: Write + Send>(
 #[derive(Default)]
 struct GameColumns {
     len: usize,
-    game_id: Vec<FixedLenByteArray>,
-    white_title: OptionalColumn<ByteArrayType>,
-    white_name: Vec<ByteArray>,
-    white_rating: OptionalColumn<Int32Type>,
-    black_title: OptionalColumn<ByteArrayType>,
-    black_name: Vec<ByteArray>,
-    black_rating: OptionalColumn<Int32Type>,
-    date_year: OptionalColumn<Int32Type>,
-    date_month: OptionalColumn<Int32Type>,
-    date_day: OptionalColumn<Int32Type>,
-    outcome: Vec<ByteArray>,
-    speed: OptionalColumn<ByteArrayType>,
-    rating_mode: Vec<ByteArray>,
-    setup: OptionalColumn<ByteArrayType>,
-    moves: Vec<ByteArray>,
+    game_id: Vec<FixedLenByteArray>,            // 0
+    white_title: OptionalColumn<ByteArrayType>, // 1
+    white_name: Vec<ByteArray>,                 // 2
+    white_rating: OptionalColumn<Int32Type>,    // 3
+    black_title: OptionalColumn<ByteArrayType>, // 4
+    black_name: Vec<ByteArray>,                 // 5
+    black_rating: OptionalColumn<Int32Type>,    // 6
+    date_year: OptionalColumn<Int32Type>,       // 7
+    date_month: OptionalColumn<Int32Type>,      // 8
+    date_day: OptionalColumn<Int32Type>,        // 9
+    outcome: Vec<ByteArray>,                    // 10
+    speed: OptionalColumn<ByteArrayType>,       // 11
+    rating_mode: Vec<ByteArray>,                // 12
+    setup: OptionalColumn<ByteArrayType>,       // 13
+    moves: Vec<ByteArray>,                      // 14
 }
 
 impl GameColumns {

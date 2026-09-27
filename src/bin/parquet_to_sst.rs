@@ -1,7 +1,7 @@
 use std::{io, path::PathBuf};
 
 use clap::Parser;
-use lila_openingexplorer4::parquet::{OptionalColumn, PositionalFile};
+use lila_openingexplorer4::parquet::OptionalColumn;
 use parquet::{
     column::reader::get_typed_column_reader,
     data_type::{
@@ -44,16 +44,30 @@ impl Columns {
         reader: &dyn RowGroupReader,
         num_rows: usize,
     ) -> parquet::errors::Result<()> {
-        read_required::<FixedLenByteArrayType>(reader, 0, num_rows, &mut self.game_id)?;
+        read_required::<FixedLenByteArrayType>(&mut self.game_id, reader, 0, num_rows)?;
+        self.players.white.title.fill_rows(reader, 1, num_rows)?;
+        read_required::<ByteArrayType>(&mut self.players.white.name, reader, 2, num_rows)?;
+        self.players.white.rating.fill_rows(reader, 3, num_rows)?;
+        self.players.black.title.fill_rows(reader, 4, num_rows)?;
+        read_required::<ByteArrayType>(&mut self.players.black.name, reader, 5, num_rows)?;
+        self.players.black.rating.fill_rows(reader, 6, num_rows)?;
+        self.date_year.fill_rows(reader, 7, num_rows)?;
+        self.date_month.fill_rows(reader, 8, num_rows)?;
+        self.date_day.fill_rows(reader, 9, num_rows)?;
+        read_required::<ByteArrayType>(&mut self.outcome, reader, 10, num_rows)?;
+        self.speed.fill_rows(reader, 11, num_rows)?;
+        read_required::<ByteArrayType>(&mut self.rating_mode, reader, 12, num_rows)?;
+        self.setup.fill_rows(reader, 13, num_rows)?;
+        read_required::<ByteArrayType>(&mut self.moves, reader, 14, num_rows)?;
         Ok(())
     }
 }
 
 fn read_required<T: DataType>(
+    values: &mut Vec<T::T>,
     reader: &dyn RowGroupReader,
     column: usize,
     num_rows: usize,
-    values: &mut Vec<T::T>,
 ) -> parquet::errors::Result<()> {
     values.clear();
     values.reserve(num_rows);
