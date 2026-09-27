@@ -50,13 +50,15 @@ impl<T: DataType> RequiredColumn<T> {
     pub fn read_column(
         &mut self,
         reader: &dyn RowGroupReader,
-        column: usize,
-        num_rows: usize,
+        column_index: usize,
     ) -> parquet::errors::Result<()> {
+        let num_rows = reader.metadata().num_rows() as usize;
+
         self.clear();
         self.reserve(num_rows);
 
-        let mut column_reader = get_typed_column_reader::<T>(reader.get_column_reader(column)?);
+        let mut column_reader =
+            get_typed_column_reader::<T>(reader.get_column_reader(column_index)?);
 
         let mut records = 0;
         while records < num_rows {
