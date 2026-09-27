@@ -2,10 +2,10 @@ use std::{io::Write, sync::Arc};
 
 use bytes::Bytes;
 use parquet::{
-    basic::{Compression, LogicalType, Repetition, Type as PhysicalType, ZstdLevel},
+    basic::{LogicalType, Repetition, Type as PhysicalType},
     data_type::{ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int32Type},
     file::{
-        properties::{EnabledStatistics, WriterProperties},
+        properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder},
         reader::RowGroupReader,
         writer::{SerializedFileWriter, SerializedRowGroupWriter},
     },
@@ -62,7 +62,7 @@ impl PlayerColumns {
         Ok(())
     }
 
-    pub fn scatter(&self, partitions: &[usize], targets: &mut [&mut PlayerColumns]) {
+    pub fn scatter(&self, partitions: &[Option<usize>], targets: &mut [&mut PlayerColumns]) {
         self.title
             .scatter(partitions, &mut project(targets, |t| &mut t.title));
         self.name
@@ -203,8 +203,12 @@ impl GameColumns {
         Ok(())
     }
 
-    pub fn scatter(&self, partition: impl Fn(GameId) -> usize, targets: &mut [&mut GameColumns]) {
-        let partitions: Vec<usize> = self
+    pub fn scatter(
+        &self,
+        partition: impl Fn(GameId) -> Option<usize>,
+        targets: &mut [&mut GameColumns],
+    ) {
+        let partitions: Vec<Option<usize>> = self
             .game_id
             .iter()
             .map(|game_id| partition(GameId::unpack(&mut game_id.data())))
@@ -261,11 +265,8 @@ impl GameColumns {
         )
     }
 
-    pub fn properties() -> WriterProperties {
+    pub fn properties() -> WriterPropertiesBuilder {
         WriterProperties::builder()
-            .set_compression(Compression::ZSTD(
-                ZstdLevel::try_new(9).expect("zstd level"),
-            ))
             .set_data_page_size_limit(8 * 1024 * 1024)
             .set_data_page_row_count_limit(usize::MAX)
             .set_column_dictionary_enabled(ColumnPath::from("game_id"), false)
@@ -274,7 +275,6 @@ impl GameColumns {
             .set_column_statistics_enabled(ColumnPath::from("moves"), EnabledStatistics::None)
             .set_column_dictionary_enabled(ColumnPath::from("setup"), false)
             .set_column_statistics_enabled(ColumnPath::from("setup"), EnabledStatistics::None)
-            .build()
     }
 }
 

@@ -52,9 +52,11 @@ impl<T: DataType> OptionalColumn<T> {
             .map(move |&def_level| if def_level > 0 { values.next() } else { None })
     }
 
-    pub fn scatter(&self, partitions: &[usize], targets: &mut [&mut Self]) {
+    pub fn scatter(&self, partitions: &[Option<usize>], targets: &mut [&mut Self]) {
         for (value, &partition) in self.iter().zip(partitions) {
-            targets[partition].push(value.cloned());
+            if let Some(partition) = partition {
+                targets[partition].push(value.cloned());
+            }
         }
     }
 

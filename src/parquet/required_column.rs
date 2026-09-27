@@ -37,9 +37,11 @@ impl<T: DataType> RequiredColumn<T> {
         self.values.iter()
     }
 
-    pub fn scatter(&self, partitions: &[usize], targets: &mut [&mut Self]) {
+    pub fn scatter(&self, partitions: &[Option<usize>], targets: &mut [&mut Self]) {
         for (value, &partition) in self.values.iter().zip(partitions) {
-            targets[partition].push(value.clone());
+            if let Some(partition) = partition {
+                targets[partition].push(value.clone());
+            }
         }
     }
 

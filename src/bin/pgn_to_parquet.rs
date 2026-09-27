@@ -7,7 +7,10 @@ use lila_openingexplorer4::{
     indexing::{FlatGame, GameVisitor, ParsedGame, RecentGameIds},
     parquet::GameColumns,
 };
-use parquet::file::writer::SerializedFileWriter;
+use parquet::{
+    basic::{Compression, ZstdLevel},
+    file::writer::SerializedFileWriter,
+};
 use pgn_reader::Reader;
 use tikv_jemallocator::Jemalloc;
 
@@ -56,7 +59,11 @@ fn main() -> io::Result<()> {
             let mut writer = SerializedFileWriter::new(
                 file,
                 GameColumns::schema(),
-                Arc::new(GameColumns::properties()),
+                Arc::new(
+                    GameColumns::properties()
+                        .set_compression(Compression::ZSTD(ZstdLevel::try_new(9).unwrap()))
+                        .build(),
+                ),
             )
             .expect("parquet writer");
 
