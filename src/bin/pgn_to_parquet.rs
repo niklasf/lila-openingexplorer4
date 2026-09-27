@@ -59,7 +59,7 @@ fn main() -> io::Result<()> {
         }
 
         s.spawn(move || {
-            let file = BufWriter::new(File::create(&args.out).expect("create parquet file"));
+            let file = File::create(&args.out).expect("create parquet file");
             let mut writer = SerializedFileWriter::new(
                 file,
                 GameColumns::schema(),

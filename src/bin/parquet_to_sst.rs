@@ -1,18 +1,43 @@
-use std::{io, path::PathBuf};
+use std::{fs::File, io, path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use crossbeam::channel;
 use lila_openingexplorer4::parquet::{GameColumns, PositionalFile};
-use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::{
+    reader::{FileReader, SerializedFileReader},
+    writer::SerializedFileWriter,
+};
 use std::thread;
 
 const CHANNEL_SIZE: usize = 128;
 
 const READ_THREADS: usize = 4;
 
+const DISK_PARTITION_BITS: usize = 3;
+
 #[derive(Parser)]
 struct Args {
     parquet: PathBuf,
+}
+
+struct DiskPartition {
+    buffer: GameColumns,
+    writer: SerializedFileWriter<File>,
+}
+
+impl DiskPartition {
+    pub fn new(disk_partition: usize) -> DiskPartition {
+        DiskPartition {
+            buffer: GameColumns::default(),
+            writer: SerializedFileWriter::new(
+                File::create(format!("games_{disk_partition}.parquet"))
+                    .expect("create partition file"),
+                GameColumns::schema(),
+                Arc::new(GameColumns::properties()),
+            )
+            .expect("partition writer"),
+        }
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -41,7 +66,13 @@ fn main() -> io::Result<()> {
             });
         }
 
-        for _columns in rx {}
+        let partitions: Vec<_> = (0..(1 << DISK_PARTITION_BITS))
+            .map(DiskPartition::new)
+            .collect();
+
+        for _columns in rx {
+            todo!()
+        }
 
         Ok(())
     })
