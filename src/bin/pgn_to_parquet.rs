@@ -1,11 +1,4 @@
-use std::{
-    ffi::OsStr,
-    fs::File,
-    io::{self, BufWriter},
-    path::PathBuf,
-    sync::Arc,
-    thread,
-};
+use std::{ffi::OsStr, fs::File, io, path::PathBuf, sync::Arc, thread};
 
 use clap::Parser;
 use crossbeam::channel;

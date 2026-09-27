@@ -1,4 +1,4 @@
-use std::{fs::File, io, path::PathBuf, sync::Arc};
+use std::{fs::File, io, path::PathBuf, sync::Arc, thread};
 
 use clap::Parser;
 use crossbeam::channel;
@@ -7,7 +7,6 @@ use parquet::file::{
     reader::{FileReader, SerializedFileReader},
     writer::SerializedFileWriter,
 };
-use std::thread;
 
 const CHANNEL_SIZE: usize = 128;
 

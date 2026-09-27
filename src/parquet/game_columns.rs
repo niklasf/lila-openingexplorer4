@@ -1,10 +1,5 @@
 use std::{io::Write, sync::Arc};
 
-use crate::{
-    indexing::{FlatGame, FlatPlayer},
-    packed::GameId,
-    parquet::{OptionalColumn, RequiredColumn},
-};
 use bytes::Bytes;
 use parquet::{
     basic::{Compression, LogicalType, Repetition, Type as PhysicalType, ZstdLevel},
@@ -17,6 +12,12 @@ use parquet::{
     schema::types::{ColumnPath, Type, TypePtr},
 };
 use shakmaty::{ByColor, packed::PackedUciMove};
+
+use crate::{
+    indexing::{FlatGame, FlatPlayer},
+    packed::GameId,
+    parquet::{OptionalColumn, RequiredColumn},
+};
 
 #[derive(Default)]
 pub struct PlayerColumns {
