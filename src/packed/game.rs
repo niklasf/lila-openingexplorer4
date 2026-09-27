@@ -140,7 +140,7 @@ impl Speed {
 
         if total < 30 {
             Speed::UltraBullet
-        } else if total < 100 {
+        } else if total < 180 {
             Speed::Bullet
         } else if total < 480 {
             Speed::Blitz
@@ -290,7 +290,7 @@ impl LichessGame {
             .filter(|bytes| !bytes.is_empty())
             .map(|bytes| PackedSetup::try_from_bytes(&bytes).expect("packed setup"));
 
-        let mut moves = Vec::with_capacity(buf.remaining() / 2);
+        let mut moves = Vec::with_capacity(buf.remaining() / PackedUciMove::BYTES);
         while buf.has_remaining() {
             moves.push(unpack_uci_move(buf));
         }

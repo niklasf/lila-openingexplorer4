@@ -1,17 +1,15 @@
 use std::{io, ops::ControlFlow};
 
-use nohash_hasher::IntMap;
 use pgn_reader::{RawTag, Skip, Visitor};
 use shakmaty::{
-    ByColor, CastlingMode, Color, EnPassantMode, Outcome, Position,
+    ByColor, CastlingMode, EnPassantMode, Outcome, Position,
     fen::Fen,
     packed::{PackedSetup, PackedUciMove},
     san::{San, SanPlus},
     variant::{Variant, VariantPosition},
-    zobrist::Zobrist128,
 };
 
-use crate::packed::{GameId, GamePlayer, LaxDate, Rating, RatingMode, Speed};
+use crate::packed::{GameId, LaxDate, Rating, RatingMode, Speed};
 
 pub struct GameVisitor;
 
@@ -216,106 +214,6 @@ impl ParsedGame {
     }
 }
 
-pub struct PreparedGameMeta {
-    pub game_id: GameId,
-    pub players: ByColor<GamePlayer>,
-    pub speed: Speed,
-    pub date: LaxDate,
-    pub outcome: Outcome,
-    pub setup: Option<PackedSetup>,
-}
-
-pub struct PreparedGame {
-    pub meta: PreparedGameMeta,
-    pub positions: IntMap<Zobrist128, (Color, PackedUciMove)>,
-}
-
-impl PreparedGame {
-    pub fn prepare(parsed: ParsedGame) -> io::Result<PreparedGame> {
-        let game_id = parsed
-            .game_id
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing game id"))?;
-
-        let (mut pos, setup) = parsed.initial_position()?;
-
-        let meta = PreparedGameMeta {
-            game_id,
-            players: ByColor {
-                white: GamePlayer {
-                    title: parsed.white_title,
-                    name: parsed.white.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("missing white name in game {}", game_id),
-                        )
-                    })?,
-                    rating: parsed.white_elo.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("missing white rating in game {}", game_id),
-                        )
-                    })?,
-                },
-                black: GamePlayer {
-                    title: parsed.black_title,
-                    name: parsed.black.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("missing black name in game {}", game_id),
-                        )
-                    })?,
-                    rating: parsed.black_elo.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("missing black rating in game {}", game_id),
-                        )
-                    })?,
-                },
-            },
-            speed: parsed.speed.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("missing speed in game {}", game_id),
-                )
-            })?,
-            date: parsed.date.ok_or(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("missing date in game {}", game_id),
-            ))?,
-            setup,
-            outcome: parsed.outcome.unwrap_or(Outcome::Unknown),
-        };
-
-        let mut positions =
-            IntMap::with_capacity_and_hasher(parsed.moves.len(), Default::default());
-
-        let mut updated_hash = None;
-
-        for san in parsed.moves {
-            let m = san.to_move(&pos).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("illegal san {} in game {}: {}", san, game_id, err),
-                )
-            })?;
-
-            let hash = updated_hash.unwrap_or_else(|| pos.zobrist_hash(EnPassantMode::Legal));
-            positions.insert(
-                hash,
-                (
-                    pos.turn(),
-                    PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
-                ),
-            );
-
-            updated_hash = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
-            pos.play_unchecked(m);
-        }
-
-        Ok(PreparedGame { meta, positions })
-    }
-}
-
 pub struct FlatPlayer {
     pub title: Option<String>,
     pub name: String,
@@ -382,7 +280,7 @@ impl FlatGame {
             date: parsed.date,
             outcome: parsed.outcome.unwrap_or(Outcome::Unknown),
             speed: parsed.speed,
-            rating_mode: RatingMode::Rated, // TODO: from Event tag
+            rating_mode: RatingMode::Rated, // always rated for monthly export
             setup,
             moves,
         })
