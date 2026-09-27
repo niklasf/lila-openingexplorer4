@@ -9,7 +9,10 @@ use std::{
 use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use lila_openingexplorer4::parquet::{GameColumns, PositionalFile};
+use lila_openingexplorer4::{
+    packed::GameId,
+    parquet::{GameColumns, PositionalFile},
+};
 use parquet::{
     basic::Compression,
     file::{
@@ -18,13 +21,13 @@ use parquet::{
     },
 };
 
-const READ_THREADS: usize = 4;
+const READ_THREADS: usize = 8;
 
 const CHANNEL_SIZE: usize = 2 * READ_THREADS;
 
 const DISK_PARTITION_BITS: u32 = 3;
 
-const MEMORY_PARTITION_BITS: u32 = 4;
+const MEMORY_PARTITION_BITS: u32 = 6;
 
 const _: () = assert!(MEMORY_PARTITION_BITS >= DISK_PARTITION_BITS);
 
@@ -94,7 +97,7 @@ fn main() -> io::Result<()> {
     )
     .with_style(
         ProgressStyle::with_template(
-            "{spinner} {prefix} {msg} {wide_bar} {human_pos}/{human_len} {per_sec:>14} {eta:>7}",
+            "{spinner} {prefix} {msg} {wide_bar} {human_pos}/{human_len} {per_sec} {eta:>7}",
         )
         .expect("progress template"),
     );
@@ -122,7 +125,7 @@ fn scatter_pass(
     scratch: &Path,
     progress: &ProgressBar,
 ) -> io::Result<Vec<PathBuf>> {
-    let mut writers = (0..MEMORY_PARTITIONS_PER_PASS)
+    let writers = (0..MEMORY_PARTITIONS_PER_PASS)
         .map(|i| {
             let memory_partition = pass * MEMORY_PARTITIONS_PER_PASS + i;
             MemoryPartitionWriter::create(
@@ -131,11 +134,33 @@ fn scatter_pass(
         })
         .collect::<io::Result<Vec<_>>>()?;
 
-    thread::scope(|s| {
-        let (tx, rx) = channel::bounded(CHANNEL_SIZE);
+    Ok(thread::scope(|s| {
+        // One writer thread per memory partition, collecting pieces into
+        // full row groups.
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..MEMORY_PARTITIONS_PER_PASS)
+            .map(|_| channel::bounded::<GameColumns>(CHANNEL_SIZE))
+            .unzip();
 
+        let writer_threads: Vec<_> = writers
+            .into_iter()
+            .zip(rxs)
+            .map(|(mut writer, rx)| {
+                s.spawn(move || {
+                    for mut piece in rx {
+                        writer.buffer.append(&mut piece);
+                        if writer.buffer.len() >= ROW_GROUP_LEN {
+                            writer.flush();
+                        }
+                    }
+                    writer.close()
+                })
+            })
+            .collect();
+
+        // Reader threads scatter each row group into pieces, one for each
+        // memory partition of this pass.
         for thread_idx in 0..READ_THREADS {
-            let tx = tx.clone();
+            let txs = txs.clone();
 
             s.spawn(move || {
                 for i in (thread_idx..reader.num_row_groups()).step_by(READ_THREADS) {
@@ -144,42 +169,43 @@ fn scatter_pass(
                     columns
                         .read_columns(&*row_group_reader)
                         .expect("read columns");
-                    tx.send(columns).expect("send columns");
+
+                    let mut pieces: Vec<GameColumns> = (0..MEMORY_PARTITIONS_PER_PASS)
+                        .map(|_| GameColumns::default())
+                        .collect();
+                    columns.scatter(
+                        |game_id| pass_memory_partition(game_id, pass),
+                        &mut pieces.iter_mut().collect::<Vec<_>>(),
+                    );
+
+                    progress.inc(columns.len() as u64);
+
+                    for (tx, piece) in txs.iter().zip(pieces) {
+                        if piece.len() > 0 {
+                            tx.send(piece).expect("send piece");
+                        }
+                    }
                 }
             });
         }
 
-        drop(tx);
+        // Only the reader threads hold senders now, so that writer threads
+        // finish when all reader threads are done.
+        drop(txs);
 
-        for columns in rx {
-            columns.scatter(
-                |game_id| {
-                    let memory_partition = game_id.partition(MEMORY_PARTITION_BITS);
-                    let disk_partition =
-                        memory_partition >> (MEMORY_PARTITION_BITS - DISK_PARTITION_BITS);
-                    (disk_partition == pass)
-                        .then_some(memory_partition & (MEMORY_PARTITIONS_PER_PASS - 1))
-                },
-                &mut writers
-                    .iter_mut()
-                    .map(|w| &mut w.buffer)
-                    .collect::<Vec<_>>(),
-            );
+        writer_threads
+            .into_iter()
+            .map(|writer_thread| writer_thread.join().expect("writer thread"))
+            .collect()
+    }))
+}
 
-            progress.inc(columns.len() as u64);
-
-            for writer in &mut writers {
-                if writer.buffer.len() >= ROW_GROUP_LEN {
-                    writer.flush();
-                }
-            }
-        }
-    });
-
-    Ok(writers
-        .into_iter()
-        .map(MemoryPartitionWriter::close)
-        .collect())
+/// Index of the memory partition within the given pass, or `None` if the
+/// game belongs to a different pass.
+fn pass_memory_partition(game_id: GameId, pass: usize) -> Option<usize> {
+    let memory_partition = game_id.partition(MEMORY_PARTITION_BITS);
+    let disk_partition = memory_partition >> (MEMORY_PARTITION_BITS - DISK_PARTITION_BITS);
+    (disk_partition == pass).then_some(memory_partition & (MEMORY_PARTITIONS_PER_PASS - 1))
 }
 
 fn process_memory_partition(_path: &Path) -> io::Result<()> {

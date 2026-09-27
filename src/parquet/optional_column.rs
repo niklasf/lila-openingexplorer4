@@ -45,6 +45,11 @@ impl<T: DataType> OptionalColumn<T> {
         self.def_levels.reserve(additional_rows);
     }
 
+    pub fn append(&mut self, other: &mut Self) {
+        self.values.append(&mut other.values);
+        self.def_levels.append(&mut other.def_levels);
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = Option<&T::T>> {
         let mut values = self.values.iter();
         self.def_levels

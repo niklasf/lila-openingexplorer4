@@ -39,6 +39,12 @@ impl PlayerColumns {
         self.rating.reserve(additional);
     }
 
+    pub fn append(&mut self, other: &mut PlayerColumns) {
+        self.title.append(&mut other.title);
+        self.name.append(&mut other.name);
+        self.rating.append(&mut other.rating);
+    }
+
     pub fn push(&mut self, player: FlatPlayer) {
         self.title.push(
             player
@@ -128,6 +134,20 @@ impl GameColumns {
         self.rating_mode.reserve(additional);
         self.setup.reserve(additional);
         self.moves.reserve(additional);
+    }
+
+    pub fn append(&mut self, other: &mut GameColumns) {
+        self.game_id.append(&mut other.game_id);
+        self.players.white.append(&mut other.players.white);
+        self.players.black.append(&mut other.players.black);
+        self.date_year.append(&mut other.date_year);
+        self.date_month.append(&mut other.date_month);
+        self.date_day.append(&mut other.date_day);
+        self.outcome.append(&mut other.outcome);
+        self.speed.append(&mut other.speed);
+        self.rating_mode.append(&mut other.rating_mode);
+        self.setup.append(&mut other.setup);
+        self.moves.append(&mut other.moves);
     }
 
     pub fn push(&mut self, game: FlatGame) {

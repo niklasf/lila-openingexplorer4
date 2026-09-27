@@ -33,6 +33,10 @@ impl<T: DataType> RequiredColumn<T> {
         self.values.reserve(additional_rows);
     }
 
+    pub fn append(&mut self, other: &mut Self) {
+        self.values.append(&mut other.values);
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &T::T> {
         self.values.iter()
     }
