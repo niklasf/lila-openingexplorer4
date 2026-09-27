@@ -33,6 +33,16 @@ impl<T: DataType> RequiredColumn<T> {
         self.values.reserve(additional_rows);
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &T::T> {
+        self.values.iter()
+    }
+
+    pub fn scatter(&self, partitions: &[usize], targets: &mut [&mut Self]) {
+        for (value, &partition) in self.values.iter().zip(partitions) {
+            targets[partition].push(value.clone());
+        }
+    }
+
     pub fn write_column<W>(
         &self,
         writer: &mut SerializedRowGroupWriter<'_, W>,

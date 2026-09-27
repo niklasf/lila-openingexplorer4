@@ -62,6 +62,15 @@ impl PlayerColumns {
         Ok(())
     }
 
+    pub fn scatter(&self, partitions: &[usize], targets: &mut [&mut PlayerColumns]) {
+        self.title
+            .scatter(partitions, &mut project(targets, |t| &mut t.title));
+        self.name
+            .scatter(partitions, &mut project(targets, |t| &mut t.name));
+        self.rating
+            .scatter(partitions, &mut project(targets, |t| &mut t.rating));
+    }
+
     pub fn read_columns(
         &mut self,
         reader: &dyn RowGroupReader,
@@ -173,8 +182,6 @@ impl GameColumns {
         self.outcome.write_column(&mut row_group)?;
         self.speed.write_column(&mut row_group)?;
         self.rating_mode.write_column(&mut row_group)?;
-        self.speed.write_column(&mut row_group)?;
-        self.rating_mode.write_column(&mut row_group)?;
         self.setup.write_column(&mut row_group)?;
         self.moves.write_column(&mut row_group)?;
         row_group.close()?;
@@ -194,6 +201,39 @@ impl GameColumns {
         self.setup.read_column(reader, 13)?;
         self.moves.read_column(reader, 14)?;
         Ok(())
+    }
+
+    pub fn scatter(&self, partition: impl Fn(GameId) -> usize, targets: &mut [&mut GameColumns]) {
+        let partitions: Vec<usize> = self
+            .game_id
+            .iter()
+            .map(|game_id| partition(GameId::unpack(&mut game_id.data())))
+            .collect();
+
+        self.game_id
+            .scatter(&partitions, &mut project(targets, |t| &mut t.game_id));
+        self.players
+            .white
+            .scatter(&partitions, &mut project(targets, |t| &mut t.players.white));
+        self.players
+            .black
+            .scatter(&partitions, &mut project(targets, |t| &mut t.players.black));
+        self.date_year
+            .scatter(&partitions, &mut project(targets, |t| &mut t.date_year));
+        self.date_month
+            .scatter(&partitions, &mut project(targets, |t| &mut t.date_month));
+        self.date_day
+            .scatter(&partitions, &mut project(targets, |t| &mut t.date_day));
+        self.outcome
+            .scatter(&partitions, &mut project(targets, |t| &mut t.outcome));
+        self.speed
+            .scatter(&partitions, &mut project(targets, |t| &mut t.speed));
+        self.rating_mode
+            .scatter(&partitions, &mut project(targets, |t| &mut t.rating_mode));
+        self.setup
+            .scatter(&partitions, &mut project(targets, |t| &mut t.setup));
+        self.moves
+            .scatter(&partitions, &mut project(targets, |t| &mut t.moves));
     }
 
     pub fn schema() -> TypePtr {
@@ -236,6 +276,13 @@ impl GameColumns {
             .set_column_statistics_enabled(ColumnPath::from("setup"), EnabledStatistics::None)
             .build()
     }
+}
+
+fn project<'a, 'b: 'a, S: 'b, T>(
+    targets: &'a mut [&'b mut S],
+    f: impl FnMut(&'a mut &'b mut S) -> &'a mut T,
+) -> Vec<&'a mut T> {
+    targets.iter_mut().map(f).collect()
 }
 
 fn primitive(

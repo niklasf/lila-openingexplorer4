@@ -45,6 +45,19 @@ impl<T: DataType> OptionalColumn<T> {
         self.def_levels.reserve(additional_rows);
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = Option<&T::T>> {
+        let mut values = self.values.iter();
+        self.def_levels
+            .iter()
+            .map(move |&def_level| if def_level > 0 { values.next() } else { None })
+    }
+
+    pub fn scatter(&self, partitions: &[usize], targets: &mut [&mut Self]) {
+        for (value, &partition) in self.iter().zip(partitions) {
+            targets[partition].push(value.cloned());
+        }
+    }
+
     pub fn write_column<W>(
         &self,
         writer: &mut SerializedRowGroupWriter<'_, W>,

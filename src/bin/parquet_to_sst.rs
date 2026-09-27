@@ -12,7 +12,9 @@ const CHANNEL_SIZE: usize = 128;
 
 const READ_THREADS: usize = 4;
 
-const DISK_PARTITION_BITS: usize = 3;
+const DISK_PARTITION_BITS: u32 = 3;
+
+const ROW_GROUP_LEN: usize = 100_000;
 
 #[derive(Parser)]
 struct Args {
@@ -36,6 +38,20 @@ impl DiskPartition {
             )
             .expect("partition writer"),
         }
+    }
+
+    pub fn flush(&mut self) {
+        if self.buffer.len() > 0 {
+            self.buffer
+                .write_row_group(&mut self.writer)
+                .expect("write row group");
+            self.buffer.clear();
+        }
+    }
+
+    pub fn close(mut self) {
+        self.flush();
+        self.writer.close().expect("close partition file");
     }
 }
 
@@ -65,12 +81,30 @@ fn main() -> io::Result<()> {
             });
         }
 
-        let partitions: Vec<_> = (0..(1 << DISK_PARTITION_BITS))
+        drop(tx);
+
+        let mut partitions: Vec<_> = (0..(1 << DISK_PARTITION_BITS))
             .map(DiskPartition::new)
             .collect();
 
-        for _columns in rx {
-            todo!()
+        for columns in rx {
+            columns.scatter(
+                |game_id| game_id.partition(DISK_PARTITION_BITS),
+                &mut partitions
+                    .iter_mut()
+                    .map(|p| &mut p.buffer)
+                    .collect::<Vec<_>>(),
+            );
+
+            for partition in &mut partitions {
+                if partition.buffer.len() >= ROW_GROUP_LEN {
+                    partition.flush();
+                }
+            }
+        }
+
+        for partition in partitions {
+            partition.close();
         }
 
         Ok(())
