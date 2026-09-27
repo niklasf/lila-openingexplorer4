@@ -1,5 +1,9 @@
+use std::io::Write;
+
 use parquet::{
-    column::reader::get_typed_column_reader, data_type::DataType, file::reader::RowGroupReader,
+    column::reader::get_typed_column_reader,
+    data_type::DataType,
+    file::{reader::RowGroupReader, writer::SerializedRowGroupWriter},
 };
 
 pub struct OptionalColumn<T: DataType> {
@@ -17,12 +21,8 @@ impl<T: DataType> Default for OptionalColumn<T> {
 }
 
 impl<T: DataType> OptionalColumn<T> {
-    pub fn values(&self) -> &[T::T] {
-        &self.values
-    }
-
-    pub fn def_levels(&self) -> &[i16] {
-        &self.def_levels
+    pub fn len(&self) -> usize {
+        self.def_levels.len()
     }
 
     pub fn push(&mut self, value: Option<T::T>) {
@@ -45,7 +45,21 @@ impl<T: DataType> OptionalColumn<T> {
         self.def_levels.reserve(additional_rows);
     }
 
-    pub fn fill_rows(
+    pub fn write_column<W>(
+        &self,
+        writer: &mut SerializedRowGroupWriter<'_, W>,
+    ) -> parquet::errors::Result<()>
+    where
+        W: Write + Send,
+    {
+        let mut column_writer = writer.next_column()?.expect("column");
+        column_writer
+            .typed::<T>()
+            .write_batch(&self.values, Some(&self.def_levels), None)?;
+        column_writer.close()
+    }
+
+    pub fn read_column(
         &mut self,
         reader: &dyn RowGroupReader,
         column: usize,
