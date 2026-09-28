@@ -1,4 +1,4 @@
-use std::{io::Write, sync::Arc};
+use std::{io::Write, iter, sync::Arc};
 
 use bytes::Bytes;
 use parquet::{
@@ -87,6 +87,38 @@ impl PlayerColumns {
         self.rating.read_column(reader, base_column_index + 2)?;
         Ok(())
     }
+
+    pub fn rows(&self) -> impl Iterator<Item = PlayerRow<'_>> {
+        let mut title = self.title.iter();
+        let mut name = self.name.iter();
+        let mut rating = self.rating.iter();
+        iter::from_fn(move || {
+            Some(PlayerRow {
+                name: name.next()?.data(),
+                title: title.next().expect("title").map(ByteArray::data),
+                rating: rating.next().expect("rating").copied(),
+            })
+        })
+    }
+}
+
+pub struct PlayerRow<'a> {
+    pub title: Option<&'a [u8]>,
+    pub name: &'a [u8],
+    pub rating: Option<i32>,
+}
+
+pub struct GameRow<'a> {
+    pub game_id: GameId,
+    pub players: ByColor<PlayerRow<'a>>,
+    pub date_year: Option<i32>,
+    pub date_month: Option<i32>,
+    pub date_day: Option<i32>,
+    pub outcome: &'a [u8],
+    pub speed: Option<&'a [u8]>,
+    pub rating_mode: &'a [u8],
+    pub setup: Option<&'a [u8]>,
+    pub moves: &'a [u8],
 }
 
 #[derive(Default)]
@@ -148,6 +180,37 @@ impl GameColumns {
         self.rating_mode.append(&mut other.rating_mode);
         self.setup.append(&mut other.setup);
         self.moves.append(&mut other.moves);
+    }
+
+    pub fn rows(&self) -> impl Iterator<Item = GameRow<'_>> {
+        let mut game_id = self.game_id.iter();
+        let mut white = self.players.white.rows();
+        let mut black = self.players.black.rows();
+        let mut date_year = self.date_year.iter();
+        let mut date_month = self.date_month.iter();
+        let mut date_day = self.date_day.iter();
+        let mut outcome = self.outcome.iter();
+        let mut speed = self.speed.iter();
+        let mut rating_mode = self.rating_mode.iter();
+        let mut setup = self.setup.iter();
+        let mut moves = self.moves.iter();
+        iter::from_fn(move || {
+            Some(GameRow {
+                game_id: GameId::unpack(&mut game_id.next()?.data()),
+                players: ByColor {
+                    white: white.next().expect("white"),
+                    black: black.next().expect("black"),
+                },
+                date_year: date_year.next().expect("date_year").copied(),
+                date_month: date_month.next().expect("date_month").copied(),
+                date_day: date_day.next().expect("date_day").copied(),
+                outcome: outcome.next().expect("outcome").data(),
+                speed: speed.next().expect("speed").map(ByteArray::data),
+                rating_mode: rating_mode.next().expect("rating_mode").data(),
+                setup: setup.next().expect("setup").map(ByteArray::data),
+                moves: moves.next().expect("moves").data(),
+            })
+        })
     }
 
     pub fn push(&mut self, game: FlatGame) {

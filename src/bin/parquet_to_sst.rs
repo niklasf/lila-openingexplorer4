@@ -10,8 +10,8 @@ use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
-    packed::GameId,
-    parquet::{GameColumns, PositionalFile},
+    packed::{GameId, pack_bytes, pack_int},
+    parquet::{GameColumns, GameRow, PositionalFile},
 };
 use parquet::{
     basic::Compression,
@@ -25,13 +25,25 @@ const READ_THREADS: usize = 8;
 
 const CHANNEL_SIZE: usize = 2 * READ_THREADS;
 
+/// One pass over the input for each disk partition. All memory partitions of
+/// a disk partition, except the resident ones, must fit into scratch space at
+/// the same time.
 const DISK_PARTITION_BITS: u32 = 3;
 
+/// Each memory partition must fit into memory at once.
 const MEMORY_PARTITION_BITS: u32 = 6;
 
 const _: () = assert!(MEMORY_PARTITION_BITS >= DISK_PARTITION_BITS);
 
 const MEMORY_PARTITIONS_PER_PASS: usize = 1 << (MEMORY_PARTITION_BITS - DISK_PARTITION_BITS);
+
+/// Memory partitions per pass that are kept in memory while reading the
+/// input, rather than being written to scratch space and read back. Each
+/// resident partition takes about as much memory as processing a memory
+/// partition.
+const RESIDENT_PARTITIONS_PER_PASS: usize = 1;
+
+const _: () = assert!(RESIDENT_PARTITIONS_PER_PASS <= MEMORY_PARTITIONS_PER_PASS);
 
 const ROW_GROUP_LEN: usize = 100_000;
 
@@ -43,16 +55,17 @@ struct Args {
     scratch: PathBuf,
 }
 
-struct MemoryPartitionWriter {
+/// Writes a memory partition to a file in scratch space.
+struct ScratchWriter {
     path: PathBuf,
     buffer: GameColumns,
     writer: SerializedFileWriter<File>,
 }
 
-impl MemoryPartitionWriter {
-    pub fn create(path: PathBuf) -> io::Result<MemoryPartitionWriter> {
+impl ScratchWriter {
+    pub fn create(path: PathBuf) -> io::Result<ScratchWriter> {
         let file = File::create(&path)?;
-        Ok(MemoryPartitionWriter {
+        Ok(ScratchWriter {
             path,
             buffer: GameColumns::default(),
             writer: SerializedFileWriter::new(
@@ -83,6 +96,112 @@ impl MemoryPartitionWriter {
     }
 }
 
+/// A memory partition, loaded in a compact form ready to be sorted.
+#[derive(Default)]
+struct MemoryPartition {
+    /// Length-prefixed packed values, back to back.
+    values: Vec<u8>,
+    /// Game ids and the offsets of their values.
+    index: Vec<(GameId, u64)>,
+}
+
+impl MemoryPartition {
+    pub fn push(&mut self, columns: &GameColumns) {
+        self.index.reserve(columns.len());
+        let mut value = Vec::new();
+        for row in columns.rows() {
+            self.index.push((row.game_id, self.values.len() as u64));
+            value.clear();
+            pack_value(&row, &mut value);
+            pack_bytes(&mut self.values, &value);
+        }
+    }
+
+    pub fn load(path: &Path) -> io::Result<MemoryPartition> {
+        let reader = SerializedFileReader::new(PositionalFile::open(path)?)?;
+        let mut partition = MemoryPartition::default();
+        let mut columns = GameColumns::default();
+        for i in 0..reader.num_row_groups() {
+            columns.read_columns(&*reader.get_row_group(i)?)?;
+            partition.push(&columns);
+        }
+        Ok(partition)
+    }
+}
+
+/// Placeholder encoding, lossless with respect to the parquet columns.
+///
+/// TODO: Replace with the final SST value encoding.
+fn pack_value(row: &GameRow<'_>, buf: &mut Vec<u8>) {
+    for player in [&row.players.white, &row.players.black] {
+        pack_optional_bytes(buf, player.title);
+        pack_bytes(buf, player.name);
+        pack_optional_int(buf, player.rating);
+    }
+    pack_optional_int(buf, row.date_year);
+    pack_optional_int(buf, row.date_month);
+    pack_optional_int(buf, row.date_day);
+    pack_bytes(buf, row.outcome);
+    pack_optional_bytes(buf, row.speed);
+    pack_bytes(buf, row.rating_mode);
+    pack_optional_bytes(buf, row.setup);
+    pack_bytes(buf, row.moves);
+}
+
+fn pack_optional_bytes(buf: &mut Vec<u8>, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(bytes) => {
+            buf.push(1);
+            pack_bytes(buf, bytes);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn pack_optional_int(buf: &mut Vec<u8>, n: Option<i32>) {
+    match n {
+        Some(n) => {
+            buf.push(1);
+            pack_int(buf, i64::from(n));
+        }
+        None => buf.push(0),
+    }
+}
+
+/// Destination of the games of a memory partition during a pass.
+enum Sink {
+    Scratch(ScratchWriter),
+    Resident(MemoryPartition),
+}
+
+enum Filled {
+    Scratch(PathBuf),
+    Resident(MemoryPartition),
+}
+
+impl Sink {
+    fn fill(self, rx: channel::Receiver<GameColumns>) -> Filled {
+        match self {
+            Sink::Scratch(mut writer) => {
+                // Collect pieces into full row groups.
+                for mut piece in rx {
+                    writer.buffer.append(&mut piece);
+                    if writer.buffer.len() >= ROW_GROUP_LEN {
+                        writer.flush();
+                    }
+                }
+                Filled::Scratch(writer.close())
+            }
+            Sink::Resident(mut partition) => {
+                for piece in rx {
+                    partition.push(&piece);
+                }
+                Filled::Resident(partition)
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
@@ -106,12 +225,27 @@ fn main() -> io::Result<()> {
         progress.set_prefix(format!("pass {}/{}", pass + 1, passes));
 
         progress.set_message("scattering");
-        let paths = scatter_pass(&reader, pass, &args.scratch, &progress)?;
+        let filled = scatter_pass(&reader, pass, &args.scratch, &progress)?;
 
-        for path in paths {
-            progress.set_message(format!("processing {}", path.display()));
-            process_memory_partition(&path)?;
+        // Process resident partitions first, to free their memory.
+        let mut scratch_files = Vec::new();
+        for (memory_partition, filled) in filled {
+            match filled {
+                Filled::Resident(partition) => {
+                    progress.set_message(format!("processing {memory_partition} (resident)"));
+                    process_memory_partition(partition)?;
+                }
+                Filled::Scratch(path) => scratch_files.push((memory_partition, path)),
+            }
+        }
+
+        for (memory_partition, path) in scratch_files {
+            progress.set_message(format!("loading {memory_partition}"));
+            let partition = MemoryPartition::load(&path)?;
             fs::remove_file(&path)?;
+
+            progress.set_message(format!("processing {memory_partition}"));
+            process_memory_partition(partition)?;
         }
     }
 
@@ -119,42 +253,43 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// Reads the entire input and distributes the games of the given disk
+/// partition to its memory partitions. The last `RESIDENT_PARTITIONS_PER_PASS`
+/// memory partitions are kept in memory, the others are written to scratch
+/// space.
 fn scatter_pass(
     reader: &SerializedFileReader<PositionalFile>,
     pass: usize,
     scratch: &Path,
     progress: &ProgressBar,
-) -> io::Result<Vec<PathBuf>> {
-    let writers = (0..MEMORY_PARTITIONS_PER_PASS)
+) -> io::Result<Vec<(usize, Filled)>> {
+    let first_memory_partition = pass * MEMORY_PARTITIONS_PER_PASS;
+
+    let sinks = (0..MEMORY_PARTITIONS_PER_PASS)
         .map(|i| {
-            let memory_partition = pass * MEMORY_PARTITIONS_PER_PASS + i;
-            MemoryPartitionWriter::create(
-                scratch.join(format!("games_{memory_partition:05}.parquet")),
+            let memory_partition = first_memory_partition + i;
+            Ok::<_, io::Error>(
+                if i >= MEMORY_PARTITIONS_PER_PASS - RESIDENT_PARTITIONS_PER_PASS {
+                    Sink::Resident(MemoryPartition::default())
+                } else {
+                    Sink::Scratch(ScratchWriter::create(
+                        scratch.join(format!("games_{memory_partition:05}.parquet")),
+                    )?)
+                },
             )
         })
         .collect::<io::Result<Vec<_>>>()?;
 
-    Ok(thread::scope(|s| {
-        // One writer thread per memory partition, collecting pieces into
-        // full row groups.
+    let filled: Vec<Filled> = thread::scope(|s| {
+        // One sink thread per memory partition.
         let (txs, rxs): (Vec<_>, Vec<_>) = (0..MEMORY_PARTITIONS_PER_PASS)
             .map(|_| channel::bounded::<GameColumns>(CHANNEL_SIZE))
             .unzip();
 
-        let writer_threads: Vec<_> = writers
+        let sink_threads: Vec<_> = sinks
             .into_iter()
             .zip(rxs)
-            .map(|(mut writer, rx)| {
-                s.spawn(move || {
-                    for mut piece in rx {
-                        writer.buffer.append(&mut piece);
-                        if writer.buffer.len() >= ROW_GROUP_LEN {
-                            writer.flush();
-                        }
-                    }
-                    writer.close()
-                })
-            })
+            .map(|(sink, rx)| s.spawn(move || sink.fill(rx)))
             .collect();
 
         // Reader threads scatter each row group into pieces, one for each
@@ -189,15 +324,21 @@ fn scatter_pass(
             });
         }
 
-        // Only the reader threads hold senders now, so that writer threads
+        // Only the reader threads hold senders now, so that sink threads
         // finish when all reader threads are done.
         drop(txs);
 
-        writer_threads
+        sink_threads
             .into_iter()
-            .map(|writer_thread| writer_thread.join().expect("writer thread"))
+            .map(|sink_thread| sink_thread.join().expect("sink thread"))
             .collect()
-    }))
+    });
+
+    Ok(filled
+        .into_iter()
+        .enumerate()
+        .map(|(i, filled)| (first_memory_partition + i, filled))
+        .collect())
 }
 
 /// Index of the memory partition within the given pass, or `None` if the
@@ -208,7 +349,11 @@ fn pass_memory_partition(game_id: GameId, pass: usize) -> Option<usize> {
     (disk_partition == pass).then_some(memory_partition & (MEMORY_PARTITIONS_PER_PASS - 1))
 }
 
-fn process_memory_partition(_path: &Path) -> io::Result<()> {
-    // TODO: Load entirely into memory, sort by game id, and write SST files.
+fn process_memory_partition(mut partition: MemoryPartition) -> io::Result<()> {
+    partition
+        .index
+        .sort_unstable_by_key(|&(game_id, _)| game_id);
+
+    // TODO: Write values in sorted order into SST files.
     Ok(())
 }
