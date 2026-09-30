@@ -1,5 +1,7 @@
 use std::{io::Write, iter, sync::Arc};
 
+use bytes::BufMut;
+
 use bytes::Bytes;
 use parquet::{
     basic::{LogicalType, Repetition, Type as PhysicalType},
@@ -11,11 +13,15 @@ use parquet::{
     },
     schema::types::{ColumnPath, Type, TypePtr},
 };
-use shakmaty::{ByColor, packed::PackedUciMove};
+use shakmaty::{ByColor, Outcome, packed::PackedUciMove};
+use thiserror::Error;
 
 use crate::{
     indexing::{FlatGame, FlatPlayer},
-    packed::GameId,
+    packed::{
+        GameId, IndexStatus, LaxDate, Rating, RatingMode, Speed, outcome_bits, pack_bytes,
+        pack_speed_and_rating_mode,
+    },
     parquet::{OptionalColumn, RequiredColumn},
 };
 
@@ -119,6 +125,84 @@ pub struct GameRow<'a> {
     pub rating_mode: &'a [u8],
     pub setup: Option<&'a [u8]>,
     pub moves: &'a [u8],
+}
+
+/// Reasons why a parquet row can not be represented as a `LichessGame`.
+#[derive(Debug, Error, Copy, Clone, PartialEq, Eq)]
+pub enum InvalidGameRow {
+    #[error("missing rating")]
+    MissingRating,
+    #[error("invalid rating")]
+    InvalidRating,
+    #[error("missing date")]
+    MissingDate,
+    #[error("invalid date")]
+    InvalidDate,
+    #[error("invalid outcome")]
+    InvalidOutcome,
+    #[error("missing speed")]
+    MissingSpeed,
+    #[error("invalid speed")]
+    InvalidSpeed,
+    #[error("invalid rating mode")]
+    InvalidRatingMode,
+}
+
+impl GameRow<'_> {
+    /// Packs the row exactly like `LichessGame::pack_entire` would pack the
+    /// corresponding game with an empty index status, but without
+    /// intermediate allocations.
+    ///
+    /// Nothing is written to `buf` if the row is invalid.
+    pub fn pack_lichess_game<B: BufMut>(&self, buf: &mut B) -> Result<(), InvalidGameRow> {
+        let ratings = ByColor {
+            white: rating_from_row(self.players.white.rating)?,
+            black: rating_from_row(self.players.black.rating)?,
+        };
+
+        let date = LaxDate::from_ymd(
+            u32::try_from(self.date_year.ok_or(InvalidGameRow::MissingDate)?)
+                .map_err(|_| InvalidGameRow::InvalidDate)?,
+            optional_u8(self.date_month)?,
+            optional_u8(self.date_day)?,
+        )
+        .map_err(|_| InvalidGameRow::InvalidDate)?;
+
+        let outcome =
+            Outcome::from_ascii(self.outcome).map_err(|_| InvalidGameRow::InvalidOutcome)?;
+
+        let speed = Speed::from_ascii(self.speed.ok_or(InvalidGameRow::MissingSpeed)?)
+            .map_err(|_| InvalidGameRow::InvalidSpeed)?;
+
+        let rating_mode = RatingMode::from_ascii(self.rating_mode)
+            .map_err(|_| InvalidGameRow::InvalidRatingMode)?;
+
+        IndexStatus::empty().pack(buf);
+        for (player, rating) in [
+            (&self.players.white, ratings.white),
+            (&self.players.black, ratings.black),
+        ] {
+            pack_bytes(buf, player.title.unwrap_or(b""));
+            pack_bytes(buf, player.name);
+            rating.pack(buf);
+        }
+        date.pack(buf);
+        buf.put_u8(outcome_bits(outcome));
+        pack_speed_and_rating_mode(buf, speed, rating_mode);
+        pack_bytes(buf, self.setup.unwrap_or(b""));
+        buf.put_slice(self.moves);
+        Ok(())
+    }
+}
+
+fn rating_from_row(rating: Option<i32>) -> Result<Rating, InvalidGameRow> {
+    Rating::try_from(rating.ok_or(InvalidGameRow::MissingRating)?)
+        .map_err(|_| InvalidGameRow::InvalidRating)
+}
+
+fn optional_u8(n: Option<i32>) -> Result<Option<u8>, InvalidGameRow> {
+    n.map(|n| u8::try_from(n).map_err(|_| InvalidGameRow::InvalidDate))
+        .transpose()
 }
 
 #[derive(Default)]
@@ -408,4 +492,90 @@ fn fixed_binary(name: &str, len: i32, repetition: Repetition) -> TypePtr {
             .build()
             .expect("fixed len byte array type"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use arbtest::arbtest;
+
+    use super::*;
+    use crate::packed::LichessGame;
+
+    #[test]
+    fn test_pack_lichess_game_matches_pack_entire() {
+        arbtest(|u| {
+            let mut game: LichessGame = u.arbitrary()?;
+            game.index_status = IndexStatus::empty();
+            let game_id: GameId = u.arbitrary()?;
+
+            let flat = FlatGame {
+                game_id,
+                players: ByColor {
+                    white: FlatPlayer {
+                        title: game.players.white.title.clone(),
+                        name: game.players.white.name.clone(),
+                        rating: Some(game.players.white.rating),
+                    },
+                    black: FlatPlayer {
+                        title: game.players.black.title.clone(),
+                        name: game.players.black.name.clone(),
+                        rating: Some(game.players.black.rating),
+                    },
+                },
+                date: Some(game.date.clone()),
+                outcome: game.outcome,
+                speed: Some(game.speed),
+                rating_mode: game.rating_mode,
+                setup: game.setup.clone(),
+                moves: game.moves.clone(),
+            };
+
+            let mut columns = GameColumns::default();
+            columns.push(flat);
+            let row = columns.rows().next().expect("row");
+            assert_eq!(row.game_id, game_id);
+
+            let mut expected = Vec::new();
+            game.pack_entire(&mut expected);
+
+            let mut actual = Vec::new();
+            row.pack_lichess_game(&mut actual).expect("valid row");
+            assert_eq!(actual, expected);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_pack_lichess_game_missing_rating() {
+        let mut columns = GameColumns::default();
+        columns.push(FlatGame {
+            game_id: GameId::from_ascii(b"abcdefgh").unwrap(),
+            players: ByColor {
+                white: FlatPlayer {
+                    title: None,
+                    name: "a".to_owned(),
+                    rating: None,
+                },
+                black: FlatPlayer {
+                    title: None,
+                    name: "b".to_owned(),
+                    rating: Some(Rating::try_from(1500).unwrap()),
+                },
+            },
+            date: Some(LaxDate::from_ymd(2020, Some(1), Some(1)).unwrap()),
+            outcome: Outcome::Unknown,
+            speed: Some(Speed::Blitz),
+            rating_mode: RatingMode::Rated,
+            setup: None,
+            moves: Vec::new(),
+        });
+        let row = columns.rows().next().expect("row");
+        let mut buf = Vec::new();
+        assert_eq!(
+            row.pack_lichess_game(&mut buf),
+            Err(InvalidGameRow::MissingRating)
+        );
+        assert!(buf.is_empty());
+    }
 }

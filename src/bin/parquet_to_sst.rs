@@ -5,17 +5,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
+    time::Instant,
 };
 
 use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
-    packed::{GameId, pack_bytes, pack_int},
-    parquet::{GameColumns, GameRow, PositionalFile},
+    packed::{GameId, pack_bytes, unpack_uint},
+    parquet::{GameColumns, PositionalFile},
 };
 use parquet::{
     basic::Compression,
@@ -24,6 +25,7 @@ use parquet::{
         writer::SerializedFileWriter,
     },
 };
+use rocksdb::{DBCompressionType, Options, SstFileWriter};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -55,26 +57,46 @@ const SCRATCH_PARTITIONS_PER_PASS: usize =
 
 const ROW_GROUP_LEN: usize = 100_000;
 
+/// Hard limit for the size of each SST file.
+const SST_MAX_SIZE: u64 = 512 * 1024 * 1024;
+
+/// Start a new SST file once the current one reaches this size. The margin
+/// leaves room for the index and footer written when finishing the file.
+const SST_ROLL_SIZE: u64 = SST_MAX_SIZE - 16 * 1024 * 1024;
+
+/// Games that could not be represented as `LichessGame`.
+static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Parser)]
 struct Args {
     parquet: PathBuf,
     /// Directory for temporary partition files.
     #[clap(long)]
     scratch: PathBuf,
+    /// Directory for the final SST files.
+    #[clap(long)]
+    out: PathBuf,
     /// Threads for reading the input and loading scratch files. Defaults to
-    /// half of available parallelism.
+    /// half of the usable parallelism.
     #[clap(long)]
     read_threads: Option<usize>,
-    /// Threads for writing scratch files. Defaults to half of available
+    /// Threads for writing scratch files. Defaults to half of the usable
     /// parallelism.
     #[clap(long)]
     write_threads: Option<usize>,
+    /// Threads for writing SST files. Defaults to the usable parallelism.
+    #[clap(long)]
+    sst_threads: Option<usize>,
+    /// Only process the first row groups of the input (for benchmarking).
+    #[clap(long)]
+    row_groups: Option<usize>,
 }
 
 #[derive(Copy, Clone)]
 struct Threads {
     read: usize,
     write: usize,
+    sst: usize,
 }
 
 impl Threads {
@@ -141,12 +163,26 @@ impl MemoryPartition {
     pub fn push(&mut self, columns: &GameColumns) {
         self.index.reserve(columns.len());
         let mut value = Vec::new();
+        let mut skipped = 0;
         for row in columns.rows() {
-            self.index.push((row.game_id, self.values.len() as u64));
             value.clear();
-            pack_value(&row, &mut value);
+            if row.pack_lichess_game(&mut value).is_err() {
+                skipped += 1;
+                continue;
+            }
+            self.index.push((row.game_id, self.values.len() as u64));
             pack_bytes(&mut self.values, &value);
         }
+        if skipped > 0 {
+            SKIPPED_GAMES.fetch_add(skipped, Ordering::Relaxed);
+        }
+    }
+
+    /// The packed value at the given offset in `values`.
+    pub fn value_at(&self, offset: u64) -> &[u8] {
+        let mut buf = &self.values[offset as usize..];
+        let len = unpack_uint(&mut buf) as usize;
+        &buf[..len]
     }
 
     pub fn append(&mut self, other: MemoryPartition) {
@@ -201,60 +237,38 @@ impl MemoryPartition {
     }
 }
 
-/// Placeholder encoding, lossless with respect to the parquet columns.
-///
-/// TODO: Replace with the final SST value encoding.
-fn pack_value(row: &GameRow<'_>, buf: &mut Vec<u8>) {
-    for player in [&row.players.white, &row.players.black] {
-        pack_optional_bytes(buf, player.title);
-        pack_bytes(buf, player.name);
-        pack_optional_int(buf, player.rating);
-    }
-    pack_optional_int(buf, row.date_year);
-    pack_optional_int(buf, row.date_month);
-    pack_optional_int(buf, row.date_day);
-    pack_bytes(buf, row.outcome);
-    pack_optional_bytes(buf, row.speed);
-    pack_bytes(buf, row.rating_mode);
-    pack_optional_bytes(buf, row.setup);
-    pack_bytes(buf, row.moves);
-}
-
-fn pack_optional_bytes(buf: &mut Vec<u8>, bytes: Option<&[u8]>) {
-    match bytes {
-        Some(bytes) => {
-            buf.push(1);
-            pack_bytes(buf, bytes);
-        }
-        None => buf.push(0),
-    }
-}
-
-fn pack_optional_int(buf: &mut Vec<u8>, n: Option<i32>) {
-    match n {
-        Some(n) => {
-            buf.push(1);
-            pack_int(buf, i64::from(n));
-        }
-        None => buf.push(0),
-    }
-}
-
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
+    // Leave one physical core (two hardware threads) idle.
     let parallelism = thread::available_parallelism()
         .map_or(1, NonZeroUsize::get)
-        .div_ceil(2);
+        .saturating_sub(2)
+        .max(2);
     let threads = Threads {
-        read: args.read_threads.unwrap_or(parallelism),
-        write: args.write_threads.unwrap_or(parallelism),
+        read: args.read_threads.unwrap_or(parallelism / 2),
+        write: args.write_threads.unwrap_or(parallelism / 2),
+        sst: args.sst_threads.unwrap_or(parallelism),
     };
 
     let reader = SerializedFileReader::new(PositionalFile::open(&args.parquet)?)?;
-    let num_rows = reader.metadata().file_metadata().num_rows() as u64;
+    let num_row_groups = args.row_groups.map_or(reader.num_row_groups(), |limit| {
+        limit.min(reader.num_row_groups())
+    });
+    let num_rows: u64 = (0..num_row_groups)
+        .map(|i| reader.metadata().row_group(i).num_rows() as u64)
+        .sum();
+
+    let mut sst_opts = Options::default();
+    sst_opts.set_compression_type(DBCompressionType::Zstd);
+    let sst = SstContext {
+        opts: &sst_opts,
+        out: &args.out,
+        stats: Mutex::new(SstStats::default()),
+    };
 
     let passes = 1 << DISK_PARTITION_BITS;
+    let started = Instant::now();
 
     let progress = ProgressBar::with_draw_target(
         Some(num_rows * passes as u64),
@@ -271,12 +285,19 @@ fn main() -> io::Result<()> {
         progress.set_prefix(format!("pass {}/{}", pass + 1, passes));
 
         progress.set_message("scattering");
-        let (resident, scratch) = scatter_pass(&reader, pass, &args.scratch, threads, &progress)?;
+        let (resident, scratch) = scatter_pass(
+            &reader,
+            num_row_groups,
+            pass,
+            &args.scratch,
+            threads,
+            &progress,
+        )?;
 
         // Process resident partitions first, to free their memory.
         for (memory_partition, partition) in resident {
             progress.set_message(format!("processing {memory_partition} (resident)"));
-            process_memory_partition(partition)?;
+            process_memory_partition(partition, memory_partition, &sst, threads.sst)?;
         }
 
         for (memory_partition, paths) in scratch {
@@ -287,11 +308,22 @@ fn main() -> io::Result<()> {
             }
 
             progress.set_message(format!("processing {memory_partition}"));
-            process_memory_partition(partition)?;
+            process_memory_partition(partition, memory_partition, &sst, threads.sst)?;
         }
     }
 
     progress.finish();
+
+    let stats = sst.stats.into_inner().expect("stats");
+    println!(
+        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes), {} skipped games",
+        started.elapsed(),
+        stats.games,
+        stats.files,
+        stats.bytes,
+        stats.largest_file,
+        SKIPPED_GAMES.load(Ordering::Relaxed),
+    );
     Ok(())
 }
 
@@ -304,6 +336,7 @@ type Scratch = Vec<(usize, Vec<PathBuf>)>;
 /// files in scratch space.
 fn scatter_pass(
     reader: &SerializedFileReader<PositionalFile>,
+    num_row_groups: usize,
     pass: usize,
     scratch: &Path,
     threads: Threads,
@@ -367,7 +400,7 @@ fn scatter_pass(
                         .map(|_| MemoryPartition::default())
                         .collect();
 
-                    for i in (thread_idx..reader.num_row_groups()).step_by(threads.read) {
+                    for i in (thread_idx..num_row_groups).step_by(threads.read) {
                         let row_group_reader = reader.get_row_group(i).expect("row group");
                         let mut columns = GameColumns::default();
                         columns
@@ -459,11 +492,107 @@ fn pass_memory_partition(game_id: GameId, pass: usize) -> Option<usize> {
     (disk_partition == pass).then_some(memory_partition & (MEMORY_PARTITIONS_PER_PASS - 1))
 }
 
-fn process_memory_partition(mut partition: MemoryPartition) -> io::Result<()> {
+struct SstContext<'a> {
+    opts: &'a Options,
+    out: &'a Path,
+    stats: Mutex<SstStats>,
+}
+
+#[derive(Default)]
+struct SstStats {
+    games: u64,
+    files: u64,
+    bytes: u64,
+    largest_file: u64,
+}
+
+impl SstStats {
+    fn add_file(&mut self, games: u64, bytes: u64) {
+        self.games += games;
+        self.files += 1;
+        self.bytes += bytes;
+        self.largest_file = self.largest_file.max(bytes);
+    }
+}
+
+/// Sorts the partition by game id and writes it to non-overlapping SST files.
+///
+/// The sorted partition is split into contiguous ranges, each written by its
+/// own thread as a sequence of SST files. File names sort in key order.
+fn process_memory_partition(
+    mut partition: MemoryPartition,
+    memory_partition: usize,
+    sst: &SstContext<'_>,
+    threads: usize,
+) -> io::Result<()> {
     partition
         .index
         .sort_unstable_by_key(|&(game_id, _)| game_id);
 
-    // TODO: Write values in sorted order into SST files.
+    let ranges = threads.clamp(1, partition.index.len().max(1));
+    let range_len = partition.index.len().div_ceil(ranges);
+
+    thread::scope(|s| {
+        let partition = &partition;
+        for (range, index) in partition.index.chunks(range_len).enumerate() {
+            s.spawn(move || {
+                write_sst_range(
+                    partition,
+                    index,
+                    sst,
+                    &format!("games_{memory_partition:04}_{range:03}"),
+                )
+                .expect("write sst files");
+            });
+        }
+    });
+
     Ok(())
+}
+
+/// Writes a sorted range of the partition to SST files of bounded size.
+fn write_sst_range(
+    partition: &MemoryPartition,
+    index: &[(GameId, u64)],
+    sst: &SstContext<'_>,
+    prefix: &str,
+) -> Result<(), rocksdb::Error> {
+    let mut seq = 0;
+    let mut writer: Option<SstFileWriter<'_>> = None;
+    let mut games_in_file = 0;
+
+    let finish = |writer: &mut Option<SstFileWriter<'_>>, games_in_file: &mut u64| {
+        if let Some(mut w) = writer.take() {
+            w.finish()?;
+            let bytes = w.file_size();
+            assert!(bytes <= SST_MAX_SIZE, "sst file too large: {bytes}");
+            sst.stats
+                .lock()
+                .expect("lock stats")
+                .add_file(*games_in_file, bytes);
+            *games_in_file = 0;
+        }
+        Ok::<_, rocksdb::Error>(())
+    };
+
+    for &(game_id, offset) in index {
+        let w = match &mut writer {
+            Some(w) => w,
+            None => {
+                let w = SstFileWriter::create(sst.opts);
+                w.open(sst.out.join(format!("{prefix}_{seq:04}.sst")))?;
+                seq += 1;
+                writer.insert(w)
+            }
+        };
+
+        w.put(game_id.to_bytes(), partition.value_at(offset))?;
+        games_in_file += 1;
+
+        if w.file_size() >= SST_ROLL_SIZE {
+            finish(&mut writer, &mut games_in_file)?;
+        }
+    }
+
+    finish(&mut writer, &mut games_in_file)
 }

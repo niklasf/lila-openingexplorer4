@@ -11,7 +11,8 @@ pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
 pub use entry::{GroupHeader, LichessEntry, RatingGroup};
 pub use game::{
     GamePlayer, IndexStatus, InvalidRatingMode, InvalidSpeed, LichessGame, RatingMode, Speed,
-    outcome_bits, outcome_from_bits, unpack_uci_move,
+    outcome_bits, outcome_from_bits, pack_speed_and_rating_mode, unpack_speed_and_rating_mode,
+    unpack_uci_move,
 };
 pub use game_id::{GameId, InvalidGameId};
 pub use int::{pack_int, pack_uint, unpack_int, unpack_uint};
