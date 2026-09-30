@@ -2,29 +2,24 @@ use std::{
     fs::{self, File},
     io, mem,
     num::NonZeroUsize,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
-    packed::{GameId, pack_bytes, unpack_uint},
+    packed::{GameId, pack_uint, unpack_uint},
     parquet::{GameColumns, PositionalFile},
 };
-use parquet::{
-    basic::Compression,
-    file::{
-        reader::{FileReader, SerializedFileReader},
-        writer::SerializedFileWriter,
-    },
-};
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use rocksdb::{BlockBasedOptions, DBCompressionType, Options, SstFileWriter};
 use tikv_jemallocator::Jemalloc;
 
@@ -34,19 +29,21 @@ static ALLOC: Jemalloc = Jemalloc;
 /// One pass over the input for each disk partition. All memory partitions of
 /// a disk partition, except the resident ones, must fit into scratch space at
 /// the same time.
-const DISK_PARTITION_BITS: u32 = 3;
+const DISK_PARTITION_BITS: u32 = 1;
 
-/// Each memory partition must fit into memory at once.
-const MEMORY_PARTITION_BITS: u32 = 4;
+/// Each memory partition must fit into memory at once. Up to three memory
+/// partitions are in memory at the same time: one being written to SST files,
+/// one being loaded and sorted, and one resident partition of the next pass.
+const MEMORY_PARTITION_BITS: u32 = 6;
 
 const _: () = assert!(MEMORY_PARTITION_BITS >= DISK_PARTITION_BITS);
+
+const PASSES: usize = 1 << DISK_PARTITION_BITS;
 
 const MEMORY_PARTITIONS_PER_PASS: usize = 1 << (MEMORY_PARTITION_BITS - DISK_PARTITION_BITS);
 
 /// Memory partitions per pass that are kept in memory while reading the
-/// input, rather than being written to scratch space and read back. Each
-/// resident partition takes about as much memory as processing a memory
-/// partition.
+/// input, rather than being written to scratch space and read back.
 const RESIDENT_PARTITIONS_PER_PASS: usize = 1;
 
 const _: () = assert!(RESIDENT_PARTITIONS_PER_PASS <= MEMORY_PARTITIONS_PER_PASS);
@@ -55,7 +52,8 @@ const _: () = assert!(RESIDENT_PARTITIONS_PER_PASS <= MEMORY_PARTITIONS_PER_PASS
 const SCRATCH_PARTITIONS_PER_PASS: usize =
     MEMORY_PARTITIONS_PER_PASS - RESIDENT_PARTITIONS_PER_PASS;
 
-const ROW_GROUP_LEN: usize = 100_000;
+/// Uncompressed bytes per chunk in scratch files.
+const CHUNK_SIZE: usize = 4 << 20;
 
 /// Hard limit for the size of each SST file.
 const SST_MAX_SIZE: u64 = 512 * 1024 * 1024;
@@ -64,8 +62,15 @@ const SST_MAX_SIZE: u64 = 512 * 1024 * 1024;
 /// leaves room for the index and footer written when finishing the file.
 const SST_ROLL_SIZE: u64 = SST_MAX_SIZE - 16 * 1024 * 1024;
 
+/// Initial guess for the ratio of SST bytes to uncompressed value bytes, used
+/// until measured.
+const INITIAL_SST_RATIO: f64 = 0.9;
+
 /// Games that could not be represented as `LichessGame`.
 static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes currently occupied by scratch files.
+static SCRATCH_USAGE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser)]
 struct Args {
@@ -73,23 +78,32 @@ struct Args {
     /// Directory for temporary partition files.
     #[clap(long)]
     scratch: PathBuf,
+    /// Maximum bytes to use in scratch space. The scatter of a pass only
+    /// starts once the previous pass has freed enough scratch space.
+    #[clap(long, default_value = "650000000000")]
+    scratch_budget: u64,
     /// Directory for the final SST files.
     #[clap(long)]
     out: PathBuf,
-    /// Threads for reading the input and loading scratch files. Defaults to
-    /// half of the usable parallelism.
+    /// Threads for reading the input. Defaults to the usable parallelism
+    /// minus the write threads.
     #[clap(long)]
     read_threads: Option<usize>,
-    /// Threads for writing scratch files. Defaults to half of the usable
-    /// parallelism.
-    #[clap(long)]
-    write_threads: Option<usize>,
-    /// Threads for writing SST files. Defaults to the usable parallelism.
-    #[clap(long)]
-    sst_threads: Option<usize>,
+    /// Threads for compressing and writing scratch chunks.
+    #[clap(long, default_value = "4")]
+    write_threads: usize,
+    /// Threads for loading scratch files.
+    #[clap(long, default_value = "6")]
+    load_threads: usize,
+    /// Threads for writing SST files.
+    #[clap(long, default_value = "6")]
+    sst_threads: usize,
     /// Only process the first row groups of the input (for benchmarking).
     #[clap(long)]
     row_groups: Option<usize>,
+    /// Stop after the scatter of the first pass (for benchmarking).
+    #[clap(long)]
+    scatter_only: bool,
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]
     sst_block_size: usize,
@@ -102,148 +116,226 @@ struct Args {
     sst_zstd_dict: i32,
 }
 
-#[derive(Copy, Clone)]
-struct Threads {
-    read: usize,
-    write: usize,
-    sst: usize,
-}
-
-impl Threads {
-    /// Each scratch partition is split into this many files, so that all
-    /// write threads can be busy, even with few scratch partitions per pass.
-    fn shards(self) -> usize {
-        self.write
-            .div_ceil(SCRATCH_PARTITIONS_PER_PASS.max(1))
-            .max(1)
-    }
-}
-
-/// Writes row groups to a file in scratch space.
-struct ScratchWriter {
-    path: PathBuf,
-    writer: SerializedFileWriter<File>,
-}
-
-impl ScratchWriter {
-    pub fn create(path: PathBuf) -> io::Result<ScratchWriter> {
-        let file = File::create(&path)?;
-        Ok(ScratchWriter {
-            path,
-            writer: SerializedFileWriter::new(
-                file,
-                GameColumns::schema(),
-                Arc::new(
-                    GameColumns::properties()
-                        .set_compression(Compression::LZ4)
-                        .build(),
-                ),
-            )?,
-        })
-    }
-
-    pub fn write(&mut self, columns: &GameColumns) {
-        columns
-            .write_row_group(&mut self.writer)
-            .expect("write row group");
-    }
-
-    pub fn close(self) -> PathBuf {
-        self.writer.close().expect("close partition file");
-        self.path
-    }
-}
-
-/// A scratch file, with a buffer collecting pieces into a full row group.
-struct ScratchFile {
-    buffer: Mutex<GameColumns>,
-    writer: Mutex<ScratchWriter>,
-}
-
 /// A memory partition, loaded in a compact form ready to be sorted.
+///
+/// Records are `game_id` (6 bytes), followed by the length-prefixed value.
+/// The index points at the length prefix.
 #[derive(Default)]
 struct MemoryPartition {
-    /// Length-prefixed packed values, back to back.
-    values: Vec<u8>,
-    /// Game ids and the offsets of their values.
+    records: Vec<u8>,
     index: Vec<(GameId, u64)>,
 }
 
 impl MemoryPartition {
-    pub fn push(&mut self, columns: &GameColumns) {
-        self.index.reserve(columns.len());
-        let mut value = Vec::new();
-        let mut skipped = 0;
-        for row in columns.rows() {
-            value.clear();
-            if row.pack_lichess_game(&mut value).is_err() {
-                skipped += 1;
-                continue;
-            }
-            self.index.push((row.game_id, self.values.len() as u64));
-            pack_bytes(&mut self.values, &value);
-        }
-        if skipped > 0 {
-            SKIPPED_GAMES.fetch_add(skipped, Ordering::Relaxed);
-        }
+    fn push(&mut self, game_id: GameId, value: &[u8]) {
+        self.records.extend_from_slice(&game_id.to_bytes());
+        self.index.push((game_id, self.records.len() as u64));
+        pack_uint(&mut self.records, value.len() as u64);
+        self.records.extend_from_slice(value);
     }
 
-    /// The packed value at the given offset in `values`.
-    pub fn value_at(&self, offset: u64) -> &[u8] {
-        let mut buf = &self.values[offset as usize..];
+    /// The packed value at the given offset in `records`.
+    fn value_at(&self, offset: u64) -> &[u8] {
+        let mut buf = &self.records[offset as usize..];
         let len = unpack_uint(&mut buf) as usize;
         &buf[..len]
     }
 
-    pub fn append(&mut self, other: MemoryPartition) {
-        if self.index.is_empty() {
-            *self = other;
-            return;
+    /// Builds index entries for a range of records starting at `base`.
+    fn index_records(records: &[u8], base: u64, index: &mut Vec<(GameId, u64)>) {
+        let mut pos = 0;
+        while pos < records.len() {
+            let mut buf = &records[pos..];
+            let game_id = GameId::unpack(&mut buf);
+            let offset = pos + GameId::SIZE;
+            let len = unpack_uint(&mut buf) as usize;
+            let header = records.len() - pos - buf.len();
+            index.push((game_id, base + offset as u64));
+            pos += header + len;
         }
-        let base = self.values.len() as u64;
-        self.values.extend_from_slice(&other.values);
-        self.index.extend(
-            other
-                .index
-                .into_iter()
-                .map(|(game_id, offset)| (game_id, base + offset)),
-        );
+        assert_eq!(pos, records.len(), "records truncated");
     }
 
-    /// Loads all row groups of the given scratch files, in parallel.
-    pub fn load(paths: &[PathBuf], threads: usize) -> io::Result<MemoryPartition> {
-        let readers = paths
-            .iter()
-            .map(|path| Ok::<_, io::Error>(SerializedFileReader::new(PositionalFile::open(path)?)?))
-            .collect::<io::Result<Vec<_>>>()?;
+    /// Merges partitions collected by multiple threads.
+    fn merge(parts: Vec<MemoryPartition>) -> MemoryPartition {
+        let mut parts = parts.into_iter().filter(|p| !p.index.is_empty());
+        let Some(mut merged) = parts.next() else {
+            return MemoryPartition::default();
+        };
+        let parts: Vec<_> = parts.collect();
+        merged
+            .records
+            .reserve_exact(parts.iter().map(|p| p.records.len()).sum());
+        merged
+            .index
+            .reserve_exact(parts.iter().map(|p| p.index.len()).sum());
+        for part in parts {
+            let base = merged.records.len() as u64;
+            merged.records.extend_from_slice(&part.records);
+            merged
+                .index
+                .extend(part.index.into_iter().map(|(id, off)| (id, base + off)));
+        }
+        merged
+    }
+}
 
-        let jobs: Vec<(usize, usize)> = readers
-            .iter()
-            .enumerate()
-            .flat_map(|(file, reader)| (0..reader.num_row_groups()).map(move |i| (file, i)))
-            .collect();
-        let next_job = AtomicUsize::new(0);
+/// Appends a record to a scratch chunk buffer.
+fn push_record(buf: &mut Vec<u8>, game_id: GameId, value: &[u8]) {
+    buf.extend_from_slice(&game_id.to_bytes());
+    pack_uint(buf, value.len() as u64);
+    buf.extend_from_slice(value);
+}
 
-        let partition = Mutex::new(MemoryPartition::default());
+#[derive(Copy, Clone)]
+struct ChunkMeta {
+    offset: u64,
+    raw_len: u32,
+    compressed_len: u32,
+}
+
+/// A scratch file holding LZ4 compressed chunks of records.
+struct ScratchFile {
+    path: PathBuf,
+    file: File,
+    len: u64,
+    chunks: Vec<ChunkMeta>,
+}
+
+impl ScratchFile {
+    fn create(path: PathBuf) -> io::Result<ScratchFile> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        Ok(ScratchFile {
+            path,
+            file,
+            len: 0,
+            chunks: Vec::new(),
+        })
+    }
+
+    fn append(&mut self, raw_len: usize, compressed: &[u8]) -> io::Result<()> {
+        self.file.write_all_at(compressed, self.len)?;
+        self.chunks.push(ChunkMeta {
+            offset: self.len,
+            raw_len: raw_len as u32,
+            compressed_len: compressed.len() as u32,
+        });
+        self.len += compressed.len() as u64;
+        SCRATCH_USAGE.fetch_add(compressed.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn raw_len(&self) -> usize {
+        self.chunks.iter().map(|c| c.raw_len as usize).sum()
+    }
+
+    /// Loads and decompresses all chunks in parallel.
+    fn load(&self, threads: usize) -> MemoryPartition {
+        let mut records = vec![0u8; self.raw_len()];
+
+        // Disjoint destination slices for each chunk.
+        let mut slots: Vec<Option<(ChunkMeta, u64, &mut [u8])>> =
+            Vec::with_capacity(self.chunks.len());
+        let mut rest: &mut [u8] = &mut records;
+        let mut base = 0u64;
+        for chunk in &self.chunks {
+            let (dst, tail) = rest.split_at_mut(chunk.raw_len as usize);
+            rest = tail;
+            slots.push(Some((*chunk, base, dst)));
+            base += chunk.raw_len as u64;
+        }
+        let next = AtomicUsize::new(0);
+        let slots = Mutex::new(slots);
+        let index = Mutex::new(Vec::new());
 
         thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
-                    let mut local = MemoryPartition::default();
-                    let mut columns = GameColumns::default();
-                    while let Some(&(file, i)) = jobs.get(next_job.fetch_add(1, Ordering::Relaxed))
-                    {
-                        columns
-                            .read_columns(&*readers[file].get_row_group(i).expect("row group"))
-                            .expect("read columns");
-                        local.push(&columns);
+                    let mut compressed = Vec::new();
+                    let mut local_index = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((chunk, base, dst)) = slots
+                            .lock()
+                            .expect("lock slots")
+                            .get_mut(i)
+                            .and_then(Option::take)
+                        else {
+                            break;
+                        };
+                        compressed.resize(chunk.compressed_len as usize, 0);
+                        self.file
+                            .read_exact_at(&mut compressed, chunk.offset)
+                            .expect("read chunk");
+                        let n = lz4_flex::decompress_into(&compressed, dst).expect("decompress");
+                        assert_eq!(n, dst.len(), "chunk length");
+                        MemoryPartition::index_records(dst, base, &mut local_index);
                     }
-                    partition.lock().expect("lock partition").append(local);
+                    index.lock().expect("lock index").append(&mut local_index);
                 });
             }
         });
 
-        Ok(partition.into_inner().expect("partition"))
+        MemoryPartition {
+            records,
+            index: index.into_inner().expect("index"),
+        }
+    }
+
+    fn remove(self) -> io::Result<()> {
+        drop(self.file);
+        fs::remove_file(&self.path)?;
+        SCRATCH_USAGE.fetch_sub(self.len, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// A memory partition to process, either resident or in scratch space.
+enum PartitionSource {
+    Resident(MemoryPartition),
+    Scratch(ScratchFile),
+}
+
+struct PartitionJob {
+    memory_partition: usize,
+    source: PartitionSource,
+}
+
+struct SstContext<'a> {
+    opts: &'a Options,
+    out: &'a Path,
+    stats: Mutex<SstStats>,
+}
+
+#[derive(Default)]
+struct SstStats {
+    games: u64,
+    files: u64,
+    bytes: u64,
+    raw_bytes: u64,
+    largest_file: u64,
+}
+
+impl SstStats {
+    fn add_file(&mut self, games: u64, bytes: u64, raw_bytes: u64) {
+        self.games += games;
+        self.files += 1;
+        self.bytes += bytes;
+        self.raw_bytes += raw_bytes;
+        self.largest_file = self.largest_file.max(bytes);
+    }
+
+    fn ratio(&self) -> f64 {
+        if self.raw_bytes == 0 {
+            INITIAL_SST_RATIO
+        } else {
+            self.bytes as f64 / self.raw_bytes as f64
+        }
     }
 }
 
@@ -255,11 +347,9 @@ fn main() -> io::Result<()> {
         .map_or(1, NonZeroUsize::get)
         .saturating_sub(2)
         .max(2);
-    let threads = Threads {
-        read: args.read_threads.unwrap_or(parallelism / 2),
-        write: args.write_threads.unwrap_or(parallelism / 2),
-        sst: args.sst_threads.unwrap_or(parallelism),
-    };
+    let read_threads = args
+        .read_threads
+        .unwrap_or(parallelism.saturating_sub(args.write_threads).max(1));
 
     let reader = SerializedFileReader::new(PositionalFile::open(&args.parquet)?)?;
     let num_row_groups = args.row_groups.map_or(reader.num_row_groups(), |limit| {
@@ -293,11 +383,10 @@ fn main() -> io::Result<()> {
         stats: Mutex::new(SstStats::default()),
     };
 
-    let passes = 1 << DISK_PARTITION_BITS;
     let started = Instant::now();
 
     let progress = ProgressBar::with_draw_target(
-        Some(num_rows * passes as u64),
+        Some(num_rows * PASSES as u64),
         ProgressDrawTarget::stdout_with_hz(4),
     )
     .with_style(
@@ -307,219 +396,311 @@ fn main() -> io::Result<()> {
         .expect("progress template"),
     );
 
-    for pass in 0..passes {
-        progress.set_prefix(format!("pass {}/{}", pass + 1, passes));
+    thread::scope(|s| {
+        let progress = &progress;
+        let sst = &sst;
+        let reader = &reader;
+        let args = &args;
 
-        progress.set_message("scattering");
-        let timer = Instant::now();
-        let (resident, scratch) = scatter_pass(
-            &reader,
-            num_row_groups,
-            pass,
-            &args.scratch,
-            threads,
-            &progress,
-        )?;
-        log(&progress, format!("pass {pass}: scatter {:.1?}", timer.elapsed()));
+        // Loader: loads and sorts partitions in order, one ahead of the
+        // writer.
+        let (job_tx, job_rx) = channel::unbounded::<PartitionJob>();
+        let (sorted_tx, sorted_rx) = channel::bounded::<(usize, MemoryPartition)>(0);
+        s.spawn(move || {
+            for job in job_rx {
+                let memory_partition = job.memory_partition;
+                let timer = Instant::now();
+                let mut partition = match job.source {
+                    PartitionSource::Resident(partition) => partition,
+                    PartitionSource::Scratch(scratch) => {
+                        let partition = scratch.load(args.load_threads);
+                        scratch.remove().expect("remove scratch");
+                        partition
+                    }
+                };
+                let load = timer.elapsed();
 
-        // Process resident partitions first, to free their memory.
-        for (memory_partition, partition) in resident {
-            progress.set_message(format!("processing {memory_partition} (resident)"));
-            process_memory_partition(partition, memory_partition, &sst, threads.sst, &progress)?;
-        }
-
-        for (memory_partition, paths) in scratch {
-            progress.set_message(format!("loading {memory_partition}"));
-            let timer = Instant::now();
-            let partition = MemoryPartition::load(&paths, threads.read)?;
-            for path in &paths {
-                fs::remove_file(path)?;
+                let timer = Instant::now();
+                partition
+                    .index
+                    .sort_unstable_by_key(|&(game_id, _)| game_id);
+                log(
+                    progress,
+                    format!(
+                        "partition {memory_partition}: load {load:.1?}, sort {:.1?} ({} games, {} record bytes)",
+                        timer.elapsed(),
+                        partition.index.len(),
+                        partition.records.len()
+                    ),
+                );
+                sorted_tx
+                    .send((memory_partition, partition))
+                    .expect("send sorted");
             }
+        });
+
+        // Writer: writes sorted partitions to SST files.
+        s.spawn(move || {
+            for (memory_partition, partition) in sorted_rx {
+                let timer = Instant::now();
+                write_partition(&partition, memory_partition, sst, args.sst_threads);
+                let stats = sst.stats.lock().expect("lock stats");
+                log(
+                    progress,
+                    format!(
+                        "partition {memory_partition}: write {:.1?} ({} files so far, ratio {:.3})",
+                        timer.elapsed(),
+                        stats.files,
+                        stats.ratio()
+                    ),
+                );
+            }
+        });
+
+        let mut expected_scratch = 0;
+        for pass in 0..PASSES {
+            progress.set_prefix(format!("pass {}/{}", pass + 1, PASSES));
+
+            // Wait until the previous pass has freed enough scratch space.
+            let timer = Instant::now();
+            loop {
+                let usage = SCRATCH_USAGE.load(Ordering::Relaxed);
+                if usage + expected_scratch <= args.scratch_budget {
+                    break;
+                }
+                progress.set_message(format!(
+                    "waiting for scratch space ({} GB used)",
+                    usage >> 30
+                ));
+                thread::sleep(Duration::from_secs(1));
+            }
+            if pass > 0 {
+                log(
+                    progress,
+                    format!(
+                        "pass {pass}: waited {:.1?} for scratch space",
+                        timer.elapsed()
+                    ),
+                );
+            }
+
+            progress.set_message("scattering");
+            let timer = Instant::now();
+            let (resident, scratch) = scatter_pass(
+                reader,
+                num_row_groups,
+                pass,
+                &args.scratch,
+                read_threads,
+                args.write_threads,
+                progress,
+            )
+            .expect("scatter");
+            let scratch_bytes: u64 = scratch.iter().map(|f| f.len).sum();
+            expected_scratch = scratch_bytes + scratch_bytes / 20;
             log(
-                &progress,
+                progress,
                 format!(
-                    "partition {memory_partition}: load {:.1?} ({} games, {} value bytes)",
+                    "pass {pass}: scatter {:.1?} ({} GB scratch)",
                     timer.elapsed(),
-                    partition.index.len(),
-                    partition.values.len()
+                    scratch_bytes >> 30
                 ),
             );
+            if args.scatter_only {
+                for file in scratch {
+                    file.remove().expect("remove scratch");
+                }
+                break;
+            }
 
-            progress.set_message(format!("processing {memory_partition}"));
-            process_memory_partition(partition, memory_partition, &sst, threads.sst, &progress)?;
+            // Process resident partitions first, to free their memory.
+            for (memory_partition, partition) in resident {
+                job_tx
+                    .send(PartitionJob {
+                        memory_partition,
+                        source: PartitionSource::Resident(partition),
+                    })
+                    .expect("send job");
+            }
+            for (memory_partition, file) in scratch.into_iter().enumerate() {
+                job_tx
+                    .send(PartitionJob {
+                        memory_partition: pass * MEMORY_PARTITIONS_PER_PASS + memory_partition,
+                        source: PartitionSource::Scratch(file),
+                    })
+                    .expect("send job");
+            }
         }
-    }
+
+        drop(job_tx);
+    });
 
     progress.finish();
 
     let stats = sst.stats.into_inner().expect("stats");
     println!(
-        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes), {} skipped games",
+        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes, ratio {:.3}), {} skipped games",
         started.elapsed(),
         stats.games,
         stats.files,
         stats.bytes,
         stats.largest_file,
+        stats.ratio(),
         SKIPPED_GAMES.load(Ordering::Relaxed),
     );
     Ok(())
 }
 
 type Resident = Vec<(usize, MemoryPartition)>;
-type Scratch = Vec<(usize, Vec<PathBuf>)>;
 
 /// Reads the entire input and distributes the games of the given disk
 /// partition to its memory partitions. The last `RESIDENT_PARTITIONS_PER_PASS`
-/// memory partitions are kept in memory, the others are written to sharded
-/// files in scratch space.
+/// memory partitions are kept in memory, the others are written to scratch
+/// files.
 fn scatter_pass(
     reader: &SerializedFileReader<PositionalFile>,
     num_row_groups: usize,
     pass: usize,
     scratch: &Path,
-    threads: Threads,
+    read_threads: usize,
+    write_threads: usize,
     progress: &ProgressBar,
-) -> io::Result<(Resident, Scratch)> {
+) -> io::Result<(Resident, Vec<ScratchFile>)> {
     let first_memory_partition = pass * MEMORY_PARTITIONS_PER_PASS;
-    let shards = threads.shards();
 
-    // Scratch file for shard s of scratch partition i at index i * shards + s.
-    let files = (0..SCRATCH_PARTITIONS_PER_PASS)
-        .flat_map(|i| (0..shards).map(move |s| (first_memory_partition + i, s)))
-        .map(|(memory_partition, shard)| {
-            Ok::<_, io::Error>(ScratchFile {
-                buffer: Mutex::new(GameColumns::default()),
-                writer: Mutex::new(ScratchWriter::create(
-                    scratch.join(format!("games_{memory_partition:05}_{shard:03}.parquet")),
-                )?),
-            })
+    let files: Vec<Mutex<ScratchFile>> = (0..SCRATCH_PARTITIONS_PER_PASS)
+        .map(|i| {
+            Ok::<_, io::Error>(Mutex::new(ScratchFile::create(
+                scratch.join(format!("games_{:05}.lz4chunks", first_memory_partition + i)),
+            )?))
         })
-        .collect::<io::Result<Vec<_>>>()?;
+        .collect::<io::Result<_>>()?;
 
-    let resident: Vec<Mutex<MemoryPartition>> = (0..RESIDENT_PARTITIONS_PER_PASS)
-        .map(|_| Mutex::new(MemoryPartition::default()))
-        .collect();
+    let resident: Mutex<Vec<MemoryPartition>> = Mutex::new(Vec::new());
+    let next_row_group = AtomicUsize::new(0);
 
     thread::scope(|s| {
         let files = &files;
         let resident = &resident;
+        let next_row_group = &next_row_group;
 
-        // Write threads take full row groups for any scratch file. Writes to
-        // the same file are serialized by its lock.
-        let (tx, rx) = channel::bounded::<(usize, GameColumns)>(threads.write);
+        // Write threads compress full chunks and append them to scratch
+        // files.
+        let (tx, rx) = channel::bounded::<(usize, Vec<u8>)>(write_threads * 2);
 
-        for _ in 0..threads.write {
+        for _ in 0..write_threads {
             let rx = rx.clone();
             s.spawn(move || {
-                for (file, batch) in rx {
+                let mut compressed = Vec::new();
+                for (file, raw) in rx {
+                    compressed.resize(lz4_flex::block::get_maximum_output_size(raw.len()), 0);
+                    let n = lz4_flex::compress_into(&raw, &mut compressed).expect("compress");
                     files[file]
-                        .writer
                         .lock()
-                        .expect("lock writer")
-                        .write(&batch);
+                        .expect("lock scratch file")
+                        .append(raw.len(), &compressed[..n])
+                        .expect("append chunk");
                 }
             });
         }
 
         drop(rx);
 
-        // Read threads scatter each row group into pieces, one for each
-        // memory partition of this pass. They pack pieces for resident
-        // partitions, and collect pieces for scratch files into full row
-        // groups.
-        let read_threads: Vec<_> = (0..threads.read)
-            .map(|thread_idx| {
-                let tx = tx.clone();
-                s.spawn(move || {
-                    // Collect resident partitions locally, to avoid
-                    // contention.
-                    let mut local_resident: Vec<MemoryPartition> = (0
-                        ..RESIDENT_PARTITIONS_PER_PASS)
-                        .map(|_| MemoryPartition::default())
-                        .collect();
+        // Read threads pack the games of this pass and route them to
+        // resident partitions or scratch chunks.
+        for _ in 0..read_threads {
+            let tx = tx.clone();
+            s.spawn(move || {
+                let mut local_resident: Vec<MemoryPartition> = (0..RESIDENT_PARTITIONS_PER_PASS)
+                    .map(|_| MemoryPartition::default())
+                    .collect();
+                let mut chunks: Vec<Vec<u8>> = (0..SCRATCH_PARTITIONS_PER_PASS)
+                    .map(|_| Vec::with_capacity(CHUNK_SIZE + 4096))
+                    .collect();
+                let mut columns = GameColumns::default();
+                let mut value = Vec::new();
+                let mut skipped = 0;
 
-                    for i in (thread_idx..num_row_groups).step_by(threads.read) {
-                        let row_group_reader = reader.get_row_group(i).expect("row group");
-                        let mut columns = GameColumns::default();
-                        columns
-                            .read_columns(&*row_group_reader)
-                            .expect("read columns");
+                loop {
+                    let i = next_row_group.fetch_add(1, Ordering::Relaxed);
+                    if i >= num_row_groups {
+                        break;
+                    }
+                    columns
+                        .read_columns(&*reader.get_row_group(i).expect("row group"))
+                        .expect("read columns");
 
-                        let mut pieces: Vec<GameColumns> = (0..MEMORY_PARTITIONS_PER_PASS)
-                            .map(|_| GameColumns::default())
-                            .collect();
-                        columns.scatter(
-                            |game_id| pass_memory_partition(game_id, pass),
-                            &mut pieces.iter_mut().collect::<Vec<_>>(),
-                        );
-
-                        progress.inc(columns.len() as u64);
-
-                        for (j, mut piece) in pieces.into_iter().enumerate() {
-                            if piece.len() == 0 {
-                                continue;
-                            }
-
-                            if j >= SCRATCH_PARTITIONS_PER_PASS {
-                                local_resident[j - SCRATCH_PARTITIONS_PER_PASS].push(&piece);
-                            } else {
-                                let file = j * shards + i % shards;
-                                let batch = {
-                                    let mut buffer =
-                                        files[file].buffer.lock().expect("lock buffer");
-                                    buffer.append(&mut piece);
-                                    (buffer.len() >= ROW_GROUP_LEN).then(|| mem::take(&mut *buffer))
-                                };
-                                if let Some(batch) = batch {
-                                    tx.send((file, batch)).expect("send batch");
-                                }
+                    for row in columns.rows() {
+                        let Some(j) = pass_memory_partition(row.game_id, pass) else {
+                            continue;
+                        };
+                        value.clear();
+                        if row.pack_lichess_game(&mut value).is_err() {
+                            skipped += 1;
+                            continue;
+                        }
+                        if j >= SCRATCH_PARTITIONS_PER_PASS {
+                            local_resident[j - SCRATCH_PARTITIONS_PER_PASS]
+                                .push(row.game_id, &value);
+                        } else {
+                            let chunk = &mut chunks[j];
+                            push_record(chunk, row.game_id, &value);
+                            if chunk.len() >= CHUNK_SIZE {
+                                let full =
+                                    mem::replace(chunk, Vec::with_capacity(CHUNK_SIZE + 4096));
+                                tx.send((j, full)).expect("send chunk");
                             }
                         }
                     }
 
-                    for (partition, local) in resident.iter().zip(local_resident) {
-                        partition.lock().expect("lock resident").append(local);
+                    progress.inc(columns.len() as u64);
+                }
+
+                for (j, chunk) in chunks.into_iter().enumerate() {
+                    if !chunk.is_empty() {
+                        tx.send((j, chunk)).expect("send chunk");
                     }
-                })
-            })
-            .collect();
+                }
 
-        for read_thread in read_threads {
-            read_thread.join().expect("read thread");
+                SKIPPED_GAMES.fetch_add(skipped, Ordering::Relaxed);
+                resident
+                    .lock()
+                    .expect("lock resident")
+                    .append(&mut local_resident);
+            });
         }
 
-        // Write remaining partial row groups.
-        for (file, scratch_file) in files.iter().enumerate() {
-            let batch = mem::take(&mut *scratch_file.buffer.lock().expect("lock buffer"));
-            if batch.len() > 0 {
-                tx.send((file, batch)).expect("send batch");
-            }
-        }
-
-        // Write threads finish once all batches are written.
+        // Write threads finish once all chunks are written.
         drop(tx);
     });
 
-    let mut scratch_paths: Scratch = (0..SCRATCH_PARTITIONS_PER_PASS)
-        .map(|i| (first_memory_partition + i, Vec::with_capacity(shards)))
+    let files: Vec<ScratchFile> = files
+        .into_iter()
+        .map(|file| file.into_inner().expect("scratch file"))
         .collect();
-    for (file, scratch_file) in files.into_iter().enumerate() {
-        let path = scratch_file.writer.into_inner().expect("writer").close();
-        scratch_paths[file / shards].1.push(path);
-    }
 
-    let resident = resident
+    // Merge per-thread resident partitions.
+    let mut per_thread = resident.into_inner().expect("resident");
+    let mut merged: Vec<Vec<MemoryPartition>> = (0..RESIDENT_PARTITIONS_PER_PASS)
+        .map(|_| Vec::new())
+        .collect();
+    while !per_thread.is_empty() {
+        for (i, partition) in per_thread.drain(..RESIDENT_PARTITIONS_PER_PASS).enumerate() {
+            merged[i].push(partition);
+        }
+    }
+    let resident = merged
         .into_iter()
         .enumerate()
-        .map(|(i, partition)| {
+        .map(|(i, parts)| {
             (
                 first_memory_partition + SCRATCH_PARTITIONS_PER_PASS + i,
-                partition.into_inner().expect("resident"),
+                MemoryPartition::merge(parts),
             )
         })
         .collect();
 
-    Ok((resident, scratch_paths))
+    Ok((resident, files))
 }
 
 /// Index of the memory partition within the given pass, or `None` if the
@@ -530,83 +711,49 @@ fn pass_memory_partition(game_id: GameId, pass: usize) -> Option<usize> {
     (disk_partition == pass).then_some(memory_partition & (MEMORY_PARTITIONS_PER_PASS - 1))
 }
 
-struct SstContext<'a> {
-    opts: &'a Options,
-    out: &'a Path,
-    stats: Mutex<SstStats>,
-}
-
-#[derive(Default)]
-struct SstStats {
-    games: u64,
-    files: u64,
-    bytes: u64,
-    largest_file: u64,
-}
-
-impl SstStats {
-    fn add_file(&mut self, games: u64, bytes: u64) {
-        self.games += games;
-        self.files += 1;
-        self.bytes += bytes;
-        self.largest_file = self.largest_file.max(bytes);
-    }
-}
-
-/// Sorts the partition by game id and writes it to non-overlapping SST files.
+/// Writes a sorted partition to non-overlapping SST files.
 ///
-/// The sorted partition is split into contiguous ranges, each written by its
-/// own thread as a sequence of SST files. File names sort in key order.
-fn process_memory_partition(
-    mut partition: MemoryPartition,
+/// The partition is split into contiguous ranges sized to produce about one
+/// full SST file each. Ranges are written in parallel. File names sort in key
+/// order.
+fn write_partition(
+    partition: &MemoryPartition,
     memory_partition: usize,
     sst: &SstContext<'_>,
     threads: usize,
-    progress: &ProgressBar,
-) -> io::Result<()> {
-    let timer = Instant::now();
-    partition
-        .index
-        .sort_unstable_by_key(|&(game_id, _)| game_id);
-    log(
-        progress,
-        format!(
-            "partition {memory_partition}: sort {:.1?} ({} games)",
-            timer.elapsed(),
-            partition.index.len()
-        ),
-    );
+) {
+    if partition.index.is_empty() {
+        return;
+    }
 
-    let timer = Instant::now();
-    let ranges = threads.clamp(1, partition.index.len().max(1));
-    let range_len = partition.index.len().div_ceil(ranges);
+    let ratio = sst.stats.lock().expect("lock stats").ratio();
+    let raw_per_range = (SST_ROLL_SIZE as f64 * 0.97 / ratio) as usize;
+    let raw_per_game = partition.records.len() / partition.index.len();
+    let games_per_range = (raw_per_range / raw_per_game.max(1))
+        .min(partition.index.len().div_ceil(threads))
+        .max(1);
+    let ranges: Vec<&[(GameId, u64)]> = partition.index.chunks(games_per_range).collect();
+    let next_range = AtomicUsize::new(0);
 
     thread::scope(|s| {
-        let partition = &partition;
-        for (range, index) in partition.index.chunks(range_len).enumerate() {
-            s.spawn(move || {
-                write_sst_range(
-                    partition,
-                    index,
-                    sst,
-                    &format!("games_{memory_partition:04}_{range:03}"),
-                )
-                .expect("write sst files");
+        for _ in 0..threads.min(ranges.len()) {
+            s.spawn(|| {
+                loop {
+                    let range = next_range.fetch_add(1, Ordering::Relaxed);
+                    let Some(index) = ranges.get(range) else {
+                        break;
+                    };
+                    write_sst_range(
+                        partition,
+                        index,
+                        sst,
+                        &format!("games_{memory_partition:03}_{range:05}"),
+                    )
+                    .expect("write sst files");
+                }
             });
         }
     });
-    log(
-        progress,
-        format!("partition {memory_partition}: write {:.1?}", timer.elapsed()),
-    );
-
-    Ok(())
-}
-
-fn log(progress: &ProgressBar, msg: String) {
-    // Must not touch the progress bar inside `suspend` (its state is locked).
-    let elapsed = progress.elapsed();
-    progress.suspend(|| eprintln!("[{elapsed:>8.1?}] {msg}"));
 }
 
 /// Writes a sorted range of the partition to SST files of bounded size.
@@ -619,8 +766,9 @@ fn write_sst_range(
     let mut seq = 0;
     let mut writer: Option<SstFileWriter<'_>> = None;
     let mut games_in_file = 0;
+    let mut raw_in_file = 0;
 
-    let finish = |writer: &mut Option<SstFileWriter<'_>>, games_in_file: &mut u64| {
+    let finish = |writer: &mut Option<SstFileWriter<'_>>, games: &mut u64, raw: &mut u64| {
         if let Some(mut w) = writer.take() {
             w.finish()?;
             let bytes = w.file_size();
@@ -628,8 +776,9 @@ fn write_sst_range(
             sst.stats
                 .lock()
                 .expect("lock stats")
-                .add_file(*games_in_file, bytes);
-            *games_in_file = 0;
+                .add_file(*games, bytes, *raw);
+            *games = 0;
+            *raw = 0;
         }
         Ok::<_, rocksdb::Error>(())
     };
@@ -639,19 +788,27 @@ fn write_sst_range(
             Some(w) => w,
             None => {
                 let w = SstFileWriter::create(sst.opts);
-                w.open(sst.out.join(format!("{prefix}_{seq:04}.sst")))?;
+                w.open(sst.out.join(format!("{prefix}_{seq}.sst")))?;
                 seq += 1;
                 writer.insert(w)
             }
         };
 
-        w.put(game_id.to_bytes(), partition.value_at(offset))?;
+        let value = partition.value_at(offset);
+        w.put(game_id.to_bytes(), value)?;
         games_in_file += 1;
+        raw_in_file += (GameId::SIZE + value.len()) as u64;
 
         if w.file_size() >= SST_ROLL_SIZE {
-            finish(&mut writer, &mut games_in_file)?;
+            finish(&mut writer, &mut games_in_file, &mut raw_in_file)?;
         }
     }
 
-    finish(&mut writer, &mut games_in_file)
+    finish(&mut writer, &mut games_in_file, &mut raw_in_file)
+}
+
+fn log(progress: &ProgressBar, msg: String) {
+    // Must not touch the progress bar inside `suspend` (its state is locked).
+    let elapsed = progress.elapsed();
+    progress.suspend(|| eprintln!("[{elapsed:>8.1?}] {msg}"));
 }

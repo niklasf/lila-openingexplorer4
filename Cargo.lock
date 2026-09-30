@@ -588,6 +588,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "indicatif",
+ "lz4_flex",
  "nohash-hasher",
  "parquet",
  "pgn-reader",

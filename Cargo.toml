@@ -12,6 +12,7 @@ bytes = "1.11.0"
 clap = { version = "4.5.53", features = ["derive"] }
 crossbeam = "0.8.4"
 indicatif = "0.18.3"
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std"] }
 nohash-hasher = "0.2.0"
 parquet = { version = "60.0.0", default-features = false, features = ["zstd", "lz4"] }
 pgn-reader = { version = "0.28.0", git = "https://github.com/niklasf/shakmaty.git", branch = "incremental-zobrist-hash" }
