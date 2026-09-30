@@ -17,7 +17,12 @@ impl GameId {
     }
 
     pub fn partition(self, bits: u32) -> usize {
-        ((u128::from(self.0) << bits) / 62_u128.pow(8)) as usize
+        if bits <= 16 {
+            // 62^8 < 2^48, so the shifted id fits into 64 bits.
+            ((self.0 << bits) / 62_u64.pow(8)) as usize
+        } else {
+            ((u128::from(self.0) << bits) / 62_u128.pow(8)) as usize
+        }
     }
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {

@@ -152,56 +152,54 @@ fn page_parts(page: &Page) -> (Bytes, usize, Encoding) {
 }
 
 /// Variable length byte values, optionally nullable.
+///
+/// Values are not copied: each row references a range in one of the page
+/// buffers (a data page for PLAIN pages, the dictionary page for dictionary
+/// encoded pages).
 #[derive(Default)]
 pub struct BytesColumn {
-    /// `len + 1` offsets into `data`.
-    offsets: Vec<u32>,
-    data: Vec<u8>,
-    /// Validity per row, or `None` for required columns.
-    valid: Option<Vec<bool>>,
+    /// Buffer for each range of rows.
+    buffers: Vec<Bytes>,
+    /// First row of each buffer, ascending.
+    buffer_starts: Vec<usize>,
+    /// Start and length within the buffer of the row, for each row.
+    /// A length of `u32::MAX` marks a null.
+    ranges: Vec<(u32, u32)>,
+    // Dictionary of the current column chunk.
+    dict_buf: Bytes,
+    dict_ranges: Vec<(u32, u32)>,
     // Scratch buffers, kept to reuse allocations.
-    dict_offsets: Vec<u32>,
-    dict_data: Vec<u8>,
     indices: Vec<u32>,
     levels: Vec<u32>,
 }
 
+const NULL_LEN: u32 = u32::MAX;
+
 impl BytesColumn {
     pub fn len(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
+        self.ranges.len()
     }
 
     pub fn get(&self, i: usize) -> Option<&[u8]> {
-        if self.valid.as_ref().is_some_and(|valid| !valid[i]) {
+        let (start, len) = self.ranges[i];
+        if len == NULL_LEN {
             return None;
         }
-        Some(&self.data[self.offsets[i] as usize..self.offsets[i + 1] as usize])
+        let buffer = self.buffer_starts.partition_point(|&s| s <= i) - 1;
+        Some(&self.buffers[buffer][start as usize..start as usize + len as usize])
     }
 
     fn clear(&mut self) {
-        self.offsets.clear();
-        self.offsets.push(0);
-        self.data.clear();
-        self.valid = None;
-    }
-
-    fn push(&mut self, value: &[u8]) {
-        self.data.extend_from_slice(value);
-        self.offsets.push(self.data.len() as u32);
-    }
-
-    fn push_null(&mut self) {
-        self.offsets.push(self.data.len() as u32);
+        self.buffers.clear();
+        self.buffer_starts.clear();
+        self.ranges.clear();
     }
 
     /// Reads the column `i` of the row group.
     pub fn read(&mut self, reader: &dyn RowGroupReader, i: usize, optional: bool) -> Result<()> {
         self.clear();
         let num_rows = reader.metadata().num_rows() as usize;
-        self.offsets.reserve(num_rows);
-        if optional {
-            self.valid = Some(Vec::with_capacity(num_rows));
-        }
+        self.ranges.reserve(num_rows);
 
         let mut pages = reader.get_column_page_reader(i)?;
         let mut has_dict = false;
@@ -211,13 +209,9 @@ impl BytesColumn {
                 if encoding != Encoding::PLAIN && encoding != Encoding::PLAIN_DICTIONARY {
                     return Err(general("unsupported dictionary encoding"));
                 }
-                self.dict_offsets.clear();
-                self.dict_offsets.push(0);
-                self.dict_data.clear();
-                plain_byte_arrays(&buf, num_values, |v| {
-                    self.dict_data.extend_from_slice(v);
-                    self.dict_offsets.push(self.dict_data.len() as u32);
-                })?;
+                self.dict_ranges.clear();
+                plain_byte_array_ranges(&buf, num_values, &mut self.dict_ranges)?;
+                self.dict_buf = buf;
                 has_dict = true;
                 continue;
             }
@@ -229,41 +223,51 @@ impl BytesColumn {
                 buf
             };
             let non_null = if optional {
-                let valid = self.valid.as_mut().expect("valid");
-                valid.extend(self.levels.iter().map(|&l| l == 1));
                 self.levels.iter().filter(|&&l| l == 1).count()
             } else {
                 num_values
             };
 
+            self.buffer_starts.push(self.ranges.len());
             match encoding {
                 Encoding::PLAIN => {
-                    let mut plain = Vec::with_capacity(non_null);
-                    plain_byte_arrays(&values, non_null, |v| plain.push(v))?;
-                    self.emit(optional, plain.into_iter())?;
+                    self.buffers.push(values.clone());
+                    if optional {
+                        let mut ranges = Vec::with_capacity(non_null);
+                        plain_byte_array_ranges(&values, non_null, &mut ranges)?;
+                        self.emit_optional(ranges.into_iter().map(Ok))?;
+                    } else {
+                        plain_byte_array_ranges(&values, non_null, &mut self.ranges)?;
+                    }
                 }
                 Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
                     if !has_dict {
                         return Err(general("missing dictionary page"));
                     }
+                    self.buffers.push(self.dict_buf.clone());
                     let (&bit_width, rest) = values
                         .split_first()
                         .ok_or_else(|| general("truncated dictionary indices"))?;
                     self.indices.clear();
                     decode_hybrid(rest, u32::from(bit_width), non_null, &mut self.indices)?;
                     let indices = std::mem::take(&mut self.indices);
-                    let dict_offsets = std::mem::take(&mut self.dict_offsets);
-                    let dict_data = std::mem::take(&mut self.dict_data);
-                    let result = self.emit(
-                        optional,
-                        indices.iter().map(|&idx| {
-                            let idx = idx as usize;
-                            &dict_data[dict_offsets[idx] as usize..dict_offsets[idx + 1] as usize]
-                        }),
-                    );
+                    let dict_ranges = std::mem::take(&mut self.dict_ranges);
+                    let lookup = |idx: &u32| -> Result<(u32, u32)> {
+                        dict_ranges
+                            .get(*idx as usize)
+                            .copied()
+                            .ok_or_else(|| general("dictionary index out of range"))
+                    };
+                    let result = if optional {
+                        self.emit_optional(indices.iter().map(lookup))
+                    } else {
+                        indices.iter().try_for_each(|idx| {
+                            self.ranges.push(lookup(idx)?);
+                            Ok(())
+                        })
+                    };
                     self.indices = indices;
-                    self.dict_offsets = dict_offsets;
-                    self.dict_data = dict_data;
+                    self.dict_ranges = dict_ranges;
                     result?;
                 }
                 _ => return Err(general(format!("unsupported encoding {encoding}"))),
@@ -279,46 +283,42 @@ impl BytesColumn {
         Ok(())
     }
 
-    /// Appends decoded non-null values, interleaving nulls according to the
+    /// Appends decoded non-null ranges, interleaving nulls according to the
     /// most recently decoded levels.
-    fn emit<'a>(
+    fn emit_optional(
         &mut self,
-        optional: bool,
-        mut values: impl ExactSizeIterator<Item = &'a [u8]>,
+        mut values: impl Iterator<Item = Result<(u32, u32)>>,
     ) -> Result<()> {
-        if optional {
-            let levels = std::mem::take(&mut self.levels);
-            for &level in &levels {
-                if level == 1 {
-                    let v = values
-                        .next()
-                        .ok_or_else(|| general("fewer values than levels"))?;
-                    self.push(v);
-                } else {
-                    self.push_null();
-                }
-            }
-            self.levels = levels;
-        } else {
-            for v in values {
-                self.push(v);
+        for &level in &self.levels {
+            if level == 1 {
+                let range = values
+                    .next()
+                    .ok_or_else(|| general("fewer values than levels"))??;
+                self.ranges.push(range);
+            } else {
+                self.ranges.push((0, NULL_LEN));
             }
         }
         Ok(())
     }
 }
 
-fn plain_byte_arrays<'a>(mut buf: &'a [u8], n: usize, mut f: impl FnMut(&'a [u8])) -> Result<()> {
+/// Parses `n` PLAIN encoded byte arrays into (start, len) ranges.
+fn plain_byte_array_ranges(buf: &[u8], n: usize, out: &mut Vec<(u32, u32)>) -> Result<()> {
+    let mut pos = 0usize;
     for _ in 0..n {
-        let (len, rest) = buf
-            .split_at_checked(4)
-            .ok_or_else(|| general("truncated byte array length"))?;
-        let len = u32::from_le_bytes(len.try_into().expect("4 bytes")) as usize;
-        let (value, rest) = rest
-            .split_at_checked(len)
-            .ok_or_else(|| general("truncated byte array"))?;
-        f(value);
-        buf = rest;
+        let len = u32::from_le_bytes(
+            buf.get(pos..pos + 4)
+                .ok_or_else(|| general("truncated byte array length"))?
+                .try_into()
+                .expect("4 bytes"),
+        );
+        pos += 4;
+        if pos + len as usize > buf.len() {
+            return Err(general("truncated byte array"));
+        }
+        out.push((pos as u32, len));
+        pos += len as usize;
     }
     Ok(())
 }

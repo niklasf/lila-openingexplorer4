@@ -16,7 +16,7 @@ use clap::Parser;
 use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
-    packed::{GameId, pack_uint, unpack_uint},
+    packed::GameId,
     parquet::{FastGameColumns, GameColumns, GameRow, PositionalFile},
 };
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -123,10 +123,38 @@ struct Args {
     sst_zstd_dict: i32,
 }
 
+/// Bytes of the fixed length prefix of each record.
+const LEN_PREFIX: usize = 4;
+
+/// Appends a record to a buffer of records: `game_id` (6 bytes), a 4 byte
+/// little endian value length, and the value produced by `pack`. Nothing is
+/// appended if `pack` fails. Returns the offset of the length prefix.
+fn push_record<E>(
+    buf: &mut Vec<u8>,
+    game_id: GameId,
+    pack: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+) -> Result<u64, E> {
+    let start = buf.len();
+    buf.extend_from_slice(&game_id.to_bytes());
+    let len_offset = buf.len();
+    buf.extend_from_slice(&[0; LEN_PREFIX]);
+    match pack(buf) {
+        Ok(()) => {
+            let len = (buf.len() - len_offset - LEN_PREFIX) as u32;
+            buf[len_offset..len_offset + LEN_PREFIX].copy_from_slice(&len.to_le_bytes());
+            Ok(len_offset as u64)
+        }
+        Err(err) => {
+            buf.truncate(start);
+            Err(err)
+        }
+    }
+}
+
 /// A memory partition, loaded in a compact form ready to be sorted.
 ///
-/// Records are `game_id` (6 bytes), followed by the length-prefixed value.
-/// The index points at the length prefix.
+/// Records as produced by `push_record`, back to back. The index points at
+/// the length prefix of each record.
 #[derive(Default)]
 struct MemoryPartition {
     records: Vec<u8>,
@@ -134,31 +162,40 @@ struct MemoryPartition {
 }
 
 impl MemoryPartition {
-    fn push(&mut self, game_id: GameId, value: &[u8]) {
-        self.records.extend_from_slice(&game_id.to_bytes());
-        self.index.push((game_id, self.records.len() as u64));
-        pack_uint(&mut self.records, value.len() as u64);
-        self.records.extend_from_slice(value);
+    fn push<E>(
+        &mut self,
+        game_id: GameId,
+        pack: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let offset = push_record(&mut self.records, game_id, pack)?;
+        self.index.push((game_id, offset));
+        Ok(())
     }
 
     /// The packed value at the given offset in `records`.
     fn value_at(&self, offset: u64) -> &[u8] {
-        let mut buf = &self.records[offset as usize..];
-        let len = unpack_uint(&mut buf) as usize;
-        &buf[..len]
+        let offset = offset as usize;
+        let len = u32::from_le_bytes(
+            self.records[offset..offset + LEN_PREFIX]
+                .try_into()
+                .expect("length prefix"),
+        ) as usize;
+        &self.records[offset + LEN_PREFIX..offset + LEN_PREFIX + len]
     }
 
     /// Builds index entries for a range of records starting at `base`.
     fn index_records(records: &[u8], base: u64, index: &mut Vec<(GameId, u64)>) {
         let mut pos = 0;
         while pos < records.len() {
-            let mut buf = &records[pos..];
-            let game_id = GameId::unpack(&mut buf);
-            let offset = pos + GameId::SIZE;
-            let len = unpack_uint(&mut buf) as usize;
-            let header = records.len() - pos - buf.len();
-            index.push((game_id, base + offset as u64));
-            pos += header + len;
+            let game_id = GameId::unpack(&mut &records[pos..]);
+            let len_offset = pos + GameId::SIZE;
+            let len = u32::from_le_bytes(
+                records[len_offset..len_offset + LEN_PREFIX]
+                    .try_into()
+                    .expect("length prefix"),
+            ) as usize;
+            index.push((game_id, base + len_offset as u64));
+            pos = len_offset + LEN_PREFIX + len;
         }
         assert_eq!(pos, records.len(), "records truncated");
     }
@@ -185,13 +222,6 @@ impl MemoryPartition {
         }
         merged
     }
-}
-
-/// Appends a record to a scratch chunk buffer.
-fn push_record(buf: &mut Vec<u8>, game_id: GameId, value: &[u8]) {
-    buf.extend_from_slice(&game_id.to_bytes());
-    pack_uint(buf, value.len() as u64);
-    buf.extend_from_slice(value);
 }
 
 /// Compression of scratch chunks.
@@ -723,7 +753,6 @@ fn scatter_pass(
                     .collect();
                 let mut generic = GameColumns::default();
                 let mut fast = FastGameColumns::default();
-                let mut value = Vec::new();
                 let mut skipped = 0;
 
                 let mut route = |row: GameRow<'_>,
@@ -732,16 +761,19 @@ fn scatter_pass(
                     let Some(j) = pass_memory_partition(row.game_id, pass) else {
                         return;
                     };
-                    value.clear();
-                    if row.pack_lichess_game(&mut value).is_err() {
-                        skipped += 1;
-                        return;
-                    }
+                    let pack = |buf: &mut Vec<u8>| row.pack_lichess_game(buf);
                     if j >= SCRATCH_PARTITIONS_PER_PASS {
-                        local_resident[j - SCRATCH_PARTITIONS_PER_PASS].push(row.game_id, &value);
+                        if local_resident[j - SCRATCH_PARTITIONS_PER_PASS]
+                            .push(row.game_id, pack)
+                            .is_err()
+                        {
+                            skipped += 1;
+                        }
                     } else {
                         let chunk = &mut chunks[j];
-                        push_record(chunk, row.game_id, &value);
+                        if push_record(chunk, row.game_id, pack).is_err() {
+                            skipped += 1;
+                        }
                         if chunk.len() >= CHUNK_SIZE {
                             let full = mem::replace(chunk, Vec::with_capacity(CHUNK_SIZE + 4096));
                             tx.send((j, full)).expect("send chunk");
