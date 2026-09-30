@@ -17,7 +17,7 @@ use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
     packed::{GameId, pack_uint, unpack_uint},
-    parquet::{GameColumns, PositionalFile},
+    parquet::{FastGameColumns, GameColumns, GameRow, PositionalFile},
 };
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use rocksdb::{BlockBasedOptions, DBCompressionType, Options, SstFileWriter};
@@ -78,10 +78,17 @@ struct Args {
     /// Directory for temporary partition files.
     #[clap(long)]
     scratch: PathBuf,
-    /// Maximum bytes to use in scratch space. The scatter of a pass only
-    /// starts once the previous pass has freed enough scratch space.
-    #[clap(long, default_value = "650000000000")]
+    /// Maximum bytes to use in scratch space. The scatter of a pass is
+    /// throttled while the previous pass is still freeing scratch space.
+    #[clap(long, default_value = "690000000000")]
     scratch_budget: u64,
+    /// Zstd level for scratch chunks (0 for LZ4).
+    #[clap(long, default_value = "1")]
+    scratch_zstd_level: i32,
+    /// Use the generic parquet column readers instead of the fast decoder
+    /// (for benchmarking).
+    #[clap(long)]
+    generic_reader: bool,
     /// Directory for the final SST files.
     #[clap(long)]
     out: PathBuf,
@@ -187,6 +194,97 @@ fn push_record(buf: &mut Vec<u8>, game_id: GameId, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
+/// Compression of scratch chunks.
+#[derive(Copy, Clone)]
+enum ChunkCodec {
+    Lz4,
+    Zstd(i32),
+}
+
+impl ChunkCodec {
+    fn from_level(zstd_level: i32) -> ChunkCodec {
+        if zstd_level == 0 {
+            ChunkCodec::Lz4
+        } else {
+            ChunkCodec::Zstd(zstd_level)
+        }
+    }
+}
+
+struct ChunkCompressor {
+    codec: ChunkCodec,
+    zstd: Option<zstd::bulk::Compressor<'static>>,
+    buf: Vec<u8>,
+}
+
+impl ChunkCompressor {
+    fn new(codec: ChunkCodec) -> ChunkCompressor {
+        ChunkCompressor {
+            codec,
+            zstd: match codec {
+                ChunkCodec::Lz4 => None,
+                ChunkCodec::Zstd(level) => {
+                    Some(zstd::bulk::Compressor::new(level).expect("zstd compressor"))
+                }
+            },
+            buf: Vec::new(),
+        }
+    }
+
+    fn compress(&mut self, raw: &[u8]) -> &[u8] {
+        match self.codec {
+            ChunkCodec::Lz4 => {
+                self.buf
+                    .resize(lz4_flex::block::get_maximum_output_size(raw.len()), 0);
+                let n = lz4_flex::compress_into(raw, &mut self.buf).expect("compress");
+                &self.buf[..n]
+            }
+            ChunkCodec::Zstd(_) => {
+                self.buf.clear();
+                self.buf.reserve(zstd::zstd_safe::compress_bound(raw.len()));
+                self.zstd
+                    .as_mut()
+                    .expect("zstd")
+                    .compress_to_buffer(raw, &mut self.buf)
+                    .expect("compress");
+                &self.buf
+            }
+        }
+    }
+}
+
+struct ChunkDecompressor {
+    codec: ChunkCodec,
+    zstd: Option<zstd::bulk::Decompressor<'static>>,
+}
+
+impl ChunkDecompressor {
+    fn new(codec: ChunkCodec) -> ChunkDecompressor {
+        ChunkDecompressor {
+            codec,
+            zstd: match codec {
+                ChunkCodec::Lz4 => None,
+                ChunkCodec::Zstd(_) => {
+                    Some(zstd::bulk::Decompressor::new().expect("zstd decompressor"))
+                }
+            },
+        }
+    }
+
+    fn decompress(&mut self, compressed: &[u8], dst: &mut [u8]) {
+        let n = match self.codec {
+            ChunkCodec::Lz4 => lz4_flex::decompress_into(compressed, dst).expect("decompress"),
+            ChunkCodec::Zstd(_) => self
+                .zstd
+                .as_mut()
+                .expect("zstd")
+                .decompress_to_buffer(compressed, dst)
+                .expect("decompress"),
+        };
+        assert_eq!(n, dst.len(), "chunk length");
+    }
+}
+
 #[derive(Copy, Clone)]
 struct ChunkMeta {
     offset: u64,
@@ -198,12 +296,13 @@ struct ChunkMeta {
 struct ScratchFile {
     path: PathBuf,
     file: File,
+    codec: ChunkCodec,
     len: u64,
     chunks: Vec<ChunkMeta>,
 }
 
 impl ScratchFile {
-    fn create(path: PathBuf) -> io::Result<ScratchFile> {
+    fn create(path: PathBuf, codec: ChunkCodec) -> io::Result<ScratchFile> {
         let file = File::options()
             .read(true)
             .write(true)
@@ -213,6 +312,7 @@ impl ScratchFile {
         Ok(ScratchFile {
             path,
             file,
+            codec,
             len: 0,
             chunks: Vec::new(),
         })
@@ -256,6 +356,7 @@ impl ScratchFile {
         thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
+                    let mut decompressor = ChunkDecompressor::new(self.codec);
                     let mut compressed = Vec::new();
                     let mut local_index = Vec::new();
                     loop {
@@ -272,8 +373,7 @@ impl ScratchFile {
                         self.file
                             .read_exact_at(&mut compressed, chunk.offset)
                             .expect("read chunk");
-                        let n = lz4_flex::decompress_into(&compressed, dst).expect("decompress");
-                        assert_eq!(n, dst.len(), "chunk length");
+                        decompressor.decompress(&compressed, dst);
                         MemoryPartition::index_records(dst, base, &mut local_index);
                     }
                     index.lock().expect("lock index").append(&mut local_index);
@@ -457,53 +557,34 @@ fn main() -> io::Result<()> {
             }
         });
 
-        let mut expected_scratch = 0;
         for pass in 0..PASSES {
             progress.set_prefix(format!("pass {}/{}", pass + 1, PASSES));
-
-            // Wait until the previous pass has freed enough scratch space.
-            let timer = Instant::now();
-            loop {
-                let usage = SCRATCH_USAGE.load(Ordering::Relaxed);
-                if usage + expected_scratch <= args.scratch_budget {
-                    break;
-                }
-                progress.set_message(format!(
-                    "waiting for scratch space ({} GB used)",
-                    usage >> 30
-                ));
-                thread::sleep(Duration::from_secs(1));
-            }
-            if pass > 0 {
-                log(
-                    progress,
-                    format!(
-                        "pass {pass}: waited {:.1?} for scratch space",
-                        timer.elapsed()
-                    ),
-                );
-            }
-
             progress.set_message("scattering");
             let timer = Instant::now();
-            let (resident, scratch) = scatter_pass(
+            let (resident, scratch, throttled) = scatter_pass(
                 reader,
                 num_row_groups,
                 pass,
-                &args.scratch,
-                read_threads,
-                args.write_threads,
+                &ScatterConfig {
+                    scratch: &args.scratch,
+                    codec: ChunkCodec::from_level(args.scratch_zstd_level),
+                    // The first pass has nothing to wait for.
+                    budget: (pass > 0).then_some(args.scratch_budget),
+                    read_threads,
+                    write_threads: args.write_threads,
+                    generic_reader: args.generic_reader,
+                },
                 progress,
             )
             .expect("scatter");
             let scratch_bytes: u64 = scratch.iter().map(|f| f.len).sum();
-            expected_scratch = scratch_bytes + scratch_bytes / 20;
             log(
                 progress,
                 format!(
-                    "pass {pass}: scatter {:.1?} ({} GB scratch)",
+                    "pass {pass}: scatter {:.1?} ({} GB scratch, throttled {:.1?})",
                     timer.elapsed(),
-                    scratch_bytes >> 30
+                    scratch_bytes >> 30,
+                    throttled
                 ),
             );
             if args.scatter_only {
@@ -553,6 +634,17 @@ fn main() -> io::Result<()> {
 
 type Resident = Vec<(usize, MemoryPartition)>;
 
+struct ScatterConfig<'a> {
+    scratch: &'a Path,
+    codec: ChunkCodec,
+    /// Scratch budget to throttle against, if the previous pass is still
+    /// freeing scratch space.
+    budget: Option<u64>,
+    read_threads: usize,
+    write_threads: usize,
+    generic_reader: bool,
+}
+
 /// Reads the entire input and distributes the games of the given disk
 /// partition to its memory partitions. The last `RESIDENT_PARTITIONS_PER_PASS`
 /// memory partitions are kept in memory, the others are written to scratch
@@ -561,44 +653,56 @@ fn scatter_pass(
     reader: &SerializedFileReader<PositionalFile>,
     num_row_groups: usize,
     pass: usize,
-    scratch: &Path,
-    read_threads: usize,
-    write_threads: usize,
+    config: &ScatterConfig<'_>,
     progress: &ProgressBar,
-) -> io::Result<(Resident, Vec<ScratchFile>)> {
+) -> io::Result<(Resident, Vec<ScratchFile>, Duration)> {
     let first_memory_partition = pass * MEMORY_PARTITIONS_PER_PASS;
 
     let files: Vec<Mutex<ScratchFile>> = (0..SCRATCH_PARTITIONS_PER_PASS)
         .map(|i| {
             Ok::<_, io::Error>(Mutex::new(ScratchFile::create(
-                scratch.join(format!("games_{:05}.lz4chunks", first_memory_partition + i)),
+                config
+                    .scratch
+                    .join(format!("games_{:05}.chunks", first_memory_partition + i)),
+                config.codec,
             )?))
         })
         .collect::<io::Result<_>>()?;
 
     let resident: Mutex<Vec<MemoryPartition>> = Mutex::new(Vec::new());
     let next_row_group = AtomicUsize::new(0);
+    let throttled_nanos = AtomicU64::new(0);
 
     thread::scope(|s| {
         let files = &files;
         let resident = &resident;
         let next_row_group = &next_row_group;
+        let throttled_nanos = &throttled_nanos;
 
         // Write threads compress full chunks and append them to scratch
-        // files.
-        let (tx, rx) = channel::bounded::<(usize, Vec<u8>)>(write_threads * 2);
+        // files, throttled by the scratch budget.
+        let (tx, rx) = channel::bounded::<(usize, Vec<u8>)>(config.write_threads * 2);
 
-        for _ in 0..write_threads {
+        for _ in 0..config.write_threads {
             let rx = rx.clone();
             s.spawn(move || {
-                let mut compressed = Vec::new();
+                let mut compressor = ChunkCompressor::new(config.codec);
                 for (file, raw) in rx {
-                    compressed.resize(lz4_flex::block::get_maximum_output_size(raw.len()), 0);
-                    let n = lz4_flex::compress_into(&raw, &mut compressed).expect("compress");
+                    let compressed = compressor.compress(&raw);
+                    if let Some(budget) = config.budget {
+                        let timer = Instant::now();
+                        while SCRATCH_USAGE.load(Ordering::Relaxed) + compressed.len() as u64
+                            > budget
+                        {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        throttled_nanos
+                            .fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
                     files[file]
                         .lock()
                         .expect("lock scratch file")
-                        .append(raw.len(), &compressed[..n])
+                        .append(raw.len(), compressed)
                         .expect("append chunk");
                 }
             });
@@ -608,7 +712,7 @@ fn scatter_pass(
 
         // Read threads pack the games of this pass and route them to
         // resident partitions or scratch chunks.
-        for _ in 0..read_threads {
+        for _ in 0..config.read_threads {
             let tx = tx.clone();
             s.spawn(move || {
                 let mut local_resident: Vec<MemoryPartition> = (0..RESIDENT_PARTITIONS_PER_PASS)
@@ -617,43 +721,55 @@ fn scatter_pass(
                 let mut chunks: Vec<Vec<u8>> = (0..SCRATCH_PARTITIONS_PER_PASS)
                     .map(|_| Vec::with_capacity(CHUNK_SIZE + 4096))
                     .collect();
-                let mut columns = GameColumns::default();
+                let mut generic = GameColumns::default();
+                let mut fast = FastGameColumns::default();
                 let mut value = Vec::new();
                 let mut skipped = 0;
+
+                let mut route = |row: GameRow<'_>,
+                                 local_resident: &mut Vec<MemoryPartition>,
+                                 chunks: &mut Vec<Vec<u8>>| {
+                    let Some(j) = pass_memory_partition(row.game_id, pass) else {
+                        return;
+                    };
+                    value.clear();
+                    if row.pack_lichess_game(&mut value).is_err() {
+                        skipped += 1;
+                        return;
+                    }
+                    if j >= SCRATCH_PARTITIONS_PER_PASS {
+                        local_resident[j - SCRATCH_PARTITIONS_PER_PASS].push(row.game_id, &value);
+                    } else {
+                        let chunk = &mut chunks[j];
+                        push_record(chunk, row.game_id, &value);
+                        if chunk.len() >= CHUNK_SIZE {
+                            let full = mem::replace(chunk, Vec::with_capacity(CHUNK_SIZE + 4096));
+                            tx.send((j, full)).expect("send chunk");
+                        }
+                    }
+                };
 
                 loop {
                     let i = next_row_group.fetch_add(1, Ordering::Relaxed);
                     if i >= num_row_groups {
                         break;
                     }
-                    columns
-                        .read_columns(&*reader.get_row_group(i).expect("row group"))
-                        .expect("read columns");
-
-                    for row in columns.rows() {
-                        let Some(j) = pass_memory_partition(row.game_id, pass) else {
-                            continue;
-                        };
-                        value.clear();
-                        if row.pack_lichess_game(&mut value).is_err() {
-                            skipped += 1;
-                            continue;
+                    let row_group = reader.get_row_group(i).expect("row group");
+                    let rows = if config.generic_reader {
+                        generic.read_columns(&*row_group).expect("read columns");
+                        for row in generic.rows() {
+                            route(row, &mut local_resident, &mut chunks);
                         }
-                        if j >= SCRATCH_PARTITIONS_PER_PASS {
-                            local_resident[j - SCRATCH_PARTITIONS_PER_PASS]
-                                .push(row.game_id, &value);
-                        } else {
-                            let chunk = &mut chunks[j];
-                            push_record(chunk, row.game_id, &value);
-                            if chunk.len() >= CHUNK_SIZE {
-                                let full =
-                                    mem::replace(chunk, Vec::with_capacity(CHUNK_SIZE + 4096));
-                                tx.send((j, full)).expect("send chunk");
-                            }
+                        generic.len()
+                    } else {
+                        fast.read_columns(&*row_group).expect("read columns");
+                        for row in fast.rows() {
+                            route(row, &mut local_resident, &mut chunks);
                         }
-                    }
+                        fast.len()
+                    };
 
-                    progress.inc(columns.len() as u64);
+                    progress.inc(rows as u64);
                 }
 
                 for (j, chunk) in chunks.into_iter().enumerate() {
@@ -700,7 +816,11 @@ fn scatter_pass(
         })
         .collect();
 
-    Ok((resident, files))
+    Ok((
+        resident,
+        files,
+        Duration::from_nanos(throttled_nanos.load(Ordering::Relaxed)),
+    ))
 }
 
 /// Index of the memory partition within the given pass, or `None` if the

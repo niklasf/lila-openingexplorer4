@@ -29,6 +29,13 @@ struct Args {
     row_groups: Option<usize>,
     #[clap(long, default_value = "16")]
     threads: usize,
+    /// Only verify games of the given memory partition (SST files named
+    /// `games_{partition:03}_*`).
+    #[clap(long)]
+    partition: Option<usize>,
+    /// Number of memory partition bits used by parquet_to_sst.
+    #[clap(long, default_value = "6")]
+    partition_bits: u32,
 }
 
 fn main() -> io::Result<()> {
@@ -44,6 +51,13 @@ fn main() -> io::Result<()> {
         .collect::<io::Result<Vec<_>>>()?
         .into_iter()
         .filter(|path| path.extension().is_some_and(|ext| ext == "sst"))
+        .filter(|path| {
+            args.partition.is_none_or(|p| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&format!("games_{p:03}_")))
+            })
+        })
         .collect();
     paths.sort();
     println!("ingesting {} sst files", paths.len());
@@ -96,6 +110,12 @@ fn main() -> io::Result<()> {
                         .read_columns(&*reader.get_row_group(i).expect("row group"))
                         .expect("read columns");
                     for row in columns.rows() {
+                        if args
+                            .partition
+                            .is_some_and(|p| row.game_id.partition(args.partition_bits) != p)
+                        {
+                            continue;
+                        }
                         expected.clear();
                         let value = db.get_pinned(row.game_id.to_bytes()).expect("get");
                         match row.pack_lichess_game(&mut expected) {
