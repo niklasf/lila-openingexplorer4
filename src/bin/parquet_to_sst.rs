@@ -25,7 +25,7 @@ use parquet::{
         writer::SerializedFileWriter,
     },
 };
-use rocksdb::{DBCompressionType, Options, SstFileWriter};
+use rocksdb::{BlockBasedOptions, DBCompressionType, Options, SstFileWriter};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -90,6 +90,16 @@ struct Args {
     /// Only process the first row groups of the input (for benchmarking).
     #[clap(long)]
     row_groups: Option<usize>,
+    /// Block size of the SST files.
+    #[clap(long, default_value = "4096")]
+    sst_block_size: usize,
+    /// Zstd compression level of the SST files (0 for the default).
+    #[clap(long, default_value = "0")]
+    sst_zstd_level: i32,
+    /// Maximum size of the zstd dictionary trained for each SST file
+    /// (0 to disable dictionary compression).
+    #[clap(long, default_value = "0")]
+    sst_zstd_dict: i32,
 }
 
 #[derive(Copy, Clone)]
@@ -261,6 +271,22 @@ fn main() -> io::Result<()> {
 
     let mut sst_opts = Options::default();
     sst_opts.set_compression_type(DBCompressionType::Zstd);
+    if args.sst_zstd_level != 0 || args.sst_zstd_dict != 0 {
+        // Window bits and strategy as rocksdb defaults, but note that the
+        // default level is a sentinel value for the zstd default.
+        let level = if args.sst_zstd_level != 0 {
+            args.sst_zstd_level
+        } else {
+            32767
+        };
+        sst_opts.set_compression_options(-14, level, 0, args.sst_zstd_dict);
+        if args.sst_zstd_dict != 0 {
+            sst_opts.set_zstd_max_train_bytes(args.sst_zstd_dict * 100);
+        }
+    }
+    let mut table_opts = BlockBasedOptions::default();
+    table_opts.set_block_size(args.sst_block_size);
+    sst_opts.set_block_based_table_factory(&table_opts);
     let sst = SstContext {
         opts: &sst_opts,
         out: &args.out,
@@ -285,6 +311,7 @@ fn main() -> io::Result<()> {
         progress.set_prefix(format!("pass {}/{}", pass + 1, passes));
 
         progress.set_message("scattering");
+        let timer = Instant::now();
         let (resident, scratch) = scatter_pass(
             &reader,
             num_row_groups,
@@ -293,22 +320,33 @@ fn main() -> io::Result<()> {
             threads,
             &progress,
         )?;
+        log(&progress, format!("pass {pass}: scatter {:.1?}", timer.elapsed()));
 
         // Process resident partitions first, to free their memory.
         for (memory_partition, partition) in resident {
             progress.set_message(format!("processing {memory_partition} (resident)"));
-            process_memory_partition(partition, memory_partition, &sst, threads.sst)?;
+            process_memory_partition(partition, memory_partition, &sst, threads.sst, &progress)?;
         }
 
         for (memory_partition, paths) in scratch {
             progress.set_message(format!("loading {memory_partition}"));
+            let timer = Instant::now();
             let partition = MemoryPartition::load(&paths, threads.read)?;
             for path in &paths {
                 fs::remove_file(path)?;
             }
+            log(
+                &progress,
+                format!(
+                    "partition {memory_partition}: load {:.1?} ({} games, {} value bytes)",
+                    timer.elapsed(),
+                    partition.index.len(),
+                    partition.values.len()
+                ),
+            );
 
             progress.set_message(format!("processing {memory_partition}"));
-            process_memory_partition(partition, memory_partition, &sst, threads.sst)?;
+            process_memory_partition(partition, memory_partition, &sst, threads.sst, &progress)?;
         }
     }
 
@@ -524,11 +562,22 @@ fn process_memory_partition(
     memory_partition: usize,
     sst: &SstContext<'_>,
     threads: usize,
+    progress: &ProgressBar,
 ) -> io::Result<()> {
+    let timer = Instant::now();
     partition
         .index
         .sort_unstable_by_key(|&(game_id, _)| game_id);
+    log(
+        progress,
+        format!(
+            "partition {memory_partition}: sort {:.1?} ({} games)",
+            timer.elapsed(),
+            partition.index.len()
+        ),
+    );
 
+    let timer = Instant::now();
     let ranges = threads.clamp(1, partition.index.len().max(1));
     let range_len = partition.index.len().div_ceil(ranges);
 
@@ -546,8 +595,18 @@ fn process_memory_partition(
             });
         }
     });
+    log(
+        progress,
+        format!("partition {memory_partition}: write {:.1?}", timer.elapsed()),
+    );
 
     Ok(())
+}
+
+fn log(progress: &ProgressBar, msg: String) {
+    // Must not touch the progress bar inside `suspend` (its state is locked).
+    let elapsed = progress.elapsed();
+    progress.suspend(|| eprintln!("[{elapsed:>8.1?}] {msg}"));
 }
 
 /// Writes a sorted range of the partition to SST files of bounded size.
