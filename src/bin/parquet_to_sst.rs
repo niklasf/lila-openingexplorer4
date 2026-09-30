@@ -52,8 +52,20 @@ const _: () = assert!(RESIDENT_PARTITIONS_PER_PASS <= MEMORY_PARTITIONS_PER_PASS
 const SCRATCH_PARTITIONS_PER_PASS: usize =
     MEMORY_PARTITIONS_PER_PASS - RESIDENT_PARTITIONS_PER_PASS;
 
-/// Uncompressed bytes per chunk in scratch files.
+/// Records are collected in chunks. A chunk is full once it reaches this
+/// size; a record never spans chunks.
 const CHUNK_SIZE: usize = 4 << 20;
+
+/// Maximum record size, so that a full chunk plus one record fits into the
+/// chunk stride.
+const MAX_RECORD_SIZE: usize = 64 << 10;
+
+/// Offsets of records are `chunk * CHUNK_STRIDE + position`.
+const CHUNK_STRIDE: u64 = (CHUNK_SIZE + MAX_RECORD_SIZE) as u64;
+
+fn new_chunk() -> Vec<u8> {
+    Vec::with_capacity(CHUNK_STRIDE as usize)
+}
 
 /// Hard limit for the size of each SST file.
 const SST_MAX_SIZE: u64 = 512 * 1024 * 1024;
@@ -141,6 +153,11 @@ fn push_record<E>(
     match pack(buf) {
         Ok(()) => {
             let len = (buf.len() - len_offset - LEN_PREFIX) as u32;
+            assert!(
+                buf.len() - start <= MAX_RECORD_SIZE,
+                "record of {} too large",
+                game_id
+            );
             buf[len_offset..len_offset + LEN_PREFIX].copy_from_slice(&len.to_le_bytes());
             Ok(len_offset as u64)
         }
@@ -153,11 +170,11 @@ fn push_record<E>(
 
 /// A memory partition, loaded in a compact form ready to be sorted.
 ///
-/// Records as produced by `push_record`, back to back. The index points at
-/// the length prefix of each record.
+/// Records as produced by `push_record`, in chunks. The index points at the
+/// length prefix of each record, as `chunk * CHUNK_STRIDE + position`.
 #[derive(Default)]
 struct MemoryPartition {
-    records: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
     index: Vec<(GameId, u64)>,
 }
 
@@ -167,23 +184,47 @@ impl MemoryPartition {
         game_id: GameId,
         pack: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
     ) -> Result<(), E> {
-        let offset = push_record(&mut self.records, game_id, pack)?;
-        self.index.push((game_id, offset));
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() >= CHUNK_SIZE)
+        {
+            self.chunks.push(new_chunk());
+        }
+        let chunk = self.chunks.len() - 1;
+        let offset = push_record(&mut self.chunks[chunk], game_id, pack)?;
+        self.index
+            .push((game_id, chunk as u64 * CHUNK_STRIDE + offset));
         Ok(())
     }
 
-    /// The packed value at the given offset in `records`.
+    /// Appends a chunk of records and indexes them.
+    fn push_chunk(&mut self, chunk: Vec<u8>) {
+        Self::index_records(
+            &chunk,
+            self.chunks.len() as u64 * CHUNK_STRIDE,
+            &mut self.index,
+        );
+        self.chunks.push(chunk);
+    }
+
+    fn record_bytes(&self) -> usize {
+        self.chunks.iter().map(Vec::len).sum()
+    }
+
+    /// The packed value at the given offset.
     fn value_at(&self, offset: u64) -> &[u8] {
-        let offset = offset as usize;
+        let chunk = &self.chunks[(offset / CHUNK_STRIDE) as usize];
+        let offset = (offset % CHUNK_STRIDE) as usize;
         let len = u32::from_le_bytes(
-            self.records[offset..offset + LEN_PREFIX]
+            chunk[offset..offset + LEN_PREFIX]
                 .try_into()
                 .expect("length prefix"),
         ) as usize;
-        &self.records[offset + LEN_PREFIX..offset + LEN_PREFIX + len]
+        &chunk[offset + LEN_PREFIX..offset + LEN_PREFIX + len]
     }
 
-    /// Builds index entries for a range of records starting at `base`.
+    /// Builds index entries for a chunk of records starting at `base`.
     fn index_records(records: &[u8], base: u64, index: &mut Vec<(GameId, u64)>) {
         let mut pos = 0;
         while pos < records.len() {
@@ -200,22 +241,19 @@ impl MemoryPartition {
         assert_eq!(pos, records.len(), "records truncated");
     }
 
-    /// Merges partitions collected by multiple threads.
+    /// Merges partitions collected by multiple threads, without copying
+    /// records.
     fn merge(parts: Vec<MemoryPartition>) -> MemoryPartition {
-        let mut parts = parts.into_iter().filter(|p| !p.index.is_empty());
-        let Some(mut merged) = parts.next() else {
-            return MemoryPartition::default();
-        };
-        let parts: Vec<_> = parts.collect();
+        let mut merged = MemoryPartition::default();
         merged
-            .records
-            .reserve_exact(parts.iter().map(|p| p.records.len()).sum());
+            .chunks
+            .reserve_exact(parts.iter().map(|p| p.chunks.len()).sum());
         merged
             .index
             .reserve_exact(parts.iter().map(|p| p.index.len()).sum());
         for part in parts {
-            let base = merged.records.len() as u64;
-            merged.records.extend_from_slice(&part.records);
+            let base = merged.chunks.len() as u64 * CHUNK_STRIDE;
+            merged.chunks.extend(part.chunks);
             merged
                 .index
                 .extend(part.index.into_iter().map(|(id, off)| (id, base + off)));
@@ -360,61 +398,41 @@ impl ScratchFile {
         Ok(())
     }
 
-    fn raw_len(&self) -> usize {
-        self.chunks.iter().map(|c| c.raw_len as usize).sum()
-    }
-
     /// Loads and decompresses all chunks in parallel.
     fn load(&self, threads: usize) -> MemoryPartition {
-        let mut records = vec![0u8; self.raw_len()];
-
-        // Disjoint destination slices for each chunk.
-        let mut slots: Vec<Option<(ChunkMeta, u64, &mut [u8])>> =
-            Vec::with_capacity(self.chunks.len());
-        let mut rest: &mut [u8] = &mut records;
-        let mut base = 0u64;
-        for chunk in &self.chunks {
-            let (dst, tail) = rest.split_at_mut(chunk.raw_len as usize);
-            rest = tail;
-            slots.push(Some((*chunk, base, dst)));
-            base += chunk.raw_len as u64;
-        }
         let next = AtomicUsize::new(0);
-        let slots = Mutex::new(slots);
-        let index = Mutex::new(Vec::new());
+        let mut slots: Vec<Option<Vec<u8>>> = (0..self.chunks.len()).map(|_| None).collect();
+        let slots_ref = Mutex::new(&mut slots);
 
         thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
                     let mut decompressor = ChunkDecompressor::new(self.codec);
                     let mut compressed = Vec::new();
-                    let mut local_index = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((chunk, base, dst)) = slots
-                            .lock()
-                            .expect("lock slots")
-                            .get_mut(i)
-                            .and_then(Option::take)
-                        else {
+                        let Some(chunk) = self.chunks.get(i) else {
                             break;
                         };
                         compressed.resize(chunk.compressed_len as usize, 0);
                         self.file
                             .read_exact_at(&mut compressed, chunk.offset)
                             .expect("read chunk");
-                        decompressor.decompress(&compressed, dst);
-                        MemoryPartition::index_records(dst, base, &mut local_index);
+                        let mut raw = new_chunk();
+                        raw.resize(chunk.raw_len as usize, 0);
+                        decompressor.decompress(&compressed, &mut raw);
+                        slots_ref.lock().expect("lock slots")[i] = Some(raw);
                     }
-                    index.lock().expect("lock index").append(&mut local_index);
                 });
             }
         });
 
-        MemoryPartition {
-            records,
-            index: index.into_inner().expect("index"),
+        let mut partition = MemoryPartition::default();
+        partition.chunks.reserve_exact(slots.len());
+        for slot in slots {
+            partition.push_chunk(slot.expect("loaded chunk"));
         }
+        partition
     }
 
     fn remove(self) -> io::Result<()> {
@@ -560,7 +578,7 @@ fn main() -> io::Result<()> {
                         "partition {memory_partition}: load {load:.1?}, sort {:.1?} ({} games, {} record bytes)",
                         timer.elapsed(),
                         partition.index.len(),
-                        partition.records.len()
+                        partition.record_bytes()
                     ),
                 );
                 sorted_tx
@@ -749,7 +767,7 @@ fn scatter_pass(
                     .map(|_| MemoryPartition::default())
                     .collect();
                 let mut chunks: Vec<Vec<u8>> = (0..SCRATCH_PARTITIONS_PER_PASS)
-                    .map(|_| Vec::with_capacity(CHUNK_SIZE + 4096))
+                    .map(|_| new_chunk())
                     .collect();
                 let mut generic = GameColumns::default();
                 let mut fast = FastGameColumns::default();
@@ -775,7 +793,7 @@ fn scatter_pass(
                             skipped += 1;
                         }
                         if chunk.len() >= CHUNK_SIZE {
-                            let full = mem::replace(chunk, Vec::with_capacity(CHUNK_SIZE + 4096));
+                            let full = mem::replace(chunk, new_chunk());
                             tx.send((j, full)).expect("send chunk");
                         }
                     }
@@ -880,7 +898,7 @@ fn write_partition(
 
     let ratio = sst.stats.lock().expect("lock stats").ratio();
     let raw_per_range = (SST_ROLL_SIZE as f64 * 0.97 / ratio) as usize;
-    let raw_per_game = partition.records.len() / partition.index.len();
+    let raw_per_game = partition.record_bytes() / partition.index.len();
     let games_per_range = (raw_per_range / raw_per_game.max(1))
         .min(partition.index.len().div_ceil(threads))
         .max(1);
