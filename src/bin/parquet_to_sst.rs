@@ -104,10 +104,11 @@ struct Args {
     /// Directory for the final SST files.
     #[clap(long)]
     out: PathBuf,
-    /// Threads for reading the input. Defaults to the usable parallelism
-    /// minus the write threads.
-    #[clap(long)]
-    read_threads: Option<usize>,
+    /// Threads for reading the input. Decoding is bound by physical cores,
+    /// and leaving headroom keeps SST writing at disk speed while the next
+    /// pass is scattered.
+    #[clap(long, default_value = "16")]
+    read_threads: usize,
     /// Threads for compressing and writing scratch chunks.
     #[clap(long, default_value = "4")]
     write_threads: usize,
@@ -115,7 +116,7 @@ struct Args {
     #[clap(long, default_value = "6")]
     load_threads: usize,
     /// Threads for writing SST files.
-    #[clap(long, default_value = "6")]
+    #[clap(long, default_value = "8")]
     sst_threads: usize,
     /// Only process the first row groups of the input (for benchmarking).
     #[clap(long)]
@@ -495,9 +496,7 @@ fn main() -> io::Result<()> {
         .map_or(1, NonZeroUsize::get)
         .saturating_sub(2)
         .max(2);
-    let read_threads = args
-        .read_threads
-        .unwrap_or(parallelism.saturating_sub(args.write_threads).max(1));
+    let read_threads = args.read_threads.min(parallelism);
 
     let reader = SerializedFileReader::new(PositionalFile::open(&args.parquet)?)?;
     let num_row_groups = args.row_groups.map_or(reader.num_row_groups(), |limit| {
