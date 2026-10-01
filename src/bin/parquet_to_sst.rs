@@ -81,9 +81,6 @@ const INITIAL_SST_RATIO: f64 = 0.9;
 /// Games that could not be represented as `LichessGame`.
 static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
 
-/// Records dropped because another record had the same game id.
-static DUPLICATE_GAMES: AtomicU64 = AtomicU64::new(0);
-
 /// Sub-buckets for the parallel sort of a partition.
 const SORT_BUCKET_BITS: u32 = 3;
 
@@ -283,33 +280,12 @@ impl MemoryPartition {
         }
     }
 
-    /// Drops all but one record for each game id in the sorted index,
-    /// keeping the longest value (then the lexicographically greatest).
-    /// Returns the number of dropped records.
-    fn dedup(&mut self) -> u64 {
-        let before = self.index.len();
-        let chunks = &self.chunks;
-        let value_at = |offset: u64| -> &[u8] {
-            let chunk = &chunks[(offset / CHUNK_STRIDE) as usize];
-            let offset = (offset % CHUNK_STRIDE) as usize;
-            let len = u32::from_le_bytes(
-                chunk[offset..offset + LEN_PREFIX]
-                    .try_into()
-                    .expect("length prefix"),
-            ) as usize;
-            &chunk[offset + LEN_PREFIX..offset + LEN_PREFIX + len]
-        };
-        self.index.dedup_by(|current, kept| {
-            if current.0 != kept.0 {
-                return false;
-            }
-            let (a, b) = (value_at(current.1), value_at(kept.1));
-            if (a.len(), a) > (b.len(), b) {
-                mem::swap(current, kept);
-            }
-            true
-        });
-        (before - self.index.len()) as u64
+    /// Checks that all game ids in the sorted index are unique.
+    fn check_unique(&self) -> Result<(), GameId> {
+        match self.index.windows(2).find(|w| w[0].0 == w[1].0) {
+            Some(w) => Err(w[0].0),
+            None => Ok(()),
+        }
     }
 
     /// Merges partitions collected by multiple threads, without copying
@@ -639,12 +615,17 @@ fn main() -> io::Result<()> {
 
                 let timer = Instant::now();
                 partition.sort(args.load_threads);
-                let duplicates = partition.dedup();
-                DUPLICATE_GAMES.fetch_add(duplicates, Ordering::Relaxed);
+                if let Err(game_id) = partition.check_unique() {
+                    // Duplicates must be resolved when creating the parquet
+                    // file. Exit instead of panicking, which would leave the
+                    // other pipeline stages blocked.
+                    eprintln!("duplicate game id {game_id} in partition {memory_partition}");
+                    std::process::exit(1);
+                }
                 log(
                     progress,
                     format!(
-                        "partition {memory_partition}: load {load:.1?}, sort {:.1?} ({} games, {} record bytes, {duplicates} duplicates)",
+                        "partition {memory_partition}: load {load:.1?}, sort {:.1?} ({} games, {} record bytes)",
                         timer.elapsed(),
                         partition.index.len(),
                         partition.record_bytes()
@@ -737,7 +718,7 @@ fn main() -> io::Result<()> {
 
     let stats = sst.stats.into_inner().expect("stats");
     println!(
-        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes, ratio {:.3}), {} skipped games, {} duplicates dropped",
+        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes, ratio {:.3}), {} skipped games",
         started.elapsed(),
         stats.games,
         stats.files,
@@ -745,7 +726,6 @@ fn main() -> io::Result<()> {
         stats.largest_file,
         stats.ratio(),
         SKIPPED_GAMES.load(Ordering::Relaxed),
-        DUPLICATE_GAMES.load(Ordering::Relaxed),
     );
     Ok(())
 }
@@ -1062,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_and_dedup() {
+    fn test_sort_and_check_unique() {
         let mut partition = MemoryPartition::default();
         let games = [
             ("abcdefgh", b"long value".as_slice()),
@@ -1081,20 +1061,15 @@ mod tests {
                 .unwrap();
         }
         partition.sort(3);
-        assert_eq!(partition.dedup(), 3);
+        assert_eq!(partition.check_unique(), Err(id("abcdefgh")));
         let result: Vec<(GameId, Vec<u8>)> = partition
             .index
             .iter()
             .map(|&(game_id, offset)| (game_id, partition.value_at(offset).to_vec()))
             .collect();
-        assert_eq!(
-            result,
-            vec![
-                (id("00000000"), b"first".to_vec()),
-                (id("abcdefgh"), b"long valux".to_vec()),
-                (id("zzzzzzzz"), b"z".to_vec()),
-            ]
-        );
+        assert_eq!(result[0], (id("00000000"), b"first".to_vec()));
+        assert_eq!(result[result.len() - 1], (id("zzzzzzzz"), b"z".to_vec()));
+        assert_eq!(result.len(), 6);
     }
 
     #[test]

@@ -187,6 +187,13 @@ impl ParsedGame {
         self.game_id
     }
 
+    /// Number of plies played. Lichess considers games with fewer than two
+    /// plies unplayed and eventually deletes them, so that their ids may be
+    /// reused later.
+    pub fn num_plies(&self) -> usize {
+        self.moves.len()
+    }
+
     fn initial_position(&self) -> io::Result<(VariantPosition, Option<PackedSetup>)> {
         let variant = self.variant.unwrap_or_default();
 
