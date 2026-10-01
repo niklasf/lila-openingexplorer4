@@ -419,7 +419,7 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn read_bit(&mut self) -> Result<u32, DecodeError> {
+    pub fn read_bit(&mut self) -> Result<u32, DecodeError> {
         if self.bits == 0 {
             let byte = *self.bytes.get(self.pos).ok_or(DecodeError::Truncated)?;
             self.pos += 1;
@@ -430,7 +430,7 @@ impl<'a> BitReader<'a> {
         Ok(((self.acc >> self.bits) & 1) as u32)
     }
 
-    fn read(&mut self, bits: u32) -> Result<u32, DecodeError> {
+    pub fn read(&mut self, bits: u32) -> Result<u32, DecodeError> {
         let mut value = 0;
         for _ in 0..bits {
             value = (value << 1) | self.read_bit()?;

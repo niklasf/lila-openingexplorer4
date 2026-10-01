@@ -1,4 +1,5 @@
 mod bytes;
+mod compact_moves;
 mod entry;
 mod game;
 mod game_id;
@@ -9,6 +10,10 @@ mod month;
 mod rating;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
+pub use compact_moves::{
+    CompactEncodeError, CompactSymbols, decode_compact, decode_reachable, encode_compact,
+    encode_reachable,
+};
 pub use entry::{GroupHeader, LichessEntry, RatingGroup};
 pub use game::{
     GamePlayer, IndexStatus, InvalidRatingMode, InvalidSpeed, LichessGame, RatingMode, Speed,
