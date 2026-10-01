@@ -36,6 +36,10 @@ struct Args {
     /// Number of memory partition bits used by parquet_to_sst.
     #[clap(long, default_value = "6")]
     partition_bits: u32,
+    /// Allowed number of rows whose value differs from the stored value
+    /// (duplicate game ids, where only one value can be stored).
+    #[clap(long, default_value = "0")]
+    max_mismatches: u64,
 }
 
 fn main() -> io::Result<()> {
@@ -95,6 +99,7 @@ fn main() -> io::Result<()> {
     let next_row_group = AtomicUsize::new(0);
     let found = AtomicU64::new(0);
     let skipped = AtomicU64::new(0);
+    let mismatched = AtomicU64::new(0);
 
     thread::scope(|s| {
         for _ in 0..args.threads {
@@ -122,12 +127,19 @@ fn main() -> io::Result<()> {
                             Ok(()) => {
                                 let value =
                                     value.unwrap_or_else(|| panic!("missing game {}", row.game_id));
-                                assert!(
-                                    &value[..] == &expected[..],
-                                    "value mismatch for {}",
-                                    row.game_id
-                                );
-                                found.fetch_add(1, Ordering::Relaxed);
+                                if &value[..] != &expected[..] {
+                                    // Expected only for duplicate game ids, where
+                                    // the longest value was kept.
+                                    eprintln!(
+                                        "value mismatch for {} (stored {} bytes, row {} bytes)",
+                                        row.game_id,
+                                        value.len(),
+                                        expected.len()
+                                    );
+                                    mismatched.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    found.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             Err(err) => {
                                 assert!(value.is_none(), "invalid game {} present", row.game_id);
@@ -143,10 +155,15 @@ fn main() -> io::Result<()> {
 
     let found = found.load(Ordering::Relaxed);
     let skipped = skipped.load(Ordering::Relaxed);
-    println!("{found} games verified, {skipped} skipped rows");
+    let mismatched = mismatched.load(Ordering::Relaxed);
+    println!("{found} games verified, {skipped} skipped rows, {mismatched} mismatched rows");
     assert_eq!(
         found, count,
         "database has games not in checked parquet rows"
+    );
+    assert!(
+        mismatched <= args.max_mismatches,
+        "more mismatched rows than allowed"
     );
 
     drop(db);
