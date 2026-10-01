@@ -81,6 +81,12 @@ const INITIAL_SST_RATIO: f64 = 0.9;
 /// Games that could not be represented as `LichessGame`.
 static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Records dropped because another record had the same game id.
+static DUPLICATE_GAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Sub-buckets for the parallel sort of a partition.
+const SORT_BUCKET_BITS: u32 = 3;
+
 /// Bytes currently occupied by scratch files.
 static SCRATCH_USAGE: AtomicU64 = AtomicU64::new(0);
 
@@ -240,6 +246,70 @@ impl MemoryPartition {
             pos = len_offset + LEN_PREFIX + len;
         }
         assert_eq!(pos, records.len(), "records truncated");
+    }
+
+    /// Sorts the index by game id, in parallel over sub-buckets of the key
+    /// range.
+    fn sort(&mut self, threads: usize) {
+        let buckets = 1 << SORT_BUCKET_BITS;
+        let bits = MEMORY_PARTITION_BITS + SORT_BUCKET_BITS;
+        let mut bucketed: Vec<Vec<(GameId, u64)>> = (0..buckets).map(|_| Vec::new()).collect();
+        for entry in self.index.drain(..) {
+            bucketed[entry.0.partition(bits) & (buckets - 1)].push(entry);
+        }
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<&mut Vec<(GameId, u64)>>> =
+            bucketed.iter_mut().map(Mutex::new).collect();
+        thread::scope(|s| {
+            let next = &next;
+            let slots = &slots;
+            for _ in 0..threads.clamp(1, buckets) {
+                s.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(slot) = slots.get(i) else {
+                            break;
+                        };
+                        slot.lock()
+                            .expect("lock bucket")
+                            .sort_unstable_by_key(|&(game_id, _)| game_id);
+                    }
+                });
+            }
+        });
+        drop(slots);
+        for bucket in bucketed {
+            self.index.extend(bucket);
+        }
+    }
+
+    /// Drops all but one record for each game id in the sorted index,
+    /// keeping the longest value (then the lexicographically greatest).
+    /// Returns the number of dropped records.
+    fn dedup(&mut self) -> u64 {
+        let before = self.index.len();
+        let chunks = &self.chunks;
+        let value_at = |offset: u64| -> &[u8] {
+            let chunk = &chunks[(offset / CHUNK_STRIDE) as usize];
+            let offset = (offset % CHUNK_STRIDE) as usize;
+            let len = u32::from_le_bytes(
+                chunk[offset..offset + LEN_PREFIX]
+                    .try_into()
+                    .expect("length prefix"),
+            ) as usize;
+            &chunk[offset + LEN_PREFIX..offset + LEN_PREFIX + len]
+        };
+        self.index.dedup_by(|current, kept| {
+            if current.0 != kept.0 {
+                return false;
+            }
+            let (a, b) = (value_at(current.1), value_at(kept.1));
+            if (a.len(), a) > (b.len(), b) {
+                mem::swap(current, kept);
+            }
+            true
+        });
+        (before - self.index.len()) as u64
     }
 
     /// Merges partitions collected by multiple threads, without copying
@@ -568,13 +638,13 @@ fn main() -> io::Result<()> {
                 let load = timer.elapsed();
 
                 let timer = Instant::now();
-                partition
-                    .index
-                    .sort_unstable_by_key(|&(game_id, _)| game_id);
+                partition.sort(args.load_threads);
+                let duplicates = partition.dedup();
+                DUPLICATE_GAMES.fetch_add(duplicates, Ordering::Relaxed);
                 log(
                     progress,
                     format!(
-                        "partition {memory_partition}: load {load:.1?}, sort {:.1?} ({} games, {} record bytes)",
+                        "partition {memory_partition}: load {load:.1?}, sort {:.1?} ({} games, {} record bytes, {duplicates} duplicates)",
                         timer.elapsed(),
                         partition.index.len(),
                         partition.record_bytes()
@@ -667,7 +737,7 @@ fn main() -> io::Result<()> {
 
     let stats = sst.stats.into_inner().expect("stats");
     println!(
-        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes, ratio {:.3}), {} skipped games",
+        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes, ratio {:.3}), {} skipped games, {} duplicates dropped",
         started.elapsed(),
         stats.games,
         stats.files,
@@ -675,6 +745,7 @@ fn main() -> io::Result<()> {
         stats.largest_file,
         stats.ratio(),
         SKIPPED_GAMES.load(Ordering::Relaxed),
+        DUPLICATE_GAMES.load(Ordering::Relaxed),
     );
     Ok(())
 }
@@ -980,4 +1051,68 @@ fn log(progress: &ProgressBar, msg: String) {
     // Must not touch the progress bar inside `suspend` (its state is locked).
     let elapsed = progress.elapsed();
     progress.suspend(|| eprintln!("[{elapsed:>8.1?}] {msg}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(s: &str) -> GameId {
+        GameId::from_ascii(s.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn test_sort_and_dedup() {
+        let mut partition = MemoryPartition::default();
+        let games = [
+            ("abcdefgh", b"long value".as_slice()),
+            ("abcdefgh", b"short".as_slice()),
+            ("zzzzzzzz", b"z".as_slice()),
+            ("abcdefgh", b"long valux".as_slice()),
+            ("00000000", b"first".as_slice()),
+            ("zzzzzzzz", b"z".as_slice()),
+        ];
+        for (game_id, value) in games {
+            partition
+                .push::<()>(id(game_id), |buf| {
+                    buf.extend_from_slice(value);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        partition.sort(3);
+        assert_eq!(partition.dedup(), 3);
+        let result: Vec<(GameId, Vec<u8>)> = partition
+            .index
+            .iter()
+            .map(|&(game_id, offset)| (game_id, partition.value_at(offset).to_vec()))
+            .collect();
+        assert_eq!(
+            result,
+            vec![
+                (id("00000000"), b"first".to_vec()),
+                (id("abcdefgh"), b"long valux".to_vec()),
+                (id("zzzzzzzz"), b"z".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sort_many() {
+        let mut partition = MemoryPartition::default();
+        // All ids within the first memory partition, as in production.
+        let span = 62u64.pow(8) >> MEMORY_PARTITION_BITS;
+        let mut ids: Vec<GameId> = (0..5000u64)
+            .map(|i| {
+                let n = (i * 7919 * 1_000_003) % span;
+                GameId::unpack(&mut &n.to_be_bytes()[2..])
+            })
+            .collect();
+        for game_id in &ids {
+            partition.push::<()>(*game_id, |_| Ok(())).unwrap();
+        }
+        partition.sort(4);
+        ids.sort();
+        assert_eq!(partition.index.iter().map(|e| e.0).collect::<Vec<_>>(), ids);
+    }
 }
