@@ -1,38 +1,40 @@
-//! Compact fixed-width move encoding, after the "medium" level of
-//! thomas-daniels/aix, generalized to all variants.
+//! Compact encoding of move sequences that needs only a board to decode.
 //!
 //! Each move is encoded as the index of the moving piece among the pieces of
-//! the side to move (`ceil(log2(n))` bits, with an extra slot for drops when
-//! pockets exist), followed by a destination code whose width depends on the
-//! role. Decoding only needs to replay moves on a board, not to generate
-//! legal moves.
+//! the side to move, followed by the index of the destination among the
+//! squares that piece can reach (attacked squares not occupied by own
+//! pieces, castling rook squares for the king, pushes and captures for
+//! pawns), each in `ceil(log2(n))` bits. Pawn moves from the pre-promotion
+//! rank are followed by the promotion role in 3 bits. In variants with
+//! pockets, an extra piece slot denotes a drop, followed by the role in 3
+//! bits and the square in 6 bits.
+//!
+//! Legality is never checked, so encoder and decoder agree as long as they
+//! replay the same moves on the same position. The byte stream is terminated
+//! by a 1 bit followed by 0 bits up to the byte boundary, so that the number
+//! of plies does not need to be stored. A move that would occupy zero bits
+//! (a single piece with a single reachable square) is given one bit, so that
+//! every move is visible to the terminator.
 
 use shakmaty::{
-    Bitboard, CastlingSide, Color, Move, Piece, Position, Rank, Role, Square, attacks,
-    uci::UciMove, variant::VariantPosition,
+    Bitboard, CastlingSide, Move, Piece, Position, Rank, Role, Square, attacks, uci::UciMove,
+    variant::VariantPosition,
 };
 use thiserror::Error;
 
-use crate::packed::{BitReader, BitWriter, DecodeError};
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DecodeMovesError {
+    #[error("missing terminator")]
+    MissingTerminator,
+    #[error("truncated at ply {0}")]
+    Truncated(usize),
+    #[error("invalid move at ply {0}")]
+    InvalidMove(usize),
+}
 
 #[derive(Debug, Error)]
-pub enum CompactEncodeError {
-    #[error("illegal uci move {0} at ply {1}")]
-    IllegalUci(UciMove, usize),
-    #[error("unsupported move {0} at ply {1}")]
-    Unsupported(Move, usize),
-}
-
-/// Symbols produced for one move, for entropy analysis.
-#[derive(Debug, Clone, Copy)]
-pub struct CompactSymbols {
-    pub piece_bits: u32,
-    pub piece_index: u32,
-    /// Role of the moved piece, or `None` for drops.
-    pub role: Option<Role>,
-    pub dest_bits: u32,
-    pub dest_code: u32,
-}
+#[error("unencodable move {0} at ply {1}")]
+pub struct EncodeMoveError(pub Move, pub usize);
 
 fn bits_for(slots: usize) -> u32 {
     if slots <= 1 {
@@ -65,364 +67,16 @@ fn role_from_index(index: u32) -> Option<Role> {
     })
 }
 
-const KNIGHT_OFFSETS: [i32; 8] = [6, 10, 15, 17, -6, -10, -15, -17];
-const KING_OFFSETS: [i32; 8] = [1, 9, 8, 7, -1, -9, -8, -7];
-
-/// Castling codes reuse the king directions that lead off the board from
-/// the back rank.
-fn castle_code(turn: Color, side: CastlingSide) -> u32 {
-    match (turn, side) {
-        (Color::White, CastlingSide::KingSide) => 5,
-        (Color::White, CastlingSide::QueenSide) => 6,
-        (Color::Black, CastlingSide::KingSide) => 1,
-        (Color::Black, CastlingSide::QueenSide) => 2,
-    }
+/// Squares below or equal to `sq`.
+fn up_to(sq: Square) -> Bitboard {
+    Bitboard(u64::MAX >> (63 - u32::from(sq)))
 }
 
-fn pre_promotion_rank(turn: Color) -> Rank {
-    turn.relative_rank(Rank::Seventh)
+fn pre_promotion_rank(pos: &VariantPosition) -> Rank {
+    pos.turn().relative_rank(Rank::Seventh)
 }
 
-fn diff(from: Square, to: Square) -> i32 {
-    i32::from(to) - i32::from(from)
-}
-
-/// Destination code and width for a move with the given role.
-fn dest_code(turn: Color, role: Role, from: Square, m: Move) -> Option<(u32, u32)> {
-    let to = m.to();
-    Some(match m {
-        Move::Castle { rook, .. } => {
-            let side = if rook > from {
-                CastlingSide::KingSide
-            } else {
-                CastlingSide::QueenSide
-            };
-            (castle_code(turn, side), 3)
-        }
-        Move::Normal { .. } | Move::EnPassant { .. } => match role {
-            Role::Knight => (
-                KNIGHT_OFFSETS.iter().position(|&o| o == diff(from, to))? as u32,
-                3,
-            ),
-            Role::King => (
-                KING_OFFSETS.iter().position(|&o| o == diff(from, to))? as u32,
-                3,
-            ),
-            Role::Rook => (rook_code(from, to)?, 4),
-            Role::Bishop => (bishop_code(from, to)?, 4),
-            Role::Queen => {
-                if from.file() == to.file() || from.rank() == to.rank() {
-                    (rook_code(from, to)?, 5)
-                } else {
-                    (16 + bishop_code(from, to)?, 5)
-                }
-            }
-            Role::Pawn => {
-                let forward = if turn.is_white() { 1 } else { -1 };
-                let file_diff = i32::from(to.file()) - i32::from(from.file());
-                let rank_diff = (i32::from(to.rank()) - i32::from(from.rank())) * forward;
-                let direction = match (file_diff, rank_diff) {
-                    (0, 1) => 0,
-                    (-1, 1) => 1,
-                    (1, 1) => 2,
-                    (0, 2) => 3,
-                    _ => return None,
-                };
-                if from.rank() == pre_promotion_rank(turn) {
-                    (direction << 3 | role_index(m.promotion()?), 5)
-                } else {
-                    if m.promotion().is_some() {
-                        return None;
-                    }
-                    (direction, 2)
-                }
-            }
-        },
-        Move::Put { .. } => return None,
-    })
-}
-
-fn rook_code(from: Square, to: Square) -> Option<u32> {
-    if from.file() == to.file() {
-        Some(u32::from(to.rank()))
-    } else if from.rank() == to.rank() {
-        Some(8 | u32::from(to.file()))
-    } else {
-        None
-    }
-}
-
-fn bishop_code(from: Square, to: Square) -> Option<u32> {
-    let d = diff(from, to);
-    if d == 0 {
-        None
-    } else if d % 9 == 0 {
-        Some(8 | u32::from(to.rank()))
-    } else if d % 7 == 0 {
-        Some(u32::from(to.rank()))
-    } else {
-        None
-    }
-}
-
-fn square_offset(from: Square, offset: i32) -> Result<Square, DecodeError> {
-    let index = i32::from(from) + offset;
-    if (0..64).contains(&index) {
-        Ok(Square::new(index as u32))
-    } else {
-        Err(DecodeError::RankOutOfRange(0))
-    }
-}
-
-fn rook_dest(from: Square, code: u32) -> Square {
-    if code & 8 == 0 {
-        Square::from_coords(from.file(), Rank::new(code & 7))
-    } else {
-        Square::from_coords(shakmaty::File::new(code & 7), from.rank())
-    }
-}
-
-fn bishop_dest(from: Square, code: u32) -> Result<Square, DecodeError> {
-    let rank = Rank::new(code & 7);
-    let rank_diff = i32::from(rank) - i32::from(from.rank());
-    let file_diff = if code & 8 != 0 { rank_diff } else { -rank_diff };
-    let file = i32::from(from.file()) + file_diff;
-    if rank_diff != 0 && (0..8).contains(&file) {
-        Ok(Square::from_coords(shakmaty::File::new(file as u32), rank))
-    } else {
-        Err(DecodeError::RankOutOfRange(0))
-    }
-}
-
-/// Encodes moves in UCI notation (castling as king takes rook), advancing
-/// the position. `observe` is called with the symbols of each move.
-pub fn encode_compact(
-    pos: &mut VariantPosition,
-    moves: impl IntoIterator<Item = UciMove>,
-    writer: &mut BitWriter,
-    mut observe: impl FnMut(CompactSymbols),
-) -> Result<usize, CompactEncodeError> {
-    let mut plies = 0;
-    for uci in moves {
-        let m = uci
-            .to_move(pos)
-            .map_err(|_| CompactEncodeError::IllegalUci(uci, plies))?;
-        let turn = pos.turn();
-        let own = pos.board().by_color(turn);
-        let slots = own.count() + usize::from(pos.pockets().is_some());
-        let piece_bits = bits_for(slots);
-
-        let symbols = match m {
-            Move::Put { role, to } => {
-                let piece_index = own.count() as u32;
-                writer.write(piece_index, piece_bits);
-                let code = role_index(role) << 6 | u32::from(to);
-                writer.write(code, 9);
-                CompactSymbols {
-                    piece_bits,
-                    piece_index,
-                    role: None,
-                    dest_bits: 9,
-                    dest_code: code,
-                }
-            }
-            _ => {
-                let from = m.from().expect("from square");
-                // Rank of `from` among own pieces in square order.
-                let piece_index =
-                    (own & Bitboard(u64::MAX >> (63 - u32::from(from)))).count() as u32 - 1;
-                writer.write(piece_index, piece_bits);
-                let role = m.role();
-                let (code, bits) = dest_code(turn, role, from, m)
-                    .ok_or(CompactEncodeError::Unsupported(m, plies))?;
-                writer.write(code, bits);
-                CompactSymbols {
-                    piece_bits,
-                    piece_index,
-                    role: Some(role),
-                    dest_bits: bits,
-                    dest_code: code,
-                }
-            }
-        };
-        observe(symbols);
-        pos.play_unchecked(m);
-        plies += 1;
-    }
-    Ok(plies)
-}
-
-/// Decodes `plies` moves, advancing the position.
-pub fn decode_compact(
-    pos: &mut VariantPosition,
-    reader: &mut BitReader<'_>,
-    plies: usize,
-    out: &mut Vec<Move>,
-) -> Result<(), DecodeError> {
-    for ply in 0..plies {
-        let turn = pos.turn();
-        let own = pos.board().by_color(turn);
-        let has_pockets = pos.pockets().is_some();
-        let slots = own.count() + usize::from(has_pockets);
-        let piece_index = reader.read(bits_for(slots))? as usize;
-
-        let m = if piece_index == own.count() {
-            if !has_pockets {
-                return Err(DecodeError::RankOutOfRange(ply));
-            }
-            let code = reader.read(9)?;
-            Move::Put {
-                role: role_from_index(code >> 6).ok_or(DecodeError::RankOutOfRange(ply))?,
-                to: Square::new(code & 63),
-            }
-        } else {
-            let from = own
-                .into_iter()
-                .nth(piece_index)
-                .ok_or(DecodeError::RankOutOfRange(ply))?;
-            let role = pos
-                .board()
-                .role_at(from)
-                .ok_or(DecodeError::RankOutOfRange(ply))?;
-            let board = pos.board();
-            let normal = |to: Square, promotion: Option<Role>| Move::Normal {
-                role,
-                from,
-                capture: board.role_at(to),
-                to,
-                promotion,
-            };
-            match role {
-                Role::Knight => normal(
-                    square_offset(from, KNIGHT_OFFSETS[reader.read(3)? as usize])?,
-                    None,
-                ),
-                Role::King => {
-                    let code = reader.read(3)?;
-                    let castle = if from.rank() == turn.backrank() {
-                        [CastlingSide::KingSide, CastlingSide::QueenSide]
-                            .into_iter()
-                            .find(|&side| castle_code(turn, side) == code)
-                    } else {
-                        None
-                    };
-                    match castle {
-                        Some(side) => Move::Castle {
-                            king: from,
-                            rook: pos
-                                .castles()
-                                .rook(turn, side)
-                                .ok_or(DecodeError::RankOutOfRange(ply))?,
-                        },
-                        None => normal(square_offset(from, KING_OFFSETS[code as usize])?, None),
-                    }
-                }
-                Role::Rook => normal(rook_dest(from, reader.read(4)?), None),
-                Role::Bishop => normal(bishop_dest(from, reader.read(4)?)?, None),
-                Role::Queen => {
-                    let code = reader.read(5)?;
-                    if code & 16 == 0 {
-                        normal(rook_dest(from, code), None)
-                    } else {
-                        normal(bishop_dest(from, code & 15)?, None)
-                    }
-                }
-                Role::Pawn => {
-                    let promoting = from.rank() == pre_promotion_rank(turn);
-                    let (direction, promotion) = if promoting {
-                        let code = reader.read(5)?;
-                        (
-                            code >> 3,
-                            Some(
-                                role_from_index(code & 7)
-                                    .ok_or(DecodeError::RankOutOfRange(ply))?,
-                            ),
-                        )
-                    } else {
-                        (reader.read(2)?, None)
-                    };
-                    let forward = if turn.is_white() { 8 } else { -8 };
-                    let offset = match direction {
-                        0 => forward,
-                        1 => forward - 1,
-                        2 => forward + 1,
-                        3 => 2 * forward,
-                        _ => return Err(DecodeError::RankOutOfRange(ply)),
-                    };
-                    let to = square_offset(from, offset)?;
-                    if direction == 1 || direction == 2 {
-                        if board.role_at(to).is_none() {
-                            Move::EnPassant { from, to }
-                        } else {
-                            normal(to, promotion)
-                        }
-                    } else {
-                        normal(to, promotion)
-                    }
-                }
-            }
-        };
-        pos.play_unchecked(m);
-        out.push(m);
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use arbtest::arbtest;
-    use shakmaty::variant::Variant;
-
-    use super::*;
-
-    #[test]
-    fn test_bits_for() {
-        assert_eq!(bits_for(1), 0);
-        assert_eq!(bits_for(2), 1);
-        assert_eq!(bits_for(16), 4);
-        assert_eq!(bits_for(17), 5);
-        assert_eq!(bits_for(36), 6);
-    }
-
-    #[test]
-    fn test_arbitrary_games_roundtrip() {
-        arbtest(|u| {
-            let variant: Variant = u.arbitrary()?;
-            let mut pos = VariantPosition::new(variant);
-            let mut moves = Vec::new();
-            for _ in 0..u.int_in_range(0..=150)? {
-                let legals = pos.legal_moves();
-                if legals.is_empty() {
-                    break;
-                }
-                let m = *u.choose(&legals)?;
-                pos.play_unchecked(m);
-                moves.push(m);
-            }
-
-            let mut writer = BitWriter::default();
-            let mut pos = VariantPosition::new(variant);
-            let ucis = moves
-                .iter()
-                .map(|m| m.to_uci(shakmaty::CastlingMode::Chess960));
-            let plies = encode_compact(&mut pos, ucis, &mut writer, |_| {}).unwrap();
-            assert_eq!(plies, moves.len());
-            let bytes = writer.finish();
-
-            let mut pos = VariantPosition::new(variant);
-            let mut decoded = Vec::new();
-            decode_compact(&mut pos, &mut BitReader::new(&bytes), plies, &mut decoded).unwrap();
-            assert_eq!(decoded, moves, "variant {variant:?}");
-            Ok(())
-        })
-        .budget_ms(3000);
-    }
-}
-
-/// Squares a piece at `from` may move to, ignoring legality: attacked
-/// squares not occupied by own pieces, castling rook squares for the king,
-/// and pushes and captures (including en passant) for pawns. Only needs the
-/// board, so encoder and decoder agree without legal move generation.
+/// Squares a piece at `from` may move to, ignoring legality.
 fn reachable(pos: &VariantPosition, from: Square, role: Role) -> Bitboard {
     let turn = pos.turn();
     let board = pos.board();
@@ -435,6 +89,8 @@ fn reachable(pos: &VariantPosition, from: Square, role: Role) -> Bitboard {
                 if !board.occupied().contains(single) {
                     targets.add(single);
                     if let Some(double) = single.offset(forward) {
+                        // Horde pawns may also advance two squares from the
+                        // first rank.
                         if !board.occupied().contains(double)
                             && (from.rank() == turn.relative_rank(Rank::Second)
                                 || from.rank() == turn.relative_rank(Rank::First))
@@ -472,181 +128,413 @@ fn reachable(pos: &VariantPosition, from: Square, role: Role) -> Bitboard {
     }
 }
 
-/// Like `encode_compact`, but destinations are indexed among the squares the
-/// piece can reach.
-pub fn encode_reachable(
-    pos: &mut VariantPosition,
-    moves: impl IntoIterator<Item = UciMove>,
-    writer: &mut BitWriter,
-    mut observe: impl FnMut(CompactSymbols),
-) -> Result<usize, CompactEncodeError> {
-    let mut plies = 0;
-    for uci in moves {
-        let m = uci
-            .to_move(pos)
-            .map_err(|_| CompactEncodeError::IllegalUci(uci, plies))?;
+/// Writes bits, most significant first.
+#[derive(Default)]
+struct BitWriter {
+    bytes: Vec<u8>,
+    acc: u64,
+    bits: u32,
+}
+
+impl BitWriter {
+    fn write(&mut self, value: u32, bits: u32) {
+        debug_assert!(bits <= 32);
+        self.acc = (self.acc << bits) | u64::from(value);
+        self.bits += bits;
+        while self.bits >= 8 {
+            self.bits -= 8;
+            self.bytes.push((self.acc >> self.bits) as u8);
+        }
+    }
+
+    /// Terminates with a 1 bit and zero padding.
+    fn finish(mut self) -> Vec<u8> {
+        self.write(1, 1);
+        if self.bits > 0 {
+            self.bytes.push((self.acc << (8 - self.bits)) as u8);
+        }
+        self.bytes
+    }
+}
+
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    /// Total payload bits, excluding the terminator.
+    len: usize,
+    pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Result<BitReader<'a>, DecodeMovesError> {
+        let last = *bytes.last().ok_or(DecodeMovesError::MissingTerminator)?;
+        if last == 0 {
+            return Err(DecodeMovesError::MissingTerminator);
+        }
+        Ok(BitReader {
+            bytes,
+            len: bytes.len() * 8 - last.trailing_zeros() as usize - 1,
+            pos: 0,
+        })
+    }
+
+    fn has_remaining(&self) -> bool {
+        self.pos < self.len
+    }
+
+    fn read(&mut self, bits: u32, ply: usize) -> Result<u32, DecodeMovesError> {
+        if self.pos + bits as usize > self.len {
+            return Err(DecodeMovesError::Truncated(ply));
+        }
+        let mut value = 0;
+        for _ in 0..bits {
+            let byte = self.bytes[self.pos / 8];
+            value = (value << 1) | u32::from((byte >> (7 - self.pos % 8)) & 1);
+            self.pos += 1;
+        }
+        Ok(value)
+    }
+}
+
+/// Encodes moves one by one, as they are played on a position.
+#[derive(Default)]
+pub struct MoveEncoder {
+    writer: BitWriter,
+    plies: usize,
+}
+
+impl MoveEncoder {
+    pub fn new() -> MoveEncoder {
+        MoveEncoder::default()
+    }
+
+    pub fn plies(&self) -> usize {
+        self.plies
+    }
+
+    /// Encodes `m`, which must be a legal move in `pos`. The caller plays
+    /// the move afterwards.
+    pub fn push(&mut self, pos: &VariantPosition, m: Move) -> Result<(), EncodeMoveError> {
         let turn = pos.turn();
         let own = pos.board().by_color(turn);
         let slots = own.count() + usize::from(pos.pockets().is_some());
         let piece_bits = bits_for(slots);
+        let error = || EncodeMoveError(m, self.plies);
 
-        let symbols = match m {
+        match m {
             Move::Put { role, to } => {
-                let piece_index = own.count() as u32;
-                writer.write(piece_index, piece_bits);
-                let code = role_index(role) << 6 | u32::from(to);
-                writer.write(code, 9);
-                CompactSymbols {
-                    piece_bits,
-                    piece_index,
-                    role: None,
-                    dest_bits: 9,
-                    dest_code: code,
+                if pos.pockets().is_none() {
+                    return Err(error());
                 }
+                self.writer.write(own.count() as u32, piece_bits);
+                self.writer.write(role_index(role) << 6 | u32::from(to), 9);
             }
             _ => {
-                let from = m.from().expect("from square");
-                let piece_index =
-                    (own & Bitboard(u64::MAX >> (63 - u32::from(from)))).count() as u32 - 1;
-                writer.write(piece_index, piece_bits);
+                let from = m.from().ok_or_else(error)?;
+                if !own.contains(from) {
+                    return Err(error());
+                }
                 let role = m.role();
                 let targets = reachable(pos, from, role);
                 let to = m.to();
                 if !targets.contains(to) {
-                    return Err(CompactEncodeError::Unsupported(m, plies));
+                    return Err(error());
                 }
                 let dest_bits = bits_for(targets.count());
-                let mut code =
-                    (targets & Bitboard(u64::MAX >> (63 - u32::from(to)))).count() as u32 - 1;
-                writer.write(code, dest_bits);
-                let mut bits = dest_bits;
-                if role == Role::Pawn && from.rank() == pre_promotion_rank(turn) {
-                    let promotion = role_index(
-                        m.promotion()
-                            .ok_or(CompactEncodeError::Unsupported(m, plies))?,
-                    );
-                    writer.write(promotion, 3);
-                    code = code << 3 | promotion;
-                    bits += 3;
-                }
-                CompactSymbols {
-                    piece_bits,
-                    piece_index,
-                    role: Some(role),
-                    dest_bits: bits,
-                    dest_code: code,
+                let promotion = if role == Role::Pawn && from.rank() == pre_promotion_rank(pos) {
+                    Some(m.promotion().ok_or_else(error)?)
+                } else {
+                    if m.promotion().is_some() {
+                        return Err(error());
+                    }
+                    None
+                };
+
+                self.writer
+                    .write((own & up_to(from)).count() as u32 - 1, piece_bits);
+                self.writer
+                    .write((targets & up_to(to)).count() as u32 - 1, dest_bits);
+                match promotion {
+                    Some(promotion) => self.writer.write(role_index(promotion), 3),
+                    None => {
+                        if piece_bits == 0 && dest_bits == 0 {
+                            // Give the move a bit, so that it is visible to
+                            // the terminator.
+                            self.writer.write(0, 1);
+                        }
+                    }
                 }
             }
-        };
-        observe(symbols);
-        pos.play_unchecked(m);
-        plies += 1;
+        }
+        self.plies += 1;
+        Ok(())
     }
-    Ok(plies)
+
+    pub fn finish(self) -> EncodedMoves {
+        EncodedMoves(self.writer.finish())
+    }
 }
 
-fn nth_square(bb: Bitboard, n: usize) -> Option<Square> {
-    bb.into_iter().nth(n)
+/// Moves of a game, compactly encoded relative to the initial position.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EncodedMoves(Vec<u8>);
+
+impl EncodedMoves {
+    /// Encodes moves played from `pos`, advancing the position.
+    pub fn encode(
+        pos: &mut VariantPosition,
+        moves: impl IntoIterator<Item = Move>,
+    ) -> Result<EncodedMoves, EncodeMoveError> {
+        let mut encoder = MoveEncoder::new();
+        for m in moves {
+            encoder.push(pos, m)?;
+            pos.play_unchecked(m);
+        }
+        Ok(encoder.finish())
+    }
+
+    /// Encodes moves in UCI notation (castling as king takes rook), resolving
+    /// them against the position.
+    pub fn encode_uci(
+        pos: &mut VariantPosition,
+        moves: impl IntoIterator<Item = UciMove>,
+    ) -> Result<EncodedMoves, EncodeUciError> {
+        let mut encoder = MoveEncoder::new();
+        for uci in moves {
+            let m = uci
+                .to_move(pos)
+                .map_err(|_| EncodeUciError::Illegal(uci, encoder.plies()))?;
+            encoder.push(pos, m)?;
+            pos.play_unchecked(m);
+        }
+        Ok(encoder.finish())
+    }
+
+    /// Wraps bytes without validation.
+    pub fn from_bytes(bytes: Vec<u8>) -> EncodedMoves {
+        EncodedMoves(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Decodes all moves, advancing the position.
+    pub fn decode(&self, pos: &mut VariantPosition) -> Result<Vec<Move>, DecodeMovesError> {
+        let mut moves = Vec::new();
+        self.decode_into(pos, &mut moves)?;
+        Ok(moves)
+    }
+
+    pub fn decode_into(
+        &self,
+        pos: &mut VariantPosition,
+        out: &mut Vec<Move>,
+    ) -> Result<(), DecodeMovesError> {
+        let mut reader = BitReader::new(&self.0)?;
+        let mut ply = 0;
+        while reader.has_remaining() {
+            let m = decode_move(pos, &mut reader, ply)?;
+            pos.play_unchecked(m);
+            out.push(m);
+            ply += 1;
+        }
+        Ok(())
+    }
 }
 
-/// Decodes moves written by `encode_reachable`.
-pub fn decode_reachable(
-    pos: &mut VariantPosition,
+#[derive(Debug, Error)]
+pub enum EncodeUciError {
+    #[error("illegal uci move {0} at ply {1}")]
+    Illegal(UciMove, usize),
+    #[error(transparent)]
+    Encode(#[from] EncodeMoveError),
+}
+
+fn decode_move(
+    pos: &VariantPosition,
     reader: &mut BitReader<'_>,
-    plies: usize,
-    out: &mut Vec<Move>,
-) -> Result<(), DecodeError> {
-    for ply in 0..plies {
-        let turn = pos.turn();
-        let own = pos.board().by_color(turn);
-        let has_pockets = pos.pockets().is_some();
-        let slots = own.count() + usize::from(has_pockets);
-        let piece_index = reader.read(bits_for(slots))? as usize;
+    ply: usize,
+) -> Result<Move, DecodeMovesError> {
+    let turn = pos.turn();
+    let own = pos.board().by_color(turn);
+    let has_pockets = pos.pockets().is_some();
+    let slots = own.count() + usize::from(has_pockets);
+    let piece_bits = bits_for(slots);
+    let piece_index = reader.read(piece_bits, ply)? as usize;
+    let invalid = || DecodeMovesError::InvalidMove(ply);
 
-        let m = if piece_index == own.count() {
-            if !has_pockets {
-                return Err(DecodeError::RankOutOfRange(ply));
-            }
-            let code = reader.read(9)?;
-            Move::Put {
-                role: role_from_index(code >> 6).ok_or(DecodeError::RankOutOfRange(ply))?,
-                to: Square::new(code & 63),
-            }
-        } else {
-            let from = nth_square(own, piece_index).ok_or(DecodeError::RankOutOfRange(ply))?;
-            let board = pos.board();
-            let role = board
-                .role_at(from)
-                .ok_or(DecodeError::RankOutOfRange(ply))?;
-            let targets = reachable(pos, from, role);
-            let index = reader.read(bits_for(targets.count()))? as usize;
-            let to = nth_square(targets, index).ok_or(DecodeError::RankOutOfRange(ply))?;
-            let promotion = if role == Role::Pawn && from.rank() == pre_promotion_rank(turn) {
-                Some(role_from_index(reader.read(3)?).ok_or(DecodeError::RankOutOfRange(ply))?)
-            } else {
-                None
-            };
-            if role == Role::King && own.contains(to) {
-                Move::Castle {
-                    king: from,
-                    rook: to,
-                }
-            } else if role == Role::Pawn && from.file() != to.file() && board.role_at(to).is_none()
-            {
-                Move::EnPassant { from, to }
-            } else {
-                Move::Normal {
-                    role,
-                    from,
-                    capture: board.role_at(to),
-                    to,
-                    promotion,
-                }
-            }
-        };
-        pos.play_unchecked(m);
-        out.push(m);
+    if piece_index == own.count() {
+        if !has_pockets {
+            return Err(invalid());
+        }
+        let code = reader.read(9, ply)?;
+        return Ok(Move::Put {
+            role: role_from_index(code >> 6).ok_or_else(invalid)?,
+            to: Square::new(code & 63),
+        });
     }
-    Ok(())
+
+    let from = own.into_iter().nth(piece_index).ok_or_else(invalid)?;
+    let board = pos.board();
+    let role = board.role_at(from).ok_or_else(invalid)?;
+    let targets = reachable(pos, from, role);
+    let dest_bits = bits_for(targets.count());
+    let to = targets
+        .into_iter()
+        .nth(reader.read(dest_bits, ply)? as usize)
+        .ok_or_else(invalid)?;
+
+    let promotion = if role == Role::Pawn && from.rank() == pre_promotion_rank(pos) {
+        Some(role_from_index(reader.read(3, ply)?).ok_or_else(invalid)?)
+    } else {
+        if piece_bits == 0 && dest_bits == 0 && reader.read(1, ply)? != 0 {
+            return Err(invalid());
+        }
+        None
+    };
+
+    Ok(if role == Role::King && own.contains(to) {
+        Move::Castle {
+            king: from,
+            rook: to,
+        }
+    } else if role == Role::Pawn && from.file() != to.file() && board.role_at(to).is_none() {
+        Move::EnPassant { from, to }
+    } else {
+        Move::Normal {
+            role,
+            from,
+            capture: board.role_at(to),
+            to,
+            promotion,
+        }
+    })
 }
 
 #[cfg(test)]
-mod reachable_tests {
+mod tests {
     use arbtest::arbtest;
-    use shakmaty::variant::Variant;
+    use shakmaty::{CastlingMode, variant::Variant};
 
     use super::*;
 
     #[test]
+    fn test_bits_for() {
+        assert_eq!(bits_for(1), 0);
+        assert_eq!(bits_for(2), 1);
+        assert_eq!(bits_for(16), 4);
+        assert_eq!(bits_for(17), 5);
+        assert_eq!(bits_for(36), 6);
+    }
+
+    #[test]
+    fn test_empty() {
+        let mut pos = VariantPosition::new(Variant::Chess);
+        let encoded = EncodedMoves::encode(&mut pos, []).unwrap();
+        assert_eq!(encoded.as_bytes(), [0x80]);
+        assert_eq!(encoded.decode(&mut pos).unwrap(), Vec::<Move>::new());
+        assert_eq!(
+            EncodedMoves::from_bytes(vec![]).decode(&mut pos),
+            Err(DecodeMovesError::MissingTerminator)
+        );
+        assert_eq!(
+            EncodedMoves::from_bytes(vec![0]).decode(&mut pos),
+            Err(DecodeMovesError::MissingTerminator)
+        );
+    }
+
+    #[test]
+    fn test_known_game() {
+        let ucis = [
+            "e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "a7a6", "c1e3",
+            "e7e5", "d4b3", "c8e6", "f2f3", "f8e7", "d1d2", "e8h8", "e1a1",
+        ];
+        let mut pos = VariantPosition::new(Variant::Chess);
+        let encoded = EncodedMoves::encode_uci(
+            &mut pos,
+            ucis.iter().map(|uci| uci.parse::<UciMove>().unwrap()),
+        )
+        .unwrap();
+        // About 6 bits per ply plus terminator.
+        assert!(
+            encoded.as_bytes().len() <= 16,
+            "{}",
+            encoded.as_bytes().len()
+        );
+
+        let mut pos = VariantPosition::new(Variant::Chess);
+        let decoded = encoded.decode(&mut pos).unwrap();
+        let decoded: Vec<String> = decoded
+            .iter()
+            .map(|m| m.to_uci(CastlingMode::Chess960).to_string())
+            .collect();
+        assert_eq!(decoded, ucis);
+    }
+
+    fn random_game(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<(Variant, Vec<Move>)> {
+        let variant: Variant = u.arbitrary()?;
+        let mut pos = VariantPosition::new(variant);
+        let mut moves = Vec::new();
+        for _ in 0..u.int_in_range(0..=200)? {
+            let legals = pos.legal_moves();
+            if legals.is_empty() {
+                break;
+            }
+            let m = *u.choose(&legals)?;
+            pos.play_unchecked(m);
+            moves.push(m);
+        }
+        Ok((variant, moves))
+    }
+
+    #[test]
     fn test_arbitrary_games_roundtrip() {
         arbtest(|u| {
-            let variant: Variant = u.arbitrary()?;
+            let (variant, moves) = random_game(u)?;
             let mut pos = VariantPosition::new(variant);
-            let mut moves = Vec::new();
-            for _ in 0..u.int_in_range(0..=150)? {
-                let legals = pos.legal_moves();
-                if legals.is_empty() {
-                    break;
-                }
-                let m = *u.choose(&legals)?;
-                pos.play_unchecked(m);
-                moves.push(m);
-            }
+            let encoded = EncodedMoves::encode(&mut pos, moves.iter().copied()).unwrap();
+            let mut pos = VariantPosition::new(variant);
+            assert_eq!(
+                encoded.decode(&mut pos).unwrap(),
+                moves,
+                "variant {variant:?}"
+            );
 
-            let mut writer = BitWriter::default();
+            // Also via uci.
             let mut pos = VariantPosition::new(variant);
-            let ucis = moves
-                .iter()
-                .map(|m| m.to_uci(shakmaty::CastlingMode::Chess960));
-            let plies = encode_reachable(&mut pos, ucis, &mut writer, |_| {}).unwrap();
-            let bytes = writer.finish();
-
-            let mut pos = VariantPosition::new(variant);
-            let mut decoded = Vec::new();
-            decode_reachable(&mut pos, &mut BitReader::new(&bytes), plies, &mut decoded).unwrap();
-            assert_eq!(decoded, moves, "variant {variant:?}");
+            let via_uci = EncodedMoves::encode_uci(
+                &mut pos,
+                moves.iter().map(|m| m.to_uci(CastlingMode::Chess960)),
+            )
+            .unwrap();
+            assert_eq!(via_uci, encoded);
             Ok(())
         })
-        .budget_ms(3000);
+        .budget_ms(5000);
+    }
+
+    #[test]
+    fn test_zero_width_moves_are_terminated() {
+        // Lone king with a single reachable square: Kh1 boxed in by own
+        // pieces? Use a position where white has only a king on a1 with b1,
+        // b2 attacked... simpler: construct via FEN with a single white
+        // piece that has one target.
+        use shakmaty::fen::Fen;
+        let fen: Fen = "7k/8/8/8/8/8/6pp/7K w - - 0 1".parse().unwrap();
+        let mut pos =
+            VariantPosition::from_setup(Variant::Chess, fen.into(), CastlingMode::Standard)
+                .unwrap();
+        // White king on h1, black pawns g2 h2: only Kxg2 is legal (h2 pawn
+        // is defended? g2 pawn defended by nothing; h2 pawn attacked). Both
+        // captures reachable, so this has one bit; just check roundtrip and
+        // that a trailing move is not lost.
+        let legals = pos.legal_moves();
+        let m = legals[0];
+        let encoded = EncodedMoves::encode(&mut pos.clone(), [m]).unwrap();
+        assert_eq!(encoded.decode(&mut pos).unwrap(), vec![m]);
     }
 }

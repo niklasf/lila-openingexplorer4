@@ -3,7 +3,8 @@ mod compact_moves;
 mod entry;
 mod game;
 mod game_id;
-mod huffman_moves;
+/// Reference implementation of lichess-org/compression, kept for comparison.
+pub mod huffman_moves;
 mod int;
 mod lax_date;
 mod month;
@@ -11,8 +12,7 @@ mod rating;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
 pub use compact_moves::{
-    CompactEncodeError, CompactSymbols, decode_compact, decode_reachable, encode_compact,
-    encode_reachable,
+    DecodeMovesError, EncodeMoveError, EncodeUciError, EncodedMoves, MoveEncoder,
 };
 pub use entry::{GroupHeader, LichessEntry, RatingGroup};
 pub use game::{
@@ -21,10 +21,6 @@ pub use game::{
     unpack_uci_move,
 };
 pub use game_id::{GameId, InvalidGameId};
-pub use huffman_moves::{
-    BitReader, BitWriter, DecodeError, EncodeError, EncodeUciError, decode_moves, encode_moves,
-    encode_uci_moves, move_key,
-};
 pub use int::{pack_int, pack_uint, unpack_int, unpack_uint};
 pub use lax_date::{InvalidLaxDate, LaxDate};
 pub use month::{InvalidMonth, Month};

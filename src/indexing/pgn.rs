@@ -4,12 +4,12 @@ use pgn_reader::{RawTag, Skip, Visitor};
 use shakmaty::{
     ByColor, CastlingMode, EnPassantMode, Outcome, Position,
     fen::Fen,
-    packed::{PackedSetup, PackedUciMove},
+    packed::PackedSetup,
     san::{San, SanPlus},
     variant::{Variant, VariantPosition},
 };
 
-use crate::packed::{GameId, LaxDate, Rating, RatingMode, Speed};
+use crate::packed::{EncodedMoves, GameId, LaxDate, MoveEncoder, Rating, RatingMode, Speed};
 
 pub struct GameVisitor;
 
@@ -235,7 +235,7 @@ pub struct FlatGame {
     pub speed: Option<Speed>,
     pub rating_mode: RatingMode,
     pub setup: Option<PackedSetup>,
-    pub moves: Vec<PackedUciMove>,
+    pub moves: EncodedMoves,
 }
 
 impl FlatGame {
@@ -246,7 +246,7 @@ impl FlatGame {
 
         let (mut pos, setup) = parsed.initial_position()?;
 
-        let mut moves = Vec::with_capacity(parsed.moves.len());
+        let mut encoder = MoveEncoder::new();
 
         for san in &parsed.moves {
             let m = san.to_move(&pos).map_err(|err| {
@@ -256,9 +256,16 @@ impl FlatGame {
                 )
             })?;
 
-            moves.push(PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)));
+            encoder.push(&pos, m).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unencodable move: {} @ {:?}", err, game_id),
+                )
+            })?;
             pos.play_unchecked(m);
         }
+
+        let moves = encoder.finish();
 
         Ok(FlatGame {
             game_id,

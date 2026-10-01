@@ -3,14 +3,16 @@ use bitflags::bitflags;
 use btoi::btou;
 use bytes::{Buf, BufMut};
 use shakmaty::{
-    ByColor, Color, KnownOutcome, Outcome, Position,
+    ByColor, CastlingMode, Color, KnownOutcome, Outcome, Position,
     packed::{PackedSetup, PackedUciMove},
-    uci::UciMove,
-    variant::VariantPosition,
+    variant::{Variant, VariantPosition},
 };
 use thiserror::Error;
 
-use crate::packed::{LaxDate, Rating, pack_bytes, pack_string, unpack_bytes, unpack_string};
+use crate::packed::{
+    EncodedMoves, LaxDate, MoveEncoder, Rating, pack_bytes, pack_string, unpack_bytes,
+    unpack_string,
+};
 
 pub fn unpack_uci_move<B: Buf>(buf: &mut B) -> PackedUciMove {
     let mut bytes = [0; PackedUciMove::BYTES];
@@ -256,10 +258,22 @@ pub struct LichessGame {
     pub speed: Speed,
     pub rating_mode: RatingMode,
     pub setup: Option<PackedSetup>,
-    pub moves: Vec<PackedUciMove>,
+    pub moves: EncodedMoves,
 }
 
 impl LichessGame {
+    /// The position before the first move.
+    pub fn initial_position(&self) -> Result<VariantPosition, InvalidSetup> {
+        match &self.setup {
+            None => Ok(VariantPosition::new(Variant::Chess)),
+            Some(setup) => {
+                let (setup, variant) = setup.unpack_variant().map_err(|_| InvalidSetup)?;
+                VariantPosition::from_setup(variant, setup, CastlingMode::Chess960)
+                    .map_err(|_| InvalidSetup)
+            }
+        }
+    }
+
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
         self.index_status.pack(buf);
         self.players.white.pack(buf);
@@ -271,9 +285,7 @@ impl LichessGame {
             buf,
             self.setup.as_ref().map_or(b"", |setup| setup.as_bytes()),
         );
-        for m in &self.moves {
-            buf.put_slice(&m.to_bytes());
-        }
+        buf.put_slice(self.moves.as_bytes());
     }
 
     pub fn unpack_entire<B: Buf>(buf: &mut B) -> Self {
@@ -290,10 +302,7 @@ impl LichessGame {
             .filter(|bytes| !bytes.is_empty())
             .map(|bytes| PackedSetup::try_from_bytes(&bytes).expect("packed setup"));
 
-        let mut moves = Vec::with_capacity(buf.remaining() / PackedUciMove::BYTES);
-        while buf.has_remaining() {
-            moves.push(unpack_uci_move(buf));
-        }
+        let moves = EncodedMoves::from_bytes(buf.copy_to_bytes(buf.remaining()).to_vec());
 
         Self {
             index_status,
@@ -317,20 +326,45 @@ impl Arbitrary<'_> for LichessGame {
             outcome: u.arbitrary()?,
             speed: u.arbitrary()?,
             rating_mode: u.arbitrary()?,
-            setup: Option::<VariantPosition>::arbitrary(u)?.map(|pos| {
-                PackedSetup::pack_variant(
-                    &pos.to_setup(shakmaty::EnPassantMode::Always),
-                    pos.variant(),
+            setup: None,
+            moves: EncodedMoves::from_bytes(vec![0x80]),
+        })
+        .map(|mut game| {
+            // Random legal game from a random (or the standard) position.
+            let start = Option::<VariantPosition>::arbitrary(u)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| VariantPosition::new(Variant::Chess));
+            game.setup = (start.variant() != Variant::Chess
+                || start != VariantPosition::new(Variant::Chess))
+            .then(|| {
+                PackedSetup::pack_variant_normalized(
+                    &start.to_setup(shakmaty::EnPassantMode::Legal),
+                    start.variant(),
                 )
                 .expect("can losslessly pack position")
-            }),
-            moves: Vec::<UciMove>::arbitrary(u)?
-                .into_iter()
-                .map(PackedUciMove::pack)
-                .collect(),
+            });
+            let mut pos = game.initial_position().expect("packed setup roundtrip");
+            let mut encoder = MoveEncoder::new();
+            let plies = u.int_in_range(0..=100).unwrap_or(0);
+            for _ in 0..plies {
+                let legals = pos.legal_moves();
+                if legals.is_empty() {
+                    break;
+                }
+                let Ok(m) = u.choose(&legals) else { break };
+                encoder.push(&pos, *m).expect("encodable legal move");
+                pos.play_unchecked(*m);
+            }
+            game.moves = encoder.finish();
+            game
         })
     }
 }
+
+#[derive(Debug, Error)]
+#[error("invalid setup")]
+pub struct InvalidSetup;
 
 #[cfg(test)]
 mod tests {

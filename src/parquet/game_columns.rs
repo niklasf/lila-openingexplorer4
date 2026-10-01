@@ -13,7 +13,7 @@ use parquet::{
     },
     schema::types::{ColumnPath, Type, TypePtr},
 };
-use shakmaty::{ByColor, Outcome, packed::PackedUciMove};
+use shakmaty::{ByColor, Outcome};
 use thiserror::Error;
 
 use crate::{
@@ -325,11 +325,7 @@ impl GameColumns {
         self.setup
             .push(game.setup.map(|setup| ByteArray::from(setup.as_bytes())));
 
-        let mut moves = Vec::with_capacity(game.moves.len() * PackedUciMove::BYTES);
-        for m in game.moves {
-            moves.extend_from_slice(&m.to_bytes());
-        }
-        self.moves.push(ByteArray::from(moves));
+        self.moves.push(ByteArray::from(game.moves.into_bytes()));
     }
 
     pub fn write_row_group<W>(
@@ -499,7 +495,7 @@ mod tests {
     use arbtest::arbtest;
 
     use super::*;
-    use crate::packed::LichessGame;
+    use crate::packed::{EncodedMoves, LichessGame};
 
     #[test]
     fn test_pack_lichess_game_matches_pack_entire() {
@@ -568,7 +564,7 @@ mod tests {
             speed: Some(Speed::Blitz),
             rating_mode: RatingMode::Rated,
             setup: None,
-            moves: Vec::new(),
+            moves: EncodedMoves::from_bytes(vec![0x80]),
         });
         let row = columns.rows().next().expect("row");
         let mut buf = Vec::new();

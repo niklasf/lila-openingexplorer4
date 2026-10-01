@@ -166,13 +166,13 @@ fn main() -> io::Result<()> {
                         let mut value = Vec::new();
                         let packed = row.pack_lichess_game(&mut value).is_ok();
                         let desc = format!(
-                            "rg {i} row {j}: {} vs {} {:?}-{:?}-{:?} {} plies, packed {packed}",
+                            "rg {i} row {j}: {} vs {} {:?}-{:?}-{:?} {} move bytes, packed {packed}",
                             String::from_utf8_lossy(row.players.white.name),
                             String::from_utf8_lossy(row.players.black.name),
                             row.date_year,
                             row.date_month,
                             row.date_day,
-                            row.moves.len() / 2,
+                            row.moves.len(),
                         );
                         found
                             .lock()
