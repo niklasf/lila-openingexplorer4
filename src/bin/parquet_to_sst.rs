@@ -87,6 +87,9 @@ const SORT_BUCKET_BITS: u32 = 3;
 /// Bytes currently occupied by scratch files.
 static SCRATCH_USAGE: AtomicU64 = AtomicU64::new(0);
 
+/// Partitions written to SST files so far.
+static WRITTEN_PARTITIONS: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Parser)]
 struct Args {
     parquet: PathBuf,
@@ -127,6 +130,11 @@ struct Args {
     /// Stop after the scatter of the first pass (for benchmarking).
     #[clap(long)]
     scatter_only: bool,
+    /// Finish writing all partitions of a pass before scanning the input for
+    /// the next pass. Use when the input is on the output disk, so that the
+    /// scan does not compete with the SST writes.
+    #[clap(long)]
+    no_overlap: bool,
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]
     sst_block_size: usize,
@@ -642,6 +650,7 @@ fn main() -> io::Result<()> {
             for (memory_partition, partition) in sorted_rx {
                 let timer = Instant::now();
                 write_partition(&partition, memory_partition, sst, args.sst_threads);
+                WRITTEN_PARTITIONS.fetch_add(1, Ordering::Relaxed);
                 let stats = sst.stats.lock().expect("lock stats");
                 log(
                     progress,
@@ -657,6 +666,21 @@ fn main() -> io::Result<()> {
 
         for pass in 0..PASSES {
             progress.set_prefix(format!("pass {}/{}", pass + 1, PASSES));
+            if args.no_overlap && pass > 0 {
+                progress.set_message("waiting for previous pass");
+                let timer = Instant::now();
+                while WRITTEN_PARTITIONS.load(Ordering::Relaxed) < pass * MEMORY_PARTITIONS_PER_PASS
+                {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                log(
+                    progress,
+                    format!(
+                        "pass {pass}: waited {:.1?} for previous pass",
+                        timer.elapsed()
+                    ),
+                );
+            }
             progress.set_message("scattering");
             let timer = Instant::now();
             let (resident, scratch, throttled) = scatter_pass(
