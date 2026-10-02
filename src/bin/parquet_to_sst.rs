@@ -35,8 +35,8 @@ const RESIDENT_PARTITIONS_PER_PASS: usize = 1;
 const PARTITIONS_IN_MEMORY: u64 = 3;
 
 /// Assumed ratio of compressed scratch chunks to record bytes (measured
-/// about 0.79 with zstd level 1).
-const SCRATCH_RATIO: f64 = 0.85;
+/// about 0.79 with zstd level 1 and about 0.95 with LZ4).
+const SCRATCH_RATIO: f64 = 1.0;
 
 /// Fixed memory overhead for the parquet reader, rocksdb and allocator slack.
 const BASE_MEMORY: u64 = 4 << 30;
@@ -257,8 +257,9 @@ struct Args {
     /// Override the number of memory partitions.
     #[clap(long)]
     memory_partitions: Option<usize>,
-    /// Zstd level for scratch chunks (0 for LZ4).
-    #[clap(long, default_value = "1")]
+    /// Zstd level for scratch chunks, or 0 for LZ4. Zstd level 1 saves about
+    /// 17% scratch space at twice the compression cost.
+    #[clap(long, default_value = "0")]
     scratch_zstd_level: i32,
     /// Use the generic parquet column readers instead of the fast decoder
     /// (for benchmarking).
@@ -270,8 +271,8 @@ struct Args {
     /// Threads for reading the input (default: half of the threads).
     #[clap(long)]
     read_threads: Option<usize>,
-    /// Threads for compressing and writing scratch chunks (default: an
-    /// eighth of the threads).
+    /// Threads for compressing and writing scratch chunks (default: a fifth
+    /// of the threads).
     #[clap(long)]
     write_threads: Option<usize>,
     /// Threads for loading scratch files (default: a fifth of the threads).
@@ -712,7 +713,7 @@ fn main() -> io::Result<()> {
             .max(2)
     });
     let read_threads = args.read_threads.unwrap_or(threads / 2).max(1);
-    let write_threads = args.write_threads.unwrap_or(threads / 8).max(1);
+    let write_threads = args.write_threads.unwrap_or(threads / 5).max(1);
     let load_threads = args.load_threads.unwrap_or(threads / 5).max(1);
     let sst_threads = args.sst_threads.unwrap_or(threads / 4).max(2);
 
