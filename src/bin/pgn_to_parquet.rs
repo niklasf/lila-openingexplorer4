@@ -61,6 +61,9 @@ struct Args {
     /// Files converted in parallel. Each takes about three threads.
     #[clap(long)]
     jobs: Option<usize>,
+    /// Zstd compression level of the parquet file.
+    #[clap(long, default_value = "9")]
+    zstd_level: i32,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -71,16 +74,18 @@ struct FileStats {
     invalid: u64,
 }
 
-fn writer_properties() -> Arc<parquet::file::properties::WriterProperties> {
+fn writer_properties(zstd_level: i32) -> Arc<parquet::file::properties::WriterProperties> {
     Arc::new(
         GameColumns::properties()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(9).unwrap()))
+            .set_compression(Compression::ZSTD(
+                ZstdLevel::try_new(zstd_level).expect("valid zstd level"),
+            ))
             .build(),
     )
 }
 
 /// Converts one PGN file to a parquet part.
-fn convert_file(pgn: &Path, part: &Path) -> io::Result<FileStats> {
+fn convert_file(pgn: &Path, part: &Path, zstd_level: i32) -> io::Result<FileStats> {
     let mut stats = FileStats::default();
 
     thread::scope(|s| -> io::Result<()> {
@@ -106,9 +111,12 @@ fn convert_file(pgn: &Path, part: &Path) -> io::Result<FileStats> {
 
         let writer = s.spawn(move || {
             let file = File::create(part).expect("create parquet part");
-            let mut writer =
-                SerializedFileWriter::new(file, GameColumns::schema(), writer_properties())
-                    .expect("parquet writer");
+            let mut writer = SerializedFileWriter::new(
+                file,
+                GameColumns::schema(),
+                writer_properties(zstd_level),
+            )
+            .expect("parquet writer");
 
             let mut columns = GameColumns::default();
             let mut games = 0;
@@ -319,7 +327,7 @@ fn main() -> io::Result<()> {
                             done = cvar.wait(done).expect("wait appended");
                         }
                     }
-                    let result = convert_file(&args.pgns[i], &parts[i]);
+                    let result = convert_file(&args.pgns[i], &parts[i], args.zstd_level);
                     done_tx.send((i, result)).expect("send done");
                 }
             });
@@ -328,9 +336,12 @@ fn main() -> io::Result<()> {
 
         // Concatenate parts in order.
         let file = File::create(&args.out).expect("create output");
-        let mut writer =
-            SerializedFileWriter::new(file, GameColumns::schema(), writer_properties())
-                .expect("parquet writer");
+        let mut writer = SerializedFileWriter::new(
+            file,
+            GameColumns::schema(),
+            writer_properties(args.zstd_level),
+        )
+        .expect("parquet writer");
         let mut pending: std::collections::BTreeMap<usize, io::Result<FileStats>> =
             Default::default();
         let mut previous_ids = FxHashSet::default();

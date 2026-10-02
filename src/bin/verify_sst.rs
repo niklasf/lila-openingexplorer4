@@ -30,7 +30,7 @@ struct Args {
     #[clap(long, default_value = "16")]
     threads: usize,
     /// Only verify games of the given memory partition (SST files named
-    /// `games_{partition:03}_*`).
+    /// `games_{partition:04}_*`).
     #[clap(long)]
     partition: Option<usize>,
     /// Number of memory partition bits used by parquet_to_sst.
@@ -59,7 +59,7 @@ fn main() -> io::Result<()> {
             args.partition.is_none_or(|p| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(&format!("games_{p:03}_")))
+                    .is_some_and(|name| name.starts_with(&format!("games_{p:04}_")))
             })
         })
         .collect();

@@ -26,31 +26,173 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
 
-/// One pass over the input for each disk partition. All memory partitions of
-/// a disk partition, except the resident ones, must fit into scratch space at
-/// the same time.
-const DISK_PARTITION_BITS: u32 = 1;
-
-/// Each memory partition must fit into memory at once. Up to three memory
-/// partitions are in memory at the same time: one being written to SST files,
-/// one being loaded and sorted, and one resident partition of the next pass.
-const MEMORY_PARTITION_BITS: u32 = 6;
-
-const _: () = assert!(MEMORY_PARTITION_BITS >= DISK_PARTITION_BITS);
-
-const PASSES: usize = 1 << DISK_PARTITION_BITS;
-
-const MEMORY_PARTITIONS_PER_PASS: usize = 1 << (MEMORY_PARTITION_BITS - DISK_PARTITION_BITS);
-
 /// Memory partitions per pass that are kept in memory while reading the
 /// input, rather than being written to scratch space and read back.
 const RESIDENT_PARTITIONS_PER_PASS: usize = 1;
 
-const _: () = assert!(RESIDENT_PARTITIONS_PER_PASS <= MEMORY_PARTITIONS_PER_PASS);
+/// Partitions in memory at the same time: one being written to SST files,
+/// one being loaded and sorted, and one resident partition of the next pass.
+const PARTITIONS_IN_MEMORY: u64 = 3;
 
-/// Memory partitions per pass that are written to scratch space.
-const SCRATCH_PARTITIONS_PER_PASS: usize =
-    MEMORY_PARTITIONS_PER_PASS - RESIDENT_PARTITIONS_PER_PASS;
+/// Assumed ratio of compressed scratch chunks to record bytes (measured
+/// about 0.79 with zstd level 1).
+const SCRATCH_RATIO: f64 = 0.85;
+
+/// Fixed memory overhead for the parquet reader, rocksdb and allocator slack.
+const BASE_MEMORY: u64 = 4 << 30;
+
+/// How the key space is split: `1 << disk_bits` passes over the input, each
+/// covering `1 << (memory_bits - disk_bits)` memory partitions.
+#[derive(Debug, Copy, Clone)]
+struct Layout {
+    memory_bits: u32,
+    disk_bits: u32,
+}
+
+impl Layout {
+    fn passes(self) -> usize {
+        1 << self.disk_bits
+    }
+
+    fn memory_partitions(self) -> usize {
+        1 << self.memory_bits
+    }
+
+    fn memory_partitions_per_pass(self) -> usize {
+        1 << (self.memory_bits - self.disk_bits)
+    }
+
+    fn scratch_partitions_per_pass(self) -> usize {
+        self.memory_partitions_per_pass() - RESIDENT_PARTITIONS_PER_PASS
+    }
+
+    /// Index of the memory partition within the given pass, or `None` if the
+    /// game belongs to a different pass.
+    fn pass_memory_partition(self, game_id: GameId, pass: usize) -> Option<usize> {
+        let memory_partition = game_id.partition(self.memory_bits);
+        let disk_partition = memory_partition >> (self.memory_bits - self.disk_bits);
+        (disk_partition == pass)
+            .then_some(memory_partition & (self.memory_partitions_per_pass() - 1))
+    }
+}
+
+/// Estimated data sizes, from a sample of row groups.
+struct Estimate {
+    rows: u64,
+    /// Record bytes (game id, length prefix and value) of all games.
+    record_bytes: u64,
+}
+
+impl Estimate {
+    fn sample(reader: &SerializedFileReader<PositionalFile>, num_row_groups: usize) -> Estimate {
+        let rows: u64 = (0..num_row_groups)
+            .map(|i| reader.metadata().row_group(i).num_rows() as u64)
+            .sum();
+        let samples = 256.min(num_row_groups);
+        let mut columns = FastGameColumns::default();
+        let mut value = Vec::new();
+        let (mut sampled_rows, mut sampled_bytes) = (0u64, 0u64);
+        for k in 0..samples {
+            let i = k * num_row_groups / samples;
+            columns
+                .read_columns(&*reader.get_row_group(i).expect("row group"))
+                .expect("read columns");
+            for row in columns.rows() {
+                value.clear();
+                sampled_rows += 1;
+                if row.pack_lichess_game(&mut value).is_ok() {
+                    sampled_bytes += (GameId::SIZE + LEN_PREFIX + value.len()) as u64;
+                }
+            }
+        }
+        let per_row = if sampled_rows == 0 {
+            0.0
+        } else {
+            sampled_bytes as f64 / sampled_rows as f64
+        };
+        Estimate {
+            rows,
+            // With a safety margin for sampling error.
+            record_bytes: (per_row * rows as f64 * 1.05) as u64,
+        }
+    }
+
+    /// Bytes of one memory partition in memory, including its index and
+    /// chunk slack.
+    fn partition_memory(&self, layout: Layout) -> u64 {
+        (self.record_bytes + 16 * self.rows) * 21 / 20 / layout.memory_partitions() as u64
+    }
+
+    /// Peak memory for the given layout and read threads.
+    fn memory(&self, layout: Layout, read_threads: u64) -> u64 {
+        let buffers = read_threads * layout.scratch_partitions_per_pass() as u64 * CHUNK_STRIDE;
+        BASE_MEMORY + PARTITIONS_IN_MEMORY * self.partition_memory(layout) + buffers
+    }
+
+    /// Scratch space needed by one pass.
+    fn scratch(&self, layout: Layout) -> u64 {
+        let per_partition =
+            self.record_bytes as f64 * SCRATCH_RATIO / layout.memory_partitions() as f64;
+        (per_partition * layout.scratch_partitions_per_pass() as f64) as u64
+    }
+
+    /// Picks the fewest passes that fit the scratch budget, and the fewest
+    /// memory partitions that fit the memory budget.
+    fn layout(
+        &self,
+        memory_budget: u64,
+        scratch_budget: u64,
+        read_threads: u64,
+        passes: Option<usize>,
+        memory_partitions: Option<usize>,
+    ) -> Layout {
+        let mut layout = Layout {
+            memory_bits: 0,
+            disk_bits: 0,
+        };
+        if let Some(passes) = passes {
+            layout.disk_bits = passes.max(1).next_power_of_two().trailing_zeros();
+        }
+        if let Some(partitions) = memory_partitions {
+            layout.memory_bits = partitions
+                .max(1)
+                .next_power_of_two()
+                .trailing_zeros()
+                .max(layout.disk_bits);
+        }
+        loop {
+            let fits_memory = self.memory(layout, read_threads) <= memory_budget;
+            let fits_scratch = self.scratch(layout) <= scratch_budget;
+            if (fits_memory || memory_partitions.is_some()) && (fits_scratch || passes.is_some()) {
+                return layout;
+            }
+            if !fits_scratch && passes.is_none() && layout.disk_bits < layout.memory_bits {
+                layout.disk_bits += 1;
+            } else if memory_partitions.is_none() {
+                layout.memory_bits += 1;
+            } else {
+                layout.disk_bits += 1;
+            }
+            assert!(layout.memory_bits <= 13, "no layout fits the budgets");
+        }
+    }
+}
+
+fn total_memory() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+fn free_space(path: &Path) -> Option<u64> {
+    let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { mem::zeroed() };
+    if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
 
 /// Records are collected in chunks. A chunk is full once it reaches this
 /// size; a record never spans chunks.
@@ -96,10 +238,25 @@ struct Args {
     /// Directory for temporary partition files.
     #[clap(long)]
     scratch: PathBuf,
-    /// Maximum bytes to use in scratch space. The scatter of a pass is
-    /// throttled while the previous pass is still freeing scratch space.
-    #[clap(long, default_value = "690000000000")]
-    scratch_budget: u64,
+    /// Maximum bytes to use in scratch space. Determines the number of
+    /// passes over the input. Defaults to 90% of the free space of the
+    /// scratch directory.
+    #[clap(long)]
+    scratch_budget: Option<u64>,
+    /// Maximum bytes of memory to use. Determines the number of memory
+    /// partitions. Defaults to 60% of the total memory.
+    #[clap(long)]
+    memory_budget: Option<u64>,
+    /// Threads to use in total. Defaults to the available parallelism minus
+    /// two, to leave one physical core idle.
+    #[clap(long)]
+    threads: Option<usize>,
+    /// Override the number of passes over the input.
+    #[clap(long)]
+    passes: Option<usize>,
+    /// Override the number of memory partitions.
+    #[clap(long)]
+    memory_partitions: Option<usize>,
     /// Zstd level for scratch chunks (0 for LZ4).
     #[clap(long, default_value = "1")]
     scratch_zstd_level: i32,
@@ -110,26 +267,28 @@ struct Args {
     /// Directory for the final SST files.
     #[clap(long)]
     out: PathBuf,
-    /// Threads for reading the input. Decoding is bound by physical cores,
-    /// and leaving headroom keeps SST writing at disk speed while the next
-    /// pass is scattered.
-    #[clap(long, default_value = "16")]
-    read_threads: usize,
-    /// Threads for compressing and writing scratch chunks.
-    #[clap(long, default_value = "4")]
-    write_threads: usize,
-    /// Threads for loading scratch files.
-    #[clap(long, default_value = "6")]
-    load_threads: usize,
-    /// Threads for writing SST files.
-    #[clap(long, default_value = "8")]
-    sst_threads: usize,
+    /// Threads for reading the input (default: half of the threads).
+    #[clap(long)]
+    read_threads: Option<usize>,
+    /// Threads for compressing and writing scratch chunks (default: an
+    /// eighth of the threads).
+    #[clap(long)]
+    write_threads: Option<usize>,
+    /// Threads for loading scratch files (default: a fifth of the threads).
+    #[clap(long)]
+    load_threads: Option<usize>,
+    /// Threads for writing SST files (default: a quarter of the threads).
+    #[clap(long)]
+    sst_threads: Option<usize>,
     /// Only process the first row groups of the input (for benchmarking).
     #[clap(long)]
     row_groups: Option<usize>,
     /// Stop after the scatter of the first pass (for benchmarking).
     #[clap(long)]
     scatter_only: bool,
+    /// Only print the estimated sizes and the chosen layout.
+    #[clap(long)]
+    plan_only: bool,
     /// Finish writing all partitions of a pass before scanning the input for
     /// the next pass. Use when the input is on the output disk, so that the
     /// scan does not compete with the SST writes.
@@ -254,10 +413,10 @@ impl MemoryPartition {
     }
 
     /// Sorts the index by game id, in parallel over sub-buckets of the key
-    /// range.
-    fn sort(&mut self, threads: usize) {
+    /// range. All entries must belong to one memory partition of `layout`.
+    fn sort(&mut self, layout: Layout, threads: usize) {
         let buckets = 1 << SORT_BUCKET_BITS;
-        let bits = MEMORY_PARTITION_BITS + SORT_BUCKET_BITS;
+        let bits = layout.memory_bits + SORT_BUCKET_BITS;
         let mut bucketed: Vec<Vec<(GameId, u64)>> = (0..buckets).map(|_| Vec::new()).collect();
         for entry in self.index.drain(..) {
             bucketed[entry.0.partition(bits) & (buckets - 1)].push(entry);
@@ -545,20 +704,51 @@ impl SstStats {
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
-    // Leave one physical core (two hardware threads) idle.
-    let parallelism = thread::available_parallelism()
-        .map_or(1, NonZeroUsize::get)
-        .saturating_sub(2)
-        .max(2);
-    let read_threads = args.read_threads.min(parallelism);
+    // Leave one physical core (two hardware threads) idle by default.
+    let threads = args.threads.unwrap_or_else(|| {
+        thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .saturating_sub(2)
+            .max(2)
+    });
+    let read_threads = args.read_threads.unwrap_or(threads / 2).max(1);
+    let write_threads = args.write_threads.unwrap_or(threads / 8).max(1);
+    let load_threads = args.load_threads.unwrap_or(threads / 5).max(1);
+    let sst_threads = args.sst_threads.unwrap_or(threads / 4).max(2);
+
+    let memory_budget = args
+        .memory_budget
+        .unwrap_or_else(|| total_memory().expect("total memory; pass --memory-budget") / 10 * 6);
+    let scratch_budget = args.scratch_budget.unwrap_or_else(|| {
+        free_space(&args.scratch).expect("free scratch space; pass --scratch-budget") / 10 * 9
+    });
 
     let reader = SerializedFileReader::new(PositionalFile::open(&args.parquet)?)?;
     let num_row_groups = args.row_groups.map_or(reader.num_row_groups(), |limit| {
         limit.min(reader.num_row_groups())
     });
-    let num_rows: u64 = (0..num_row_groups)
-        .map(|i| reader.metadata().row_group(i).num_rows() as u64)
-        .sum();
+
+    let estimate = Estimate::sample(&reader, num_row_groups);
+    let num_rows = estimate.rows;
+    let layout = estimate.layout(
+        memory_budget,
+        scratch_budget,
+        read_threads as u64,
+        args.passes,
+        args.memory_partitions,
+    );
+    eprintln!(
+        "{} games, about {} GB of records; {} passes with {} memory partitions each, about {} GB scratch per pass and {} GB memory; threads: {read_threads} read, {write_threads} write, {load_threads} load, {sst_threads} sst",
+        num_rows,
+        estimate.record_bytes >> 30,
+        layout.passes(),
+        layout.memory_partitions_per_pass(),
+        estimate.scratch(layout) >> 30,
+        estimate.memory(layout, read_threads as u64) >> 30,
+    );
+    if args.plan_only {
+        return Ok(());
+    }
 
     let mut sst_opts = Options::default();
     sst_opts.set_compression_type(DBCompressionType::Zstd);
@@ -587,7 +777,7 @@ fn main() -> io::Result<()> {
     let started = Instant::now();
 
     let progress = ProgressBar::with_draw_target(
-        Some(num_rows * PASSES as u64),
+        Some(num_rows * layout.passes() as u64),
         ProgressDrawTarget::stdout_with_hz(4),
     )
     .with_style(
@@ -614,7 +804,7 @@ fn main() -> io::Result<()> {
                 let mut partition = match job.source {
                     PartitionSource::Resident(partition) => partition,
                     PartitionSource::Scratch(scratch) => {
-                        let partition = scratch.load(args.load_threads);
+                        let partition = scratch.load(load_threads);
                         scratch.remove().expect("remove scratch");
                         partition
                     }
@@ -622,7 +812,7 @@ fn main() -> io::Result<()> {
                 let load = timer.elapsed();
 
                 let timer = Instant::now();
-                partition.sort(args.load_threads);
+                partition.sort(layout, load_threads);
                 if let Err(game_id) = partition.check_unique() {
                     // Duplicates must be resolved when creating the parquet
                     // file. Exit instead of panicking, which would leave the
@@ -649,7 +839,7 @@ fn main() -> io::Result<()> {
         s.spawn(move || {
             for (memory_partition, partition) in sorted_rx {
                 let timer = Instant::now();
-                write_partition(&partition, memory_partition, sst, args.sst_threads);
+                write_partition(&partition, memory_partition, sst, sst_threads);
                 WRITTEN_PARTITIONS.fetch_add(1, Ordering::Relaxed);
                 let stats = sst.stats.lock().expect("lock stats");
                 log(
@@ -664,12 +854,13 @@ fn main() -> io::Result<()> {
             }
         });
 
-        for pass in 0..PASSES {
-            progress.set_prefix(format!("pass {}/{}", pass + 1, PASSES));
+        for pass in 0..layout.passes() {
+            progress.set_prefix(format!("pass {}/{}", pass + 1, layout.passes()));
             if args.no_overlap && pass > 0 {
                 progress.set_message("waiting for previous pass");
                 let timer = Instant::now();
-                while WRITTEN_PARTITIONS.load(Ordering::Relaxed) < pass * MEMORY_PARTITIONS_PER_PASS
+                while WRITTEN_PARTITIONS.load(Ordering::Relaxed)
+                    < pass * layout.memory_partitions_per_pass()
                 {
                     thread::sleep(Duration::from_millis(100));
                 }
@@ -691,9 +882,10 @@ fn main() -> io::Result<()> {
                     scratch: &args.scratch,
                     codec: ChunkCodec::from_level(args.scratch_zstd_level),
                     // The first pass has nothing to wait for.
-                    budget: (pass > 0).then_some(args.scratch_budget),
+                    budget: (pass > 0).then_some(scratch_budget),
+                    layout,
                     read_threads,
-                    write_threads: args.write_threads,
+                    write_threads,
                     generic_reader: args.generic_reader,
                 },
                 progress,
@@ -728,7 +920,8 @@ fn main() -> io::Result<()> {
             for (memory_partition, file) in scratch.into_iter().enumerate() {
                 job_tx
                     .send(PartitionJob {
-                        memory_partition: pass * MEMORY_PARTITIONS_PER_PASS + memory_partition,
+                        memory_partition: pass * layout.memory_partitions_per_pass()
+                            + memory_partition,
                         source: PartitionSource::Scratch(file),
                     })
                     .expect("send job");
@@ -762,6 +955,7 @@ struct ScatterConfig<'a> {
     /// Scratch budget to throttle against, if the previous pass is still
     /// freeing scratch space.
     budget: Option<u64>,
+    layout: Layout,
     read_threads: usize,
     write_threads: usize,
     generic_reader: bool,
@@ -778,9 +972,11 @@ fn scatter_pass(
     config: &ScatterConfig<'_>,
     progress: &ProgressBar,
 ) -> io::Result<(Resident, Vec<ScratchFile>, Duration)> {
-    let first_memory_partition = pass * MEMORY_PARTITIONS_PER_PASS;
+    let layout = config.layout;
+    let scratch_partitions = layout.scratch_partitions_per_pass();
+    let first_memory_partition = pass * layout.memory_partitions_per_pass();
 
-    let files: Vec<Mutex<ScratchFile>> = (0..SCRATCH_PARTITIONS_PER_PASS)
+    let files: Vec<Mutex<ScratchFile>> = (0..scratch_partitions)
         .map(|i| {
             Ok::<_, io::Error>(Mutex::new(ScratchFile::create(
                 config
@@ -840,9 +1036,8 @@ fn scatter_pass(
                 let mut local_resident: Vec<MemoryPartition> = (0..RESIDENT_PARTITIONS_PER_PASS)
                     .map(|_| MemoryPartition::default())
                     .collect();
-                let mut chunks: Vec<Vec<u8>> = (0..SCRATCH_PARTITIONS_PER_PASS)
-                    .map(|_| new_chunk())
-                    .collect();
+                let mut chunks: Vec<Vec<u8>> =
+                    (0..scratch_partitions).map(|_| new_chunk()).collect();
                 let mut generic = GameColumns::default();
                 let mut fast = FastGameColumns::default();
                 let mut skipped = 0;
@@ -850,12 +1045,12 @@ fn scatter_pass(
                 let mut route = |row: GameRow<'_>,
                                  local_resident: &mut Vec<MemoryPartition>,
                                  chunks: &mut Vec<Vec<u8>>| {
-                    let Some(j) = pass_memory_partition(row.game_id, pass) else {
+                    let Some(j) = layout.pass_memory_partition(row.game_id, pass) else {
                         return;
                     };
                     let pack = |buf: &mut Vec<u8>| row.pack_lichess_game(buf);
-                    if j >= SCRATCH_PARTITIONS_PER_PASS {
-                        if local_resident[j - SCRATCH_PARTITIONS_PER_PASS]
+                    if j >= scratch_partitions {
+                        if local_resident[j - scratch_partitions]
                             .push(row.game_id, pack)
                             .is_err()
                         {
@@ -934,7 +1129,7 @@ fn scatter_pass(
         .enumerate()
         .map(|(i, parts)| {
             (
-                first_memory_partition + SCRATCH_PARTITIONS_PER_PASS + i,
+                first_memory_partition + scratch_partitions + i,
                 MemoryPartition::merge(parts),
             )
         })
@@ -945,14 +1140,6 @@ fn scatter_pass(
         files,
         Duration::from_nanos(throttled_nanos.load(Ordering::Relaxed)),
     ))
-}
-
-/// Index of the memory partition within the given pass, or `None` if the
-/// game belongs to a different pass.
-fn pass_memory_partition(game_id: GameId, pass: usize) -> Option<usize> {
-    let memory_partition = game_id.partition(MEMORY_PARTITION_BITS);
-    let disk_partition = memory_partition >> (MEMORY_PARTITION_BITS - DISK_PARTITION_BITS);
-    (disk_partition == pass).then_some(memory_partition & (MEMORY_PARTITIONS_PER_PASS - 1))
 }
 
 /// Writes a sorted partition to non-overlapping SST files.
@@ -991,7 +1178,7 @@ fn write_partition(
                         partition,
                         index,
                         sst,
-                        &format!("games_{memory_partition:03}_{range:05}"),
+                        &format!("games_{memory_partition:04}_{range:05}"),
                     )
                     .expect("write sst files");
                 }
@@ -1084,7 +1271,11 @@ mod tests {
                 })
                 .unwrap();
         }
-        partition.sort(3);
+        let layout = Layout {
+            memory_bits: 0,
+            disk_bits: 0,
+        };
+        partition.sort(layout, 3);
         assert_eq!(partition.check_unique(), Err(id("abcdefgh")));
         let result: Vec<(GameId, Vec<u8>)> = partition
             .index
@@ -1100,7 +1291,11 @@ mod tests {
     fn test_sort_many() {
         let mut partition = MemoryPartition::default();
         // All ids within the first memory partition, as in production.
-        let span = 62u64.pow(8) >> MEMORY_PARTITION_BITS;
+        let layout = Layout {
+            memory_bits: 6,
+            disk_bits: 1,
+        };
+        let span = 62u64.pow(8) >> layout.memory_bits;
         let mut ids: Vec<GameId> = (0..5000u64)
             .map(|i| {
                 let n = (i * 7919 * 1_000_003) % span;
@@ -1110,7 +1305,7 @@ mod tests {
         for game_id in &ids {
             partition.push::<()>(*game_id, |_| Ok(())).unwrap();
         }
-        partition.sort(4);
+        partition.sort(layout, 4);
         ids.sort();
         assert_eq!(partition.index.iter().map(|e| e.0).collect::<Vec<_>>(), ids);
     }
