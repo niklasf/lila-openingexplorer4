@@ -712,11 +712,6 @@ fn main() -> io::Result<()> {
             .saturating_sub(2)
             .max(2)
     });
-    let read_threads = args.read_threads.unwrap_or(threads / 2).max(1);
-    let write_threads = args.write_threads.unwrap_or(threads / 5).max(1);
-    let load_threads = args.load_threads.unwrap_or(threads / 5).max(1);
-    let sst_threads = args.sst_threads.unwrap_or(threads / 4).max(2);
-
     let memory_budget = args
         .memory_budget
         .unwrap_or_else(|| total_memory().expect("total memory; pass --memory-budget") / 10 * 6);
@@ -731,13 +726,38 @@ fn main() -> io::Result<()> {
 
     let estimate = Estimate::sample(&reader, num_row_groups);
     let num_rows = estimate.rows;
-    let layout = estimate.layout(
+    // The layout depends on the read threads (buffers), which depend on the
+    // layout (overlap). Resolve with the smaller read thread count first.
+    let provisional_read_threads = args.read_threads.unwrap_or(threads / 2).max(1);
+    let mut layout = estimate.layout(
         memory_budget,
         scratch_budget,
-        read_threads as u64,
+        provisional_read_threads as u64,
         args.passes,
         args.memory_partitions,
     );
+    // With a single pass the scan and the partition writes never overlap, so
+    // each phase can use all threads. With several passes the scan of the
+    // next pass runs while partitions are written.
+    let single_pass = layout.passes() == 1 || args.no_overlap;
+    let (read_default, write_default, load_default, sst_default) = if single_pass {
+        (threads * 3 / 4, threads / 4, threads / 3, threads * 2 / 3)
+    } else {
+        (threads / 2, threads / 5, threads / 5, threads / 4)
+    };
+    let read_threads = args.read_threads.unwrap_or(read_default).max(1);
+    let write_threads = args.write_threads.unwrap_or(write_default).max(1);
+    let load_threads = args.load_threads.unwrap_or(load_default).max(1);
+    let sst_threads = args.sst_threads.unwrap_or(sst_default).max(2);
+    if read_threads > provisional_read_threads {
+        layout = estimate.layout(
+            memory_budget,
+            scratch_budget,
+            read_threads as u64,
+            args.passes,
+            args.memory_partitions,
+        );
+    }
     eprintln!(
         "{} games, about {} GB of records; {} passes with {} memory partitions each, about {} GB scratch per pass and {} GB memory; threads: {read_threads} read, {write_threads} write, {load_threads} load, {sst_threads} sst",
         num_rows,
