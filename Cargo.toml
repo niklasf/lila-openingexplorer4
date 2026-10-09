@@ -18,7 +18,7 @@ pgn-reader = { version = "0.28.0", git = "https://github.com/niklasf/shakmaty.gi
 roaring = "0.11.4"
 rocksdb = { version = "0.24.0", features = ["lz4", "zstd", "jemalloc"], default-features = false }
 rustc-hash = "2.1.1"
-shakmaty = { version = "0.29.0", git = "https://github.com/niklasf/shakmaty.git", branch = "incremental-zobrist-hash", features = ["arbitrary", "variant", "nohash-hasher"] }
+shakmaty = { version = "0.30.2", git = "https://github.com/niklasf/shakmaty.git", branch = "main", features = ["arbitrary", "variant", "nohash-hasher"] }
 thiserror = "2.0.12"
 tikv-jemallocator = "0.6.1"
 zstd = "0.13.3"

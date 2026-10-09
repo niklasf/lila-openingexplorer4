@@ -1,9 +1,13 @@
 use std::num::NonZero;
 
 use bytes::{Buf, BufMut};
-use shakmaty::{Bitboard, Move, Position, Rank, Role, Square, attacks, variant::VariantPosition};
+use shakmaty::{
+    Bitboard, Move, Position, Rank, Role, Square, attacks,
+    variant::{VariantPosition, WithPosition},
+};
 use thiserror::Error;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackedMoves(pub Vec<u8>);
 
 impl PackedMoves {
@@ -17,13 +21,17 @@ impl PackedMoves {
         PackedMoves(bytes)
     }
 
+    pub fn encoder() -> PackedMovesEncoder {
+        PackedMovesEncoder::default()
+    }
+
     pub fn encode(pos: &mut VariantPosition, moves: impl IntoIterator<Item = Move>) -> Self {
-        let mut writer = BitWriter::default();
+        let mut encoder = PackedMovesEncoder::default();
         for m in moves {
-            encode_move(&mut writer, pos, m);
+            encoder.encode_next(pos, m);
             pos.play_unchecked(m);
         }
-        PackedMoves(writer.finish())
+        encoder.finish()
     }
 
     pub fn decode(&self) -> Result<PackedMovesDecoder<'_>, InvalidPackedMoves> {
@@ -32,20 +40,69 @@ impl PackedMoves {
     }
 }
 
+#[derive(Default)]
+pub struct PackedMovesEncoder {
+    writer: BitWriter,
+}
+
+impl PackedMovesEncoder {
+    #[inline]
+    pub fn encode_next(&mut self, pos: &VariantPosition, m: Move) {
+        struct EncodeMove<'a> {
+            writer: &'a mut BitWriter,
+            m: Move,
+        }
+
+        impl WithPosition for EncodeMove<'_> {
+            type Output = ();
+
+            #[inline]
+            fn call<P: Position>(self, pos: &P) {
+                encode_move(self.writer, pos, self.m);
+            }
+        }
+
+        pos.with_position(EncodeMove {
+            writer: &mut self.writer,
+            m,
+        });
+    }
+
+    pub fn finish(self) -> PackedMoves {
+        PackedMoves(self.writer.finish())
+    }
+}
+
 pub struct PackedMovesDecoder<'a> {
     reader: BitReader<'a>,
 }
 
 impl PackedMovesDecoder<'_> {
+    #[inline]
     pub fn decode_next(
         &mut self,
         pos: &VariantPosition,
     ) -> Result<Option<Move>, InvalidPackedMoves> {
-        if self.reader.has_remaining() {
-            Ok(Some(decode_move(&mut self.reader, pos)?))
-        } else {
-            Ok(None)
+        struct DecodeMove<'a, 'b> {
+            reader: &'a mut BitReader<'b>,
         }
+
+        impl WithPosition for DecodeMove<'_, '_> {
+            type Output = Result<Move, InvalidPackedMoves>;
+
+            #[inline]
+            fn call<P: Position>(self, pos: &P) -> Self::Output {
+                decode_move(self.reader, pos)
+            }
+        }
+
+        Ok(if self.reader.has_remaining() {
+            Some(pos.with_position(DecodeMove {
+                reader: &mut self.reader,
+            })?)
+        } else {
+            None
+        })
     }
 }
 
@@ -61,6 +118,7 @@ struct BitWriter {
 }
 
 impl BitWriter {
+    #[inline]
     fn write_bits(&mut self, value: u32, bits: u32) {
         debug_assert!(bits <= 32 && u64::from(value) < (1 << bits));
 
@@ -105,10 +163,12 @@ impl BitReader<'_> {
         })
     }
 
+    #[inline]
     fn has_remaining(&self) -> bool {
         self.pos < self.len
     }
 
+    #[inline]
     fn read_bits(&mut self, bits: u32) -> Result<u32, InvalidPackedMoves> {
         debug_assert!(bits <= 32);
 
@@ -129,20 +189,23 @@ impl BitReader<'_> {
     }
 }
 
+#[inline]
 fn bits_for(slots: usize) -> u32 {
     slots.next_power_of_two().ilog2()
 }
 
+#[inline]
 fn role_index(role: Role) -> u32 {
     u32::from(role) - 1
 }
 
+#[inline]
 fn square_index(sq: Square, mask: Bitboard) -> u32 {
     let below = mask & Bitboard((1 << u32::from(sq)) - 1);
     below.count() as u32
 }
 
-fn pseudo_legal_targets(pos: &VariantPosition, role: Role, from: Square) -> Bitboard {
+fn pseudo_legal_targets<P: Position>(pos: &P, role: Role, from: Square) -> Bitboard {
     match role {
         Role::Pawn => {
             let forward = pos.turn().fold_wb(8, -8);
@@ -168,7 +231,7 @@ fn pseudo_legal_targets(pos: &VariantPosition, role: Role, from: Square) -> Bitb
     }
 }
 
-fn encode_move(writer: &mut BitWriter, pos: &VariantPosition, m: Move) {
+fn encode_move<P: Position>(writer: &mut BitWriter, pos: &P, m: Move) {
     let piece_bits = bits_for(pos.us().count() + usize::from(pos.pockets().is_some()));
     if let Some(from) = m.from() {
         let targets = pseudo_legal_targets(pos, m.role(), from);
@@ -188,7 +251,7 @@ fn encode_move(writer: &mut BitWriter, pos: &VariantPosition, m: Move) {
     }
 }
 
-fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, InvalidPackedMoves> {
+fn decode_move<P: Position>(reader: &mut BitReader, pos: &P) -> Result<Move, InvalidPackedMoves> {
     let piece_bits = bits_for(pos.us().count() + usize::from(pos.pockets().is_some()));
     let piece_index = reader.read_bits(piece_bits)? as usize;
     if piece_index < pos.us().count() {
