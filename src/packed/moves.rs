@@ -1,15 +1,7 @@
 use std::num::NonZero;
 
-use bytes::Buf;
-use bytes::BufMut;
-use shakmaty::Bitboard;
-use shakmaty::Move;
-use shakmaty::Position;
-use shakmaty::Rank;
-use shakmaty::Role;
-use shakmaty::Square;
-use shakmaty::attacks;
-use shakmaty::variant::VariantPosition;
+use bytes::{Buf, BufMut};
+use shakmaty::{Bitboard, Move, Position, Rank, Role, Square, attacks, variant::VariantPosition};
 use thiserror::Error;
 
 pub struct PackedMoves(pub Vec<u8>);
@@ -205,6 +197,7 @@ fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, In
             .into_iter()
             .nth(piece_index)
             .ok_or(InvalidPackedMoves)?;
+
         let role = pos.board().role_at(from).ok_or(InvalidPackedMoves)?;
 
         let targets = pseudo_legal_targets(pos, role, from);
@@ -213,6 +206,19 @@ fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, In
             .into_iter()
             .nth(reader.read_bits(target_bits)? as usize)
             .ok_or(InvalidPackedMoves)?;
+
+        let promotion = if role == Role::Pawn && to.rank() == pos.turn().relative_rank(Rank::Eighth)
+        {
+            Some(
+                Role::try_from(reader.read_bits(bits_for(6))? + 1)
+                    .map_err(|_| InvalidPackedMoves)?,
+            )
+        } else {
+            if piece_bits == 0 && target_bits == 0 && reader.read_bits(1)? != 0 {
+                return Err(InvalidPackedMoves);
+            }
+            None
+        };
 
         Ok(if role == Role::King && pos.us().contains(to) {
             Move::Castle {
@@ -225,18 +231,6 @@ fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, In
         {
             Move::EnPassant { from, to }
         } else {
-            let promotion =
-                if role == Role::Pawn && to.rank() == pos.turn().relative_rank(Rank::Eighth) {
-                    Some(
-                        Role::try_from(reader.read_bits(bits_for(6))? + 1)
-                            .map_err(|_| InvalidPackedMoves)?,
-                    )
-                } else {
-                    if piece_bits == 0 && target_bits == 0 && reader.read_bits(1)? != 0 {
-                        return Err(InvalidPackedMoves);
-                    }
-                    None
-                };
             Move::Normal {
                 role,
                 from,
@@ -245,12 +239,14 @@ fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, In
                 promotion,
             }
         })
-    } else {
+    } else if piece_index == pos.us().count() && pos.pockets().is_some() {
         Ok(Move::Put {
             role: Role::try_from(reader.read_bits(bits_for(6))? + 1)
                 .map_err(|_| InvalidPackedMoves)?,
             to: Square::new(reader.read_bits(bits_for(64))?),
         })
+    } else {
+        Err(InvalidPackedMoves)
     }
 }
 
@@ -347,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_only_moves() {
+    fn test_forced_moves() {
         // shoopi, www.chess.com 6/11/2013, Mate In 8
         let mut pos = VariantPosition::Chess(
             "rk1KB3/b1q1QQQR/bnqQ1q2/1Rq1Q1q1/2q1rQ1q/6B1/6QQ/8 w - - 0 1"
@@ -367,6 +363,39 @@ mod tests {
             Some(m)
         })
         .collect();
+
+        let packed_moves = PackedMoves::encode(&mut pos.clone(), moves.iter().copied());
+
+        let mut decoder = packed_moves.decode().unwrap();
+        for m in moves {
+            let decoded = decoder.decode_next(&pos).unwrap().unwrap();
+            assert_eq!(decoded, m);
+            pos.play_unchecked(decoded);
+        }
+
+        assert!(decoder.decode_next(&pos).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_forced_en_passant() {
+        let mut pos = VariantPosition::Antichess(
+            "8/3p4/4p3/4P3/8/8/8/8 b - - 0 1"
+                .parse::<Fen>()
+                .unwrap()
+                .into_position(CastlingMode::Chess960)
+                .unwrap(),
+        );
+
+        let moves: Vec<Move> = ["d5", "exd6"]
+            .iter()
+            .scan(pos.clone(), |pos, san| {
+                let m = san.parse::<San>().unwrap().to_move(pos).unwrap();
+                pos.play_unchecked(m);
+                Some(m)
+            })
+            .collect();
+
+        assert!(moves[1].is_en_passant());
 
         let packed_moves = PackedMoves::encode(&mut pos.clone(), moves.iter().copied());
 
