@@ -243,7 +243,7 @@ impl FlatGame {
 
         let (mut pos, setup) = parsed.initial_position()?;
 
-        let mut encoder = PackedMoves::encoder();
+        let mut encoder = PackedMoves::encoder_with_capacity(parsed.moves.len());
 
         for san in &parsed.moves {
             let m = san.to_move(&pos).map_err(|err| {

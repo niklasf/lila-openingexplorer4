@@ -18,5 +18,5 @@ pub use game_id::{GameId, InvalidGameId};
 pub use int::{pack_int, pack_uint, unpack_int, unpack_uint};
 pub use lax_date::{InvalidLaxDate, LaxDate};
 pub use month::{InvalidMonth, Month};
-pub use moves::{InvalidPackedMoves, PackedMoves, PackedMovesDecoder};
+pub use moves::{InvalidPackedMoves, PackedMoves, PackedMovesDecoder, PackedMovesEncoder};
 pub use rating::{InvalidRating, Rating};

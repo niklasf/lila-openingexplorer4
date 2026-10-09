@@ -25,8 +25,18 @@ impl PackedMoves {
         PackedMovesEncoder::default()
     }
 
+    pub fn encoder_with_capacity(plies: usize) -> PackedMovesEncoder {
+        PackedMovesEncoder {
+            writer: BitWriter {
+                bytes: Vec::with_capacity(plies + 1),
+                ..BitWriter::default()
+            },
+        }
+    }
+
     pub fn encode(pos: &mut VariantPosition, moves: impl IntoIterator<Item = Move>) -> Self {
-        let mut encoder = PackedMovesEncoder::default();
+        let moves = moves.into_iter();
+        let mut encoder = PackedMoves::encoder_with_capacity(moves.size_hint().0);
         for m in moves {
             encoder.encode_next(pos, m);
             pos.play_unchecked(m);
