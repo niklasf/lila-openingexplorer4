@@ -2,7 +2,7 @@ use std::{io::Write, iter, sync::Arc};
 
 use bytes::{BufMut, Bytes};
 use parquet::{
-    basic::{LogicalType, Repetition, Type as PhysicalType},
+    basic::{Compression, LogicalType, Repetition, Type as PhysicalType},
     data_type::{ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int32Type},
     file::{
         properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder},
@@ -425,8 +425,10 @@ impl GameColumns {
             .set_data_page_row_count_limit(usize::MAX)
             .set_column_dictionary_enabled(ColumnPath::from("game_id"), false)
             .set_column_statistics_enabled(ColumnPath::from("game_id"), EnabledStatistics::None)
+            .set_column_compression(ColumnPath::from("game_id"), Compression::UNCOMPRESSED) // Random ids
             .set_column_dictionary_enabled(ColumnPath::from("moves"), false)
             .set_column_statistics_enabled(ColumnPath::from("moves"), EnabledStatistics::None)
+            .set_column_compression(ColumnPath::from("moves"), Compression::UNCOMPRESSED) // ~%7 for zstd -9 not worth it
             .set_column_dictionary_enabled(ColumnPath::from("setup"), false)
             .set_column_statistics_enabled(ColumnPath::from("setup"), EnabledStatistics::None)
     }

@@ -105,9 +105,15 @@ impl<T: ChunkReader + Clone + 'static> GameReader<T> {
             row_group,
             ProjectionMask::columns(self.metadata.parquet_schema(), ["game_id"]),
         )?;
-        let game_ids = batch.column(0).as_fixed_size_binary();
-        Ok((0..game_ids.len())
-            .map(|i| GameId::unpack(&mut game_ids.value(i)))
+
+        Ok(batch
+            .column(0)
+            .as_fixed_size_binary()
+            .value_data()
+            .as_chunks::<{ GameId::SIZE }>()
+            .0
+            .iter()
+            .map(|game_id| GameId::unpack(&mut game_id.as_slice()))
             .collect())
     }
 }
