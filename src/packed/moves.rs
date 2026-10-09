@@ -145,12 +145,26 @@ struct BitReader<'a> {
     bytes: &'a [u8],
     pos: usize,
     len: usize,
+    /// Last (up to) 8 bytes, zero padded, so that every read is a fixed
+    /// size load.
+    tail: u64,
+    tail_start: usize,
 }
 
 impl BitReader<'_> {
     fn new(bytes: &[u8]) -> Result<BitReader<'_>, InvalidPackedMoves> {
+        let tail_start = bytes.len().saturating_sub(8);
+        let tail = match bytes.last_chunk() {
+            Some(chunk) => u64::from_le_bytes(*chunk),
+            None => bytes
+                .iter()
+                .rev()
+                .fold(0, |acc, b| (acc << 8) | u64::from(*b)),
+        };
         Ok(BitReader {
             bytes,
+            tail,
+            tail_start,
             pos: 0,
             len: bytes.len() * 8
                 - bytes
@@ -176,12 +190,12 @@ impl BitReader<'_> {
             return Err(InvalidPackedMoves);
         }
 
-        let tail = &self.bytes[self.pos / 8..];
-        let n = tail.len().min(8);
-        let mut buf = [0; 8];
-        buf[..n].copy_from_slice(&tail[..n]);
-
-        let word = u64::from_le_bytes(buf) >> (self.pos % 8);
+        let start = self.pos / 8;
+        let word = if start < self.tail_start {
+            u64::from_le_bytes(*self.bytes[start..].first_chunk().expect("before tail"))
+        } else {
+            self.tail >> (8 * (start - self.tail_start))
+        } >> (self.pos % 8);
 
         self.pos += bits as usize;
 
