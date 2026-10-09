@@ -388,10 +388,7 @@ mod tests {
                 let mut pos = game.pos.clone();
                 for _ in 0..len {
                     let legals = pos.legal_moves();
-                    if legals.is_empty() {
-                        break;
-                    }
-                    let m = *u.choose(&legals)?;
+                    let Ok(&m) = u.choose(&legals) else { break };
                     pos.play_unchecked(m);
                     game.moves.push(m);
                 }

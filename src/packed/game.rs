@@ -3,14 +3,15 @@ use bitflags::bitflags;
 use btoi::btou;
 use bytes::{Buf, BufMut};
 use shakmaty::{
-    ByColor, Color, KnownOutcome, Outcome, Position,
+    ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Outcome, Position,
     packed::{PackedSetup, PackedUciMove},
-    uci::UciMove,
-    variant::VariantPosition,
+    variant::{Variant, VariantPosition},
 };
 use thiserror::Error;
 
-use crate::packed::{LaxDate, Rating, pack_bytes, pack_string, unpack_bytes, unpack_string};
+use crate::packed::{
+    LaxDate, PackedMoves, Rating, pack_bytes, pack_string, unpack_bytes, unpack_string,
+};
 
 pub fn unpack_uci_move<B: Buf>(buf: &mut B) -> PackedUciMove {
     let mut bytes = [0; PackedUciMove::BYTES];
@@ -256,10 +257,21 @@ pub struct LichessGame {
     pub speed: Speed,
     pub rating_mode: RatingMode,
     pub setup: Option<PackedSetup>,
-    pub moves: Vec<PackedUciMove>,
+    pub moves: PackedMoves,
 }
 
 impl LichessGame {
+    pub fn initial_position(&self) -> Result<VariantPosition, InvalidSetup> {
+        match &self.setup {
+            None => Ok(VariantPosition::new(Variant::Chess)),
+            Some(setup) => {
+                let (setup, variant) = setup.unpack_variant().map_err(|_| InvalidSetup)?;
+                VariantPosition::from_setup(variant, setup, CastlingMode::Chess960)
+                    .map_err(|_| InvalidSetup)
+            }
+        }
+    }
+
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
         self.index_status.pack(buf);
         self.players.white.pack(buf);
@@ -271,9 +283,7 @@ impl LichessGame {
             buf,
             self.setup.as_ref().map_or(b"", |setup| setup.as_bytes()),
         );
-        for m in &self.moves {
-            buf.put_slice(&m.to_bytes());
-        }
+        self.moves.pack_entire(buf);
     }
 
     pub fn unpack_entire<B: Buf>(buf: &mut B) -> Self {
@@ -290,10 +300,7 @@ impl LichessGame {
             .filter(|bytes| !bytes.is_empty())
             .map(|bytes| PackedSetup::try_from_bytes(&bytes).expect("packed setup"));
 
-        let mut moves = Vec::with_capacity(buf.remaining() / PackedUciMove::BYTES);
-        while buf.has_remaining() {
-            moves.push(unpack_uci_move(buf));
-        }
+        let moves = PackedMoves::unpack_entire(buf);
 
         Self {
             index_status,
@@ -310,6 +317,19 @@ impl LichessGame {
 
 impl Arbitrary<'_> for LichessGame {
     fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        let setup = Option::<VariantPosition>::arbitrary(u)?;
+
+        let mut packed_moves = PackedMoves::encoder();
+        let mut pos = setup
+            .clone()
+            .unwrap_or_else(|| VariantPosition::new(Variant::Chess));
+        for _ in 0..u.arbitrary_len::<usize>()? {
+            let legals = pos.legal_moves();
+            let Ok(&m) = u.choose(&legals) else { break };
+            packed_moves.encode_next(&pos, m);
+            pos.play_unchecked(m);
+        }
+
         Ok(LichessGame {
             index_status: u.arbitrary()?,
             players: u.arbitrary()?,
@@ -317,20 +337,21 @@ impl Arbitrary<'_> for LichessGame {
             outcome: u.arbitrary()?,
             speed: u.arbitrary()?,
             rating_mode: u.arbitrary()?,
-            setup: Option::<VariantPosition>::arbitrary(u)?.map(|pos| {
-                PackedSetup::pack_variant(
-                    &pos.to_setup(shakmaty::EnPassantMode::Always),
-                    pos.variant(),
+            setup: setup.map(|s| {
+                PackedSetup::pack_variant_normalized(
+                    &s.to_setup(EnPassantMode::Always),
+                    s.variant(),
                 )
-                .expect("can losslessly pack position")
+                .expect("packed setup")
             }),
-            moves: Vec::<UciMove>::arbitrary(u)?
-                .into_iter()
-                .map(PackedUciMove::pack)
-                .collect(),
+            moves: packed_moves.finish(),
         })
     }
 }
+
+#[derive(Debug, Error)]
+#[error("invalid setup")]
+pub struct InvalidSetup;
 
 #[cfg(test)]
 mod tests {
