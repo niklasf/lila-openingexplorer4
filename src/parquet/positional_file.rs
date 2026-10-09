@@ -9,6 +9,7 @@ use std::{
 
 use bytes::Bytes;
 
+#[derive(Clone)]
 pub struct PositionalFile {
     file: Arc<File>,
     len: u64,

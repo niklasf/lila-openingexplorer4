@@ -1,0 +1,321 @@
+use std::sync::Arc;
+
+use arrow_array::{
+    Array, BinaryArray, DictionaryArray, FixedSizeBinaryArray, Int32Array, RecordBatch,
+    RecordBatchReader, StringArray, cast::AsArray, types::Int32Type,
+};
+use arrow_schema::{DataType, Schema};
+use parquet::{
+    arrow::{
+        ProjectionMask,
+        arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
+    },
+    errors::Result,
+    file::{
+        metadata::{ParquetMetaData, ParquetMetaDataReader},
+        reader::ChunkReader,
+    },
+};
+use shakmaty::ByColor;
+
+use crate::{
+    packed::GameId,
+    parquet::{GameRow, PlayerRow},
+};
+
+const DICTIONARY_COLUMNS: [&str; 5] = [
+    "white_title",
+    "black_title",
+    "outcome",
+    "speed",
+    "rating_mode",
+];
+
+pub struct GameReader<T> {
+    input: T,
+    metadata: ArrowReaderMetadata,
+}
+
+impl<T: ChunkReader + Clone + 'static> GameReader<T> {
+    pub fn try_new(input: T) -> Result<GameReader<T>> {
+        let metadata = ParquetMetaDataReader::new().parse_and_finish(&input)?;
+        GameReader::new_with_metadata(input, Arc::new(metadata))
+    }
+
+    pub fn new_with_metadata(
+        input: T,
+        parquet_metadata: Arc<ParquetMetaData>,
+    ) -> Result<GameReader<T>> {
+        let schema = Schema::new(
+            ArrowReaderMetadata::try_new(Arc::clone(&parquet_metadata), ArrowReaderOptions::new())?
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| {
+                    if DICTIONARY_COLUMNS.contains(&field.name().as_str()) {
+                        Arc::new(field.as_ref().clone().with_data_type(DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(DataType::Utf8),
+                        )))
+                    } else {
+                        Arc::clone(field)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let metadata = ArrowReaderMetadata::try_new(
+            parquet_metadata,
+            ArrowReaderOptions::new().with_schema(Arc::new(schema)),
+        )?;
+        Ok(GameReader { input, metadata })
+    }
+
+    pub fn metadata(&self) -> &ParquetMetaData {
+        self.metadata.metadata()
+    }
+
+    pub fn num_row_groups(&self) -> usize {
+        self.metadata().num_row_groups()
+    }
+
+    fn read(&self, row_group: usize, projection: ProjectionMask) -> Result<RecordBatch> {
+        let num_rows = self.metadata().row_group(row_group).num_rows() as usize;
+        let mut reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            self.input.clone(),
+            self.metadata.clone(),
+        )
+        .with_projection(projection)
+        .with_row_groups(vec![row_group])
+        .with_batch_size(num_rows.max(1))
+        .build()?;
+        let batch = match reader.next() {
+            Some(batch) => batch?,
+            None => RecordBatch::new_empty(reader.schema()),
+        };
+        debug_assert!(reader.next().is_none());
+        Ok(batch)
+    }
+
+    pub fn read_games(&self, row_group: usize) -> Result<GameBatch> {
+        self.read(row_group, ProjectionMask::all()).map(GameBatch)
+    }
+
+    pub fn read_game_ids(&self, row_group: usize) -> Result<Vec<GameId>> {
+        let batch = self.read(
+            row_group,
+            ProjectionMask::columns(self.metadata.parquet_schema(), ["game_id"]),
+        )?;
+        let game_ids = batch.column(0).as_fixed_size_binary();
+        Ok((0..game_ids.len())
+            .map(|i| GameId::unpack(&mut game_ids.value(i)))
+            .collect())
+    }
+}
+
+pub struct GameBatch(RecordBatch);
+
+impl GameBatch {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.num_rows()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn rows(&self) -> impl Iterator<Item = GameRow<'_>> {
+        let columns = BatchColumns::new(&self.0);
+        (0..self.len()).map(move |i| columns.get(i))
+    }
+}
+
+struct DictionaryColumn<'a> {
+    keys: &'a Int32Array,
+    values: &'a StringArray,
+}
+
+impl<'a> DictionaryColumn<'a> {
+    fn new(array: &'a DictionaryArray<Int32Type>) -> DictionaryColumn<'a> {
+        DictionaryColumn {
+            keys: array.keys(),
+            values: array.values().as_string(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> Option<&'a [u8]> {
+        self.keys
+            .is_valid(i)
+            .then(|| self.values.value(self.keys.value(i) as usize).as_bytes())
+    }
+}
+
+struct PlayerColumns<'a> {
+    title: DictionaryColumn<'a>,
+    name: &'a StringArray,
+    rating: &'a Int32Array,
+}
+
+impl<'a> PlayerColumns<'a> {
+    fn new(batch: &'a RecordBatch, color: &str) -> PlayerColumns<'a> {
+        PlayerColumns {
+            title: dictionary_column(batch, &format!("{color}_title")),
+            name: column(batch, &format!("{color}_name")).as_string(),
+            rating: column(batch, &format!("{color}_rating")).as_primitive(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> PlayerRow<'a> {
+        PlayerRow {
+            title: self.title.get(i),
+            name: self.name.value(i).as_bytes(),
+            rating: optional_int(self.rating, i),
+        }
+    }
+}
+
+struct BatchColumns<'a> {
+    game_id: &'a FixedSizeBinaryArray,
+    players: ByColor<PlayerColumns<'a>>,
+    date_year: &'a Int32Array,
+    date_month: &'a Int32Array,
+    date_day: &'a Int32Array,
+    outcome: DictionaryColumn<'a>,
+    speed: DictionaryColumn<'a>,
+    rating_mode: DictionaryColumn<'a>,
+    setup: &'a BinaryArray,
+    moves: &'a BinaryArray,
+}
+
+impl<'a> BatchColumns<'a> {
+    fn new(batch: &'a RecordBatch) -> BatchColumns<'a> {
+        BatchColumns {
+            game_id: column(batch, "game_id").as_fixed_size_binary(),
+            players: ByColor {
+                white: PlayerColumns::new(batch, "white"),
+                black: PlayerColumns::new(batch, "black"),
+            },
+            date_year: column(batch, "date_year").as_primitive(),
+            date_month: column(batch, "date_month").as_primitive(),
+            date_day: column(batch, "date_day").as_primitive(),
+            outcome: dictionary_column(batch, "outcome"),
+            speed: dictionary_column(batch, "speed"),
+            rating_mode: dictionary_column(batch, "rating_mode"),
+            setup: column(batch, "setup").as_binary(),
+            moves: column(batch, "moves").as_binary(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> GameRow<'a> {
+        GameRow {
+            game_id: GameId::unpack(&mut self.game_id.value(i)),
+            players: ByColor {
+                white: self.players.white.get(i),
+                black: self.players.black.get(i),
+            },
+            date_year: optional_int(self.date_year, i),
+            date_month: optional_int(self.date_month, i),
+            date_day: optional_int(self.date_day, i),
+            outcome: self.outcome.get(i).expect("required outcome"),
+            speed: self.speed.get(i),
+            rating_mode: self.rating_mode.get(i).expect("required rating_mode"),
+            setup: self.setup.is_valid(i).then(|| self.setup.value(i)),
+            moves: self.moves.value(i),
+        }
+    }
+}
+
+fn column<'a>(batch: &'a RecordBatch, name: &str) -> &'a dyn Array {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("column {name}"))
+        .as_ref()
+}
+
+fn dictionary_column<'a>(batch: &'a RecordBatch, name: &str) -> DictionaryColumn<'a> {
+    DictionaryColumn::new(column(batch, name).as_dictionary())
+}
+
+#[inline]
+fn optional_int(array: &Int32Array, i: usize) -> Option<i32> {
+    array.is_valid(i).then(|| array.value(i))
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use parquet::file::writer::SerializedFileWriter;
+    use shakmaty::Outcome;
+
+    use super::*;
+    use crate::{
+        indexing::{FlatGame, FlatPlayer},
+        packed::{LaxDate, PackedMoves, Rating, RatingMode, Speed},
+        parquet::GameColumns,
+    };
+
+    fn game(game_id: &[u8], title: Option<&str>, speed: Option<Speed>) -> FlatGame {
+        FlatGame {
+            game_id: GameId::from_ascii(game_id).unwrap(),
+            players: ByColor {
+                white: FlatPlayer {
+                    title: title.map(str::to_owned),
+                    name: "white".to_owned(),
+                    rating: Some(Rating::try_from(1500).unwrap()),
+                },
+                black: FlatPlayer {
+                    title: None,
+                    name: "black".to_owned(),
+                    rating: None,
+                },
+            },
+            date: Some(LaxDate::from_ymd(2020, Some(1), None).unwrap()),
+            outcome: Outcome::Unknown,
+            speed,
+            rating_mode: RatingMode::Rated,
+            setup: None,
+            moves: PackedMoves(vec![0x12, 0x34]),
+        }
+    }
+
+    #[test]
+    fn test_rows_match_generic_reader() {
+        let mut columns = GameColumns::default();
+        columns.push(game(b"abcdefgh", Some("GM"), Some(Speed::Blitz)));
+        columns.push(game(b"12345678", None, None));
+        columns.push(game(b"ABCDEFGH", Some("FM"), Some(Speed::Classical)));
+
+        let mut file = Vec::new();
+        let mut writer = SerializedFileWriter::new(
+            &mut file,
+            GameColumns::schema(),
+            Arc::new(GameColumns::properties().build()),
+        )
+        .unwrap();
+        columns.write_row_group(&mut writer).unwrap();
+        writer.close().unwrap();
+
+        let reader = GameReader::try_new(Bytes::from(file)).unwrap();
+        assert_eq!(reader.num_row_groups(), 1);
+        let batch = reader.read_games(0).unwrap();
+        assert_eq!(batch.len(), 3);
+
+        let pack = |row: GameRow<'_>| {
+            let mut buf = row.game_id.to_bytes().to_vec();
+            buf.extend(row.players.white.title.unwrap_or(b"-"));
+            buf.extend(row.speed.unwrap_or(b"-"));
+            row.pack_lichess_game(&mut buf).map(|()| buf)
+        };
+        let expected: Vec<_> = columns.rows().map(pack).collect();
+        let actual: Vec<_> = batch.rows().map(pack).collect();
+        assert_eq!(actual, expected);
+
+        let game_ids: Vec<GameId> = columns.rows().map(|row| row.game_id).collect();
+        assert_eq!(reader.read_game_ids(0).unwrap(), game_ids);
+    }
+}
