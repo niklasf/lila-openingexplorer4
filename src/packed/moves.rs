@@ -1,5 +1,7 @@
 use std::num::NonZero;
 
+use bytes::Buf;
+use bytes::BufMut;
 use shakmaty::Bitboard;
 use shakmaty::Move;
 use shakmaty::Position;
@@ -10,38 +12,79 @@ use shakmaty::attacks;
 use shakmaty::variant::VariantPosition;
 use thiserror::Error;
 
+pub struct PackedMoves(pub Vec<u8>);
+
+impl PackedMoves {
+    pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
+        buf.put_slice(&self.0);
+    }
+
+    pub fn unpack_entire<B: Buf>(buf: &mut B) -> Self {
+        let mut bytes = Vec::new();
+        bytes.put(buf);
+        PackedMoves(bytes)
+    }
+
+    pub fn encode(pos: &mut VariantPosition, moves: impl IntoIterator<Item = Move>) -> Self {
+        let mut writer = BitWriter::default();
+        for m in moves {
+            encode_move(&mut writer, pos, m);
+            pos.play_unchecked(m);
+        }
+        PackedMoves(writer.finish())
+    }
+
+    pub fn decode(&self) -> Result<PackedMovesDecoder<'_>, InvalidPackedMoves> {
+        let reader = BitReader::new(&self.0)?;
+        Ok(PackedMovesDecoder { reader })
+    }
+}
+
+pub struct PackedMovesDecoder<'a> {
+    reader: BitReader<'a>,
+}
+
+impl PackedMovesDecoder<'_> {
+    pub fn decode_next(
+        &mut self,
+        pos: &VariantPosition,
+    ) -> Result<Option<Move>, InvalidPackedMoves> {
+        if self.reader.has_remaining() {
+            Ok(Some(decode_move(&mut self.reader, pos)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("invalid packed moves")]
-struct InvalidPackedMoves;
+pub struct InvalidPackedMoves;
 
 #[derive(Default)]
 struct BitWriter {
     bytes: Vec<u8>,
     pending: u64,
-    pending_len: u32,
+    pending_bits: u32,
 }
 
 impl BitWriter {
-    fn new() -> Self {
-        BitWriter::default()
-    }
+    fn write_bits(&mut self, value: u32, bits: u32) {
+        debug_assert!(bits <= 32 && u64::from(value) < (1 << bits));
 
-    fn write_bits(&mut self, value: u32, len: u32) {
-        debug_assert!(len <= 32 && u64::from(value) < (1u64 << len));
+        self.pending |= u64::from(value) << self.pending_bits;
+        self.pending_bits += bits;
 
-        self.pending |= u64::from(value) << self.pending_len;
-        self.pending_len += len;
-
-        while self.pending_len >= 8 {
+        while self.pending_bits >= 8 {
             self.bytes.push(self.pending as u8);
             self.pending >>= 8;
-            self.pending_len -= 8;
+            self.pending_bits -= 8;
         }
     }
 
     fn finish(mut self) -> Vec<u8> {
         self.write_bits(1, 1);
-        if self.pending_len > 0 {
+        if self.pending_bits > 0 {
             self.bytes.push(self.pending as u8);
         }
         self.bytes
@@ -74,10 +117,10 @@ impl BitReader<'_> {
         self.pos < self.len
     }
 
-    fn read_bits(&mut self, len: u32) -> Result<u32, InvalidPackedMoves> {
-        debug_assert!(len <= 32);
+    fn read_bits(&mut self, bits: u32) -> Result<u32, InvalidPackedMoves> {
+        debug_assert!(bits <= 32);
 
-        if self.pos + len as usize > self.len {
+        if self.pos + bits as usize > self.len {
             return Err(InvalidPackedMoves);
         }
 
@@ -88,13 +131,13 @@ impl BitReader<'_> {
 
         let word = u64::from_le_bytes(buf) >> (self.pos % 8);
 
-        self.pos += len as usize;
+        self.pos += bits as usize;
 
-        Ok((word & ((1u64 << len) - 1)) as u32)
+        Ok((word & ((1 << bits) - 1)) as u32)
     }
 }
 
-fn len_for(slots: usize) -> u32 {
+fn bits_for(slots: usize) -> u32 {
     slots.next_power_of_two().ilog2()
 }
 
@@ -107,7 +150,7 @@ fn square_index(sq: Square, mask: Bitboard) -> u32 {
     below.count() as u32
 }
 
-fn pseudo_legal(pos: &VariantPosition, role: Role, from: Square) -> Bitboard {
+fn pseudo_legal_targets(pos: &VariantPosition, role: Role, from: Square) -> Bitboard {
     match role {
         Role::Pawn => {
             let forward = pos.turn().fold_wb(8, -8);
@@ -134,27 +177,27 @@ fn pseudo_legal(pos: &VariantPosition, role: Role, from: Square) -> Bitboard {
 }
 
 fn encode_move(writer: &mut BitWriter, pos: &VariantPosition, m: Move) {
-    let piece_bits = len_for(pos.us().count() + usize::from(pos.pockets().is_some()));
+    let piece_bits = bits_for(pos.us().count() + usize::from(pos.pockets().is_some()));
     if let Some(from) = m.from() {
-        let targets = pseudo_legal(pos, m.role(), from);
-        let target_bits = len_for(targets.count());
+        let targets = pseudo_legal_targets(pos, m.role(), from);
+        let target_bits = bits_for(targets.count());
         writer.write_bits(square_index(from, pos.us()), piece_bits);
         writer.write_bits(square_index(m.to(), targets), target_bits);
         if let Some(promotion) = m.promotion() {
-            writer.write_bits(role_index(promotion), len_for(6));
+            writer.write_bits(role_index(promotion), bits_for(6));
         } else if piece_bits == 0 && target_bits == 0 {
             writer.write_bits(0, 1); // Force at least one bit per move
         }
     } else {
         // Drop move
         writer.write_bits(pos.us().count() as u32, piece_bits);
-        writer.write_bits(role_index(m.role()), len_for(6));
-        writer.write_bits(u32::from(m.to()), len_for(64));
+        writer.write_bits(role_index(m.role()), bits_for(6));
+        writer.write_bits(u32::from(m.to()), bits_for(64));
     }
 }
 
 fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, InvalidPackedMoves> {
-    let piece_bits = len_for(pos.us().count() + usize::from(pos.pockets().is_some()));
+    let piece_bits = bits_for(pos.us().count() + usize::from(pos.pockets().is_some()));
     let piece_index = reader.read_bits(piece_bits)? as usize;
     if piece_index < pos.us().count() {
         let from = pos
@@ -164,8 +207,8 @@ fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, In
             .ok_or(InvalidPackedMoves)?;
         let role = pos.board().role_at(from).ok_or(InvalidPackedMoves)?;
 
-        let targets = pseudo_legal(pos, role, from);
-        let target_bits = len_for(targets.count());
+        let targets = pseudo_legal_targets(pos, role, from);
+        let target_bits = bits_for(targets.count());
         let to = targets
             .into_iter()
             .nth(reader.read_bits(target_bits)? as usize)
@@ -185,7 +228,7 @@ fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, In
             let promotion =
                 if role == Role::Pawn && to.rank() == pos.turn().relative_rank(Rank::Eighth) {
                     Some(
-                        Role::try_from(reader.read_bits(len_for(6))? + 1)
+                        Role::try_from(reader.read_bits(bits_for(6))? + 1)
                             .map_err(|_| InvalidPackedMoves)?,
                     )
                 } else {
@@ -204,9 +247,9 @@ fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, In
         })
     } else {
         Ok(Move::Put {
-            role: Role::try_from(reader.read_bits(len_for(6))? + 1)
+            role: Role::try_from(reader.read_bits(bits_for(6))? + 1)
                 .map_err(|_| InvalidPackedMoves)?,
-            to: Square::new(reader.read_bits(len_for(64))?),
+            to: Square::new(reader.read_bits(bits_for(64))?),
         })
     }
 }
@@ -215,6 +258,7 @@ fn decode_move(reader: &mut BitReader, pos: &VariantPosition) -> Result<Move, In
 mod tests {
     use arbitrary::Arbitrary;
     use arbtest::arbtest;
+    use shakmaty::{CastlingMode, fen::Fen, san::San};
 
     use super::*;
 
@@ -236,7 +280,7 @@ mod tests {
         arbtest(|u| {
             let groups: Vec<Group> = u.arbitrary()?;
 
-            let mut writer = BitWriter::new();
+            let mut writer = BitWriter::default();
             for group in &groups {
                 writer.write_bits(group.value, group.len);
             }
@@ -286,24 +330,53 @@ mod tests {
         arbtest(|u| {
             let game: Game = u.arbitrary()?;
 
-            let mut bit_writer = BitWriter::new();
-            let mut pos = game.pos.clone();
-            for &m in &game.moves {
-                encode_move(&mut bit_writer, &pos, m);
-                pos.play_unchecked(m);
-            }
-            let bytes = bit_writer.finish();
+            let packed_moves =
+                PackedMoves::encode(&mut game.pos.clone(), game.moves.iter().copied());
 
-            let mut bit_reader = BitReader::new(&bytes).unwrap();
+            let mut decoder = packed_moves.decode().unwrap();
             let mut pos = game.pos.clone();
             for m in game.moves {
-                let decoded = decode_move(&mut bit_reader, &pos).unwrap();
+                let decoded = decoder.decode_next(&pos).unwrap().unwrap();
                 assert_eq!(decoded, m);
                 pos.play_unchecked(decoded);
             }
-            assert!(!bit_reader.has_remaining());
+            assert!(decoder.decode_next(&pos).unwrap().is_none());
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_only_moves() {
+        // shoopi, www.chess.com 6/11/2013, Mate In 8
+        let mut pos = VariantPosition::Chess(
+            "rk1KB3/b1q1QQQR/bnqQ1q2/1Rq1Q1q1/2q1rQ1q/6B1/6QQ/8 w - - 0 1"
+                .parse::<Fen>()
+                .unwrap()
+                .into_position(CastlingMode::Chess960)
+                .unwrap(),
+        );
+
+        let moves: Vec<Move> = [
+            "Qxc7+", "Qxc7+", "Qxc7+", "Qxc7+", "Qxc7+", "Qxc7+", "Bxc7+", "Kb7+", "Bb8+",
+        ]
+        .iter()
+        .scan(pos.clone(), |pos, san| {
+            let m = san.parse::<San>().unwrap().to_move(pos).unwrap();
+            pos.play_unchecked(m);
+            Some(m)
+        })
+        .collect();
+
+        let packed_moves = PackedMoves::encode(&mut pos.clone(), moves.iter().copied());
+
+        let mut decoder = packed_moves.decode().unwrap();
+        for m in moves {
+            let decoded = decoder.decode_next(&pos).unwrap().unwrap();
+            assert_eq!(decoded, m);
+            pos.play_unchecked(decoded);
+        }
+
+        assert!(decoder.decode_next(&pos).unwrap().is_none());
     }
 }
