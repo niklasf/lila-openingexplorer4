@@ -1,5 +1,4 @@
 use arbitrary::{Arbitrary, Unstructured};
-use bitflags::bitflags;
 use btoi::btou;
 use bytes::{Buf, BufMut};
 use shakmaty::{
@@ -223,34 +222,8 @@ pub fn unpack_speed_and_rating_mode<B: Buf>(buf: &mut B) -> (Speed, RatingMode) 
     (speed, rating_mode)
 }
 
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct IndexStatus: u8 {
-        const LICHESS = 1 << 0;
-        const PLAYER_WHITE = 1 << 1;
-        const PLAYER_BLACK = 1 << 2;
-    }
-}
-
-impl IndexStatus {
-    pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        buf.put_u8(self.bits());
-    }
-
-    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        Self::from_bits_truncate(buf.get_u8())
-    }
-}
-
-impl Arbitrary<'_> for IndexStatus {
-    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
-        Ok(IndexStatus::from_bits_truncate(u.arbitrary()?))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LichessGame {
-    pub index_status: IndexStatus,
     pub players: ByColor<GamePlayer>,
     pub date: LaxDate,
     pub outcome: Outcome,
@@ -273,7 +246,6 @@ impl LichessGame {
     }
 
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
-        self.index_status.pack(buf);
         self.players.white.pack(buf);
         self.players.black.pack(buf);
         self.date.pack(buf);
@@ -287,7 +259,6 @@ impl LichessGame {
     }
 
     pub fn unpack_entire<B: Buf>(buf: &mut B) -> Self {
-        let index_status = IndexStatus::unpack(buf);
         let players = ByColor {
             white: GamePlayer::unpack(buf),
             black: GamePlayer::unpack(buf),
@@ -303,7 +274,6 @@ impl LichessGame {
         let moves = PackedMoves::unpack_entire(buf);
 
         Self {
-            index_status,
             players,
             date,
             outcome,
@@ -331,7 +301,6 @@ impl Arbitrary<'_> for LichessGame {
         }
 
         Ok(LichessGame {
-            index_status: u.arbitrary()?,
             players: u.arbitrary()?,
             date: u.arbitrary()?,
             outcome: u.arbitrary()?,
