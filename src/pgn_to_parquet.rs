@@ -15,7 +15,9 @@ use std::{
 
 use bytes::Bytes;
 use crossbeam::channel;
-use indicatif::{HumanBytes, HumanCount, MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{
+    HumanBytes, HumanCount, MultiProgress, MultiProgressAlignment, ProgressBar, ProgressStyle,
+};
 use parquet::{
     basic::{Compression, ZstdLevel},
     column::writer::ColumnCloseResult,
@@ -387,6 +389,8 @@ pub fn convert(
         .iter()
         .map(|path| path.metadata().map(|m| m.len()))
         .sum::<io::Result<u64>>()?;
+
+    progress.set_alignment(MultiProgressAlignment::Bottom);
     let total_bar = progress.add(
         ProgressBar::new(total_bytes).with_style(
             ProgressStyle::with_template(
@@ -566,7 +570,7 @@ pub fn convert(
                         encoded.seq,
                     );
                     for err in &encoded.errors {
-                        progress.suspend(|| eprintln!("skipping game: {err}"));
+                        let _ = progress.println(format!("skipping game: {err}"));
                     }
 
                     keep.clear();
@@ -600,8 +604,7 @@ pub fn convert(
                 } else if file_chunks.get(&next.0) == Some(&next.1) {
                     let file = next.0;
                     total.add(&file_stats);
-                    progress.suspend(|| {
-                        eprintln!(
+                    let _ = progress.println(format!(
                             "[{:>8.1?}] {}/{} {}: {} games, {} unplayed, {} duplicates, {} invalid, {:.1?}",
                             started.elapsed(),
                             file.index() + 1,
@@ -612,8 +615,7 @@ pub fn convert(
                             file_stats.duplicates,
                             file_stats.invalid,
                             file_started.elapsed(),
-                        )
-                    });
+                        ));
                     file_stats = Stats::default();
                     file_started = Instant::now();
                     next = (FileId(file.index() + 1), 0);

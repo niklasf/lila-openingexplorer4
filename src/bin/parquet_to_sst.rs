@@ -1238,9 +1238,7 @@ fn write_sst_range(
 }
 
 fn log(progress: &ProgressBar, msg: String) {
-    // Must not touch the progress bar inside `suspend` (its state is locked).
-    let elapsed = progress.elapsed();
-    progress.suspend(|| eprintln!("[{elapsed:>8.1?}] {msg}"));
+    progress.println(format!("[{:>8.1?}] {msg}", progress.elapsed()));
 }
 
 #[cfg(test)]
