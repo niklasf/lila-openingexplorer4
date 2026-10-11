@@ -17,7 +17,7 @@ use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
     packed::GameId,
-    parquet::{GameReader, GameRow, PositionalFile},
+    parquet::{GameBatch, GameReader, GameRow, PositionalFile},
 };
 use rocksdb::{BlockBasedOptions, DBCompressionType, Options, SstFileWriter};
 use tikv_jemallocator::Jemalloc;
@@ -34,7 +34,7 @@ const RESIDENT_PARTITIONS_PER_PASS: usize = 1;
 const PARTITIONS_IN_MEMORY: u64 = 3;
 
 /// Assumed ratio of compressed scratch chunks to record bytes (measured
-/// about 0.79 with zstd level 1 and about 0.95 with LZ4).
+/// about 0.81 with zstd level 1 and about 0.87 with LZ4).
 const SCRATCH_RATIO: f64 = 1.0;
 
 /// Fixed memory overhead for the parquet reader, rocksdb and allocator slack.
@@ -75,6 +75,48 @@ impl Layout {
     }
 }
 
+/// The row groups of all input files, in order.
+struct Input {
+    readers: Vec<GameReader<PositionalFile>>,
+    /// Pairs of reader index and row group index within that reader.
+    row_groups: Vec<(usize, usize)>,
+}
+
+impl Input {
+    fn open(paths: &[PathBuf], limit: Option<usize>) -> io::Result<Input> {
+        let readers = paths
+            .iter()
+            .map(|path| Ok(GameReader::try_new(PositionalFile::open(path)?)?))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut row_groups: Vec<(usize, usize)> = readers
+            .iter()
+            .enumerate()
+            .flat_map(|(r, reader)| (0..reader.num_row_groups()).map(move |i| (r, i)))
+            .collect();
+        if let Some(limit) = limit {
+            row_groups.truncate(limit);
+        }
+        Ok(Input {
+            readers,
+            row_groups,
+        })
+    }
+
+    fn num_row_groups(&self) -> usize {
+        self.row_groups.len()
+    }
+
+    fn num_rows(&self, row_group: usize) -> u64 {
+        let (r, i) = self.row_groups[row_group];
+        self.readers[r].metadata().row_group(i).num_rows() as u64
+    }
+
+    fn read_games(&self, row_group: usize) -> parquet::errors::Result<GameBatch> {
+        let (r, i) = self.row_groups[row_group];
+        self.readers[r].read_games(i)
+    }
+}
+
 /// Estimated data sizes, from a sample of row groups.
 struct Estimate {
     rows: u64,
@@ -83,16 +125,15 @@ struct Estimate {
 }
 
 impl Estimate {
-    fn sample(reader: &GameReader<PositionalFile>, num_row_groups: usize) -> Estimate {
-        let rows: u64 = (0..num_row_groups)
-            .map(|i| reader.metadata().row_group(i).num_rows() as u64)
-            .sum();
+    fn sample(input: &Input) -> Estimate {
+        let num_row_groups = input.num_row_groups();
+        let rows: u64 = (0..num_row_groups).map(|i| input.num_rows(i)).sum();
         let samples = 256.min(num_row_groups);
         let mut value = Vec::new();
         let (mut sampled_rows, mut sampled_bytes) = (0u64, 0u64);
         for k in 0..samples {
             let i = k * num_row_groups / samples;
-            let batch = reader.read_games(i).expect("read row group");
+            let batch = input.read_games(i).expect("read row group");
             for row in batch.rows() {
                 value.clear();
                 sampled_rows += 1;
@@ -228,9 +269,17 @@ static SCRATCH_USAGE: AtomicU64 = AtomicU64::new(0);
 /// Partitions written to SST files so far.
 static WRITTEN_PARTITIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Sorts games from parquet files into non-overlapping SST files.
+///
+/// All inputs are sorted together, so a game id may appear in only one of
+/// them. For a monthly update, pass only the new parquet file (it fits in
+/// memory and needs no scratch space) and ingest the resulting SST files
+/// alongside the existing ones.
 #[derive(Parser)]
 struct Args {
-    parquet: PathBuf,
+    /// Parquet files to read.
+    #[clap(required = true)]
+    parquet: Vec<PathBuf>,
     /// Directory for temporary partition files.
     #[clap(long)]
     scratch: PathBuf,
@@ -254,8 +303,9 @@ struct Args {
     #[clap(long)]
     memory_partitions: Option<usize>,
     /// Zstd level for scratch chunks, or 0 for LZ4. Zstd level 1 saves about
-    /// 17% scratch space at twice the compression cost.
-    #[clap(long, default_value = "0")]
+    /// 7% scratch space over LZ4 and makes the whole run about 2% faster on
+    /// NVMe.
+    #[clap(long, default_value = "1")]
     scratch_zstd_level: i32,
     /// Directory for the final SST files.
     #[clap(long)]
@@ -273,7 +323,7 @@ struct Args {
     /// Threads for writing SST files (default: a quarter of the threads).
     #[clap(long)]
     sst_threads: Option<usize>,
-    /// Only process the first row groups of the input (for benchmarking).
+    /// Only process the first row groups of the inputs (for benchmarking).
     #[clap(long)]
     row_groups: Option<usize>,
     /// Stop after the scatter of the first pass (for benchmarking).
@@ -711,12 +761,9 @@ fn main() -> io::Result<()> {
         free_space(&args.scratch).expect("free scratch space; pass --scratch-budget") / 10 * 9
     });
 
-    let reader = GameReader::try_new(PositionalFile::open(&args.parquet)?)?;
-    let num_row_groups = args.row_groups.map_or(reader.num_row_groups(), |limit| {
-        limit.min(reader.num_row_groups())
-    });
+    let input = Input::open(&args.parquet, args.row_groups)?;
 
-    let estimate = Estimate::sample(&reader, num_row_groups);
+    let estimate = Estimate::sample(&input);
     let num_rows = estimate.rows;
     // The layout depends on the read threads (buffers), which depend on the
     // layout (overlap). Resolve with the smaller read thread count first.
@@ -803,7 +850,7 @@ fn main() -> io::Result<()> {
     thread::scope(|s| {
         let progress = &progress;
         let sst = &sst;
-        let reader = &reader;
+        let input = &input;
         let args = &args;
 
         // Loader: loads and sorts partitions in order, one ahead of the
@@ -888,8 +935,7 @@ fn main() -> io::Result<()> {
             progress.set_message("scattering");
             let timer = Instant::now();
             let (resident, scratch, throttled) = scatter_pass(
-                reader,
-                num_row_groups,
+                input,
                 pass,
                 &ScatterConfig {
                     scratch: &args.scratch,
@@ -977,8 +1023,7 @@ struct ScatterConfig<'a> {
 /// memory partitions are kept in memory, the others are written to scratch
 /// files.
 fn scatter_pass(
-    reader: &GameReader<PositionalFile>,
-    num_row_groups: usize,
+    input: &Input,
     pass: usize,
     config: &ScatterConfig<'_>,
     progress: &ProgressBar,
@@ -1079,10 +1124,10 @@ fn scatter_pass(
 
                 loop {
                     let i = next_row_group.fetch_add(1, Ordering::Relaxed);
-                    if i >= num_row_groups {
+                    if i >= input.num_row_groups() {
                         break;
                     }
-                    let batch = reader.read_games(i).expect("read row group");
+                    let batch = input.read_games(i).expect("read row group");
                     for row in batch.rows() {
                         route(row, &mut local_resident, &mut chunks);
                     }
