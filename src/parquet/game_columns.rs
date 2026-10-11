@@ -359,7 +359,7 @@ impl GameColumns {
 
     pub fn scatter(
         &self,
-        partition: impl Fn(GameId) -> Option<usize>,
+        mut partition: impl FnMut(GameId) -> Option<usize>,
         targets: &mut [&mut GameColumns],
     ) {
         let partitions: Vec<Option<usize>> = self

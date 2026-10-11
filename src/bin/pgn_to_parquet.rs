@@ -1,156 +1,101 @@
-use std::{ffi::OsStr, fs::File, io, path::PathBuf, sync::Arc, thread};
+use std::{path::PathBuf, process, thread};
 
 use clap::Parser;
-use crossbeam::channel;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressDrawTarget};
 use lila_openingexplorer4::{
-    indexing::{FlatGame, GameVisitor, ParsedGame, RecentGameIds},
-    parquet::GameColumns,
+    pgn_to_parquet::{Config, convert},
+    util::ByteSize,
 };
-use parquet::{
-    basic::{Compression, ZstdLevel},
-    file::writer::SerializedFileWriter,
-};
-use pgn_reader::Reader;
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
 
-const ROW_GROUP_LEN: usize = 100_000;
-
-const FLATTEN_THREADS: usize = 2; // Enough to keep up with parsed games
-
-const CHANNEL_LEN: usize = 32768; // Enough to buffer while previous row group is being written
-
+/// Converts PGN files (optionally zstd compressed) to a single parquet file,
+/// with one row per game, in the order of the files and their games.
+///
+/// Unplayed games (fewer than two plies) and games that cannot be parsed are
+/// skipped.
+///
+/// Games whose id already appeared among the recent games (at least
+/// the previous 100k, also across consecutive files) are skipped as
+/// duplicates.
 #[derive(Parser)]
 struct Args {
     pgns: Vec<PathBuf>,
+    /// Output parquet file.
     #[clap(long)]
     out: PathBuf,
+    /// Threads to use in total. Defaults to the available parallelism minus
+    /// two.
+    #[clap(long)]
+    threads: Option<usize>,
+    /// Files read concurrently. Each takes up to one thread. Consider
+    /// matching the number of hard drives, or more for NVMe.
+    #[clap(long, default_value = "4")]
+    readers: usize,
+    /// Maximum bytes of PGN chunks and encoded row groups held in memory
+    /// while waiting for earlier chunks. Chunks of the oldest unfinished
+    /// file are exempt, so that progress is always possible. Defaults to
+    /// 60% of the total memory. Accepts units, like 32g.
+    #[clap(long)]
+    memory_budget: Option<ByteSize>,
+    /// Games per row group.
+    #[clap(long, default_value = "100000")]
+    row_group_len: usize,
+    /// Bytes read from a file at once. Large sequential reads are kinder to
+    /// spinning disks shared between readers.
+    #[clap(long, default_value = "16m")]
+    read_buffer: ByteSize,
+    /// Zstd compression level for meta data columns in the produced parquet
+    /// file, or 0 for uncompressed. Gains for levels above 9 are small.
+    #[clap(long, default_value = "9")]
+    zstd_level: i32,
+    /// Zstd compression level for the moves column in the produced parquet
+    /// file, or 0 for uncompressed. Stacking compression on the move
+    /// encoding is not very effective (~5%).
+    #[clap(long, default_value = "0")]
+    moves_zstd_level: i32,
 }
 
-fn main() -> io::Result<()> {
+fn total_memory() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(pages.max(0)).unwrap_or(0) * u64::try_from(page_size.max(0)).unwrap_or(0)
+}
+
+fn main() {
     let args = Args::parse();
 
-    thread::scope(|s| {
-        // Flatten in round robin, so that games can be collected in the
-        // original order.
-        let mut parsed_txs = Vec::with_capacity(FLATTEN_THREADS);
-        let mut flat_rxs = Vec::with_capacity(FLATTEN_THREADS);
+    let config = Config {
+        threads: args.threads.unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .saturating_sub(2)
+                .max(1)
+        }),
+        readers: args.readers,
+        games_per_chunk: args.row_group_len,
+        memory_budget: args
+            .memory_budget
+            .map_or_else(|| total_memory() / 10 * 6, u64::from),
+        read_buffer: usize::try_from(args.read_buffer.0).expect("read buffer fits in memory"),
+        zstd_level: args.zstd_level,
+        moves_zstd_level: args.moves_zstd_level,
+    };
 
-        for _ in 0..FLATTEN_THREADS {
-            let (parsed_tx, parsed_rx) = channel::bounded::<ParsedGame>(CHANNEL_LEN);
-            let (flat_tx, flat_rx) = channel::bounded::<io::Result<FlatGame>>(CHANNEL_LEN);
-            parsed_txs.push(parsed_tx);
-            flat_rxs.push(flat_rx);
-
-            s.spawn(move || {
-                for parsed in parsed_rx {
-                    flat_tx
-                        .send(FlatGame::flatten(parsed))
-                        .expect("send flat game");
-                }
-            });
+    let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(4));
+    let stats = match convert(&args.pgns, &args.out, &config, &progress) {
+        Ok(stats) => stats,
+        Err(err) => {
+            eprintln!("error: {err}");
+            process::exit(1);
         }
+    };
 
-        s.spawn(move || {
-            let file = File::create(&args.out).expect("create parquet file");
-            let mut writer = SerializedFileWriter::new(
-                file,
-                GameColumns::schema(),
-                Arc::new(
-                    GameColumns::properties()
-                        .set_compression(Compression::ZSTD(ZstdLevel::try_new(9).unwrap()))
-                        .build(),
-                ),
-            )
-            .expect("parquet writer");
-
-            let mut columns = GameColumns::default();
-
-            'collect: loop {
-                for flat_rx in &flat_rxs {
-                    match flat_rx.recv() {
-                        Ok(Ok(flat)) => {
-                            columns.push(flat);
-                            if columns.len() >= ROW_GROUP_LEN {
-                                columns
-                                    .write_row_group(&mut writer)
-                                    .expect("write row group");
-                                columns.clear();
-                            }
-                        }
-                        Ok(Err(err)) => eprintln!("skipping game: {}", err),
-                        Err(channel::RecvError) => break 'collect,
-                    }
-                }
-            }
-
-            columns
-                .write_row_group(&mut writer)
-                .expect("write final row group");
-            columns.clear();
-            writer.close().expect("close parquet file");
-        });
-
-        let mut next_thread = 0;
-
-        // Consecutive database files can overlap, so that some games appear
-        // twice.
-        let mut recent_game_ids = RecentGameIds::new();
-
-        for arg in args.pgns {
-            let file = File::open(&arg)?;
-            let progress = ProgressBar::with_draw_target(
-                Some(file.metadata()?.len()),
-                ProgressDrawTarget::stdout_with_hz(4),
-            )
-            .with_style(
-                ProgressStyle::with_template(
-                    "{spinner} {prefix} {msg} {wide_bar} {bytes_per_sec:>14} {eta:>7}",
-                )
-                .expect("progress template"),
-            )
-            .with_prefix(format!("{arg:?}"));
-
-            let file = progress.wrap_read(file);
-
-            let uncompressed: Box<dyn io::Read> = if arg.extension() == Some(OsStr::new("zst")) {
-                Box::new(zstd::Decoder::new(file)?)
-            } else {
-                Box::new(file)
-            };
-
-            let mut reader = Reader::new(uncompressed);
-
-            for parsed in reader.read_games(&mut GameVisitor) {
-                let parsed = match parsed? {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        eprintln!("skipping game: {}", err);
-                        continue;
-                    }
-                };
-
-                if parsed
-                    .game_id()
-                    .is_some_and(|game_id| !recent_game_ids.insert(game_id))
-                {
-                    continue;
-                }
-
-                parsed_txs[next_thread].send(parsed).expect("send parsed");
-                next_thread = (next_thread + 1) % FLATTEN_THREADS;
-            }
-
-            progress.finish();
-        }
-
-        if recent_game_ids.duplicates() > 0 {
-            eprintln!("skipped {} duplicate games", recent_game_ids.duplicates());
-        }
-
-        Ok(())
-    })
+    println!(
+        "{} games, {} unplayed skipped, {} duplicates skipped, {} invalid skipped",
+        stats.games, stats.unplayed, stats.duplicates, stats.invalid
+    );
 }

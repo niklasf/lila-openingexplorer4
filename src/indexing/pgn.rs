@@ -209,10 +209,19 @@ impl ParsedGame {
             ),
         };
 
-        let setup = need_setup.then(|| {
-            PackedSetup::pack_variant_normalized(&pos.to_setup(EnPassantMode::Legal), variant)
-                .expect("legal setup")
-        });
+        let setup = need_setup
+            .then(|| {
+                // Legal, but can still be unrepresentable, e.g., more than 15
+                // pieces of a kind in a crazyhouse pocket.
+                PackedSetup::pack_variant_normalized(&pos.to_setup(EnPassantMode::Legal), variant)
+                    .map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported setup: {} @ {:?}", err, self.game_id),
+                        )
+                    })
+            })
+            .transpose()?;
 
         Ok((pos, setup))
     }
