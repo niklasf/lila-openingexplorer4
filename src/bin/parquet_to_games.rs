@@ -18,7 +18,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
     packed::GameId,
     parquet::{GameBatch, GameReader, GameRow, PositionalFile},
-    util::total_memory,
+    util::{ByteSize, total_memory},
 };
 use rocksdb::{BlockBasedOptions, DBCompressionType, Options, SstFileWriter};
 use tikv_jemallocator::Jemalloc;
@@ -315,13 +315,14 @@ struct Args {
     scratch: PathBuf,
     /// Maximum bytes to use in scratch space. Determines the number of
     /// passes over the input. Defaults to 90% of the free space of the
-    /// scratch directory.
+    /// scratch directory. Accepts units, like 500g.
     #[clap(long)]
-    scratch_budget: Option<u64>,
+    scratch_budget: Option<ByteSize>,
     /// Maximum bytes of memory to use. Determines the number of memory
-    /// partitions. Defaults to 60% of the total memory.
+    /// partitions. Defaults to 60% of the total memory. Accepts units, like
+    /// 32g.
     #[clap(long)]
-    memory_budget: Option<u64>,
+    memory_budget: Option<ByteSize>,
     /// Threads to use in total. Defaults to the available parallelism minus
     /// two, to leave one physical core idle.
     #[clap(long)]
@@ -789,12 +790,14 @@ fn main() -> io::Result<()> {
             .saturating_sub(2)
             .max(2)
     });
-    let memory_budget = args
-        .memory_budget
-        .unwrap_or_else(|| total_memory().expect("total memory; pass --memory-budget") / 10 * 6);
-    let scratch_budget = args.scratch_budget.unwrap_or_else(|| {
-        free_space(&args.scratch).expect("free scratch space; pass --scratch-budget") / 10 * 9
-    });
+    let memory_budget = args.memory_budget.map_or_else(
+        || total_memory().expect("total memory; pass --memory-budget") / 10 * 6,
+        u64::from,
+    );
+    let scratch_budget = args.scratch_budget.map_or_else(
+        || free_space(&args.scratch).expect("free scratch space; pass --scratch-budget") / 10 * 9,
+        u64::from,
+    );
 
     let input = Input::open(&args.parquet, args.row_groups)?;
 
