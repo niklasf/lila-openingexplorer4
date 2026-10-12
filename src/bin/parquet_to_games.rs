@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Condvar, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -160,9 +160,11 @@ impl Estimate {
         (self.record_bytes + 16 * self.rows) * 21 / 20 / layout.memory_partitions() as u64
     }
 
-    /// Peak memory for the given layout and read threads.
-    fn memory(&self, layout: Layout, read_threads: u64) -> u64 {
-        let buffers = read_threads * layout.scratch_partitions_per_pass() as u64 * CHUNK_STRIDE;
+    /// Peak memory for the given layout and threads per stage.
+    fn memory(&self, layout: Layout, threads: u64) -> u64 {
+        // Chunk buffers of each read thread, and chunks queued for
+        // compression.
+        let buffers = threads * (layout.scratch_partitions_per_pass() as u64 + 2) * CHUNK_STRIDE;
         BASE_MEMORY + PARTITIONS_IN_MEMORY * self.partition_memory(layout) + buffers
     }
 
@@ -179,7 +181,7 @@ impl Estimate {
         &self,
         memory_budget: u64,
         scratch_budget: u64,
-        read_threads: u64,
+        threads: u64,
         passes: Option<usize>,
         memory_partitions: Option<usize>,
     ) -> Layout {
@@ -198,7 +200,7 @@ impl Estimate {
                 .max(layout.disk_bits);
         }
         loop {
-            let fits_memory = self.memory(layout, read_threads) <= memory_budget;
+            let fits_memory = self.memory(layout, threads) <= memory_budget;
             let fits_scratch = self.scratch(layout) <= scratch_budget;
             if (fits_memory || memory_partitions.is_some()) && (fits_scratch || passes.is_some()) {
                 return layout;
@@ -254,8 +256,8 @@ const SST_MAX_SIZE: u64 = 512 * 1024 * 1024;
 const SST_ROLL_SIZE: u64 = SST_MAX_SIZE - 16 * 1024 * 1024;
 
 /// Initial guess for the ratio of SST bytes to uncompressed value bytes, used
-/// until measured.
-const INITIAL_SST_RATIO: f64 = 0.9;
+/// until measured (about 1.1 with `PackedMoves` and 4 KB zstd blocks).
+const INITIAL_SST_RATIO: f64 = 1.1;
 
 /// Games that could not be represented as `LichessGame`.
 static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
@@ -263,11 +265,108 @@ static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
 /// Sub-buckets for the parallel sort of a partition.
 const SORT_BUCKET_BITS: u32 = 3;
 
+/// A counter that threads can wait on.
+struct Gauge {
+    value: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl Gauge {
+    const fn new() -> Gauge {
+        Gauge {
+            value: Mutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn add(&self, n: u64) {
+        *self.value.lock().expect("lock gauge") += n;
+        self.changed.notify_all();
+    }
+
+    fn sub(&self, n: u64) {
+        *self.value.lock().expect("lock gauge") -= n;
+        self.changed.notify_all();
+    }
+
+    /// Blocks until the value satisfies `ready`, and returns the time
+    /// waited.
+    fn wait_until(&self, ready: impl Fn(u64) -> bool) -> Duration {
+        let timer = Instant::now();
+        let mut value = self.value.lock().expect("lock gauge");
+        while !ready(*value) {
+            value = self.changed.wait(value).expect("wait gauge");
+        }
+        timer.elapsed()
+    }
+}
+
 /// Bytes currently occupied by scratch files.
-static SCRATCH_USAGE: AtomicU64 = AtomicU64::new(0);
+static SCRATCH_USAGE: Gauge = Gauge::new();
 
 /// Partitions written to SST files so far.
-static WRITTEN_PARTITIONS: AtomicUsize = AtomicUsize::new(0);
+static WRITTEN_PARTITIONS: Gauge = Gauge::new();
+
+/// Pipeline stages competing for threads, from lowest to highest priority.
+/// Later stages free memory or scratch space, so they go first.
+#[derive(Copy, Clone)]
+enum Stage {
+    Read,
+    Compress,
+    Load,
+    Write,
+}
+
+const STAGES: usize = 4;
+
+/// Bounds the number of threads working at the same time, across all
+/// stages, granting permits to waiting higher priority stages first.
+///
+/// Each stage has its own threads, which take a permit for each unit of work
+/// (a row group, a chunk, a sort bucket, an SST range). A thread must not
+/// wait for another stage while holding a permit.
+struct Permits {
+    state: Mutex<PermitState>,
+    changed: Condvar,
+}
+
+struct PermitState {
+    available: usize,
+    waiting: [usize; STAGES],
+}
+
+impl Permits {
+    fn new(threads: usize) -> Permits {
+        Permits {
+            state: Mutex::new(PermitState {
+                available: threads,
+                waiting: [0; STAGES],
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, stage: Stage) -> Permit<'_> {
+        let stage = stage as usize;
+        let mut state = self.state.lock().expect("lock permits");
+        state.waiting[stage] += 1;
+        while state.available == 0 || state.waiting[stage + 1..].iter().any(|&n| n > 0) {
+            state = self.changed.wait(state).expect("wait permits");
+        }
+        state.waiting[stage] -= 1;
+        state.available -= 1;
+        Permit(self)
+    }
+}
+
+struct Permit<'a>(&'a Permits);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().expect("lock permits").available += 1;
+        self.0.changed.notify_all();
+    }
+}
 
 /// Sorts games from parquet files into non-overlapping SST files.
 ///
@@ -292,8 +391,9 @@ struct Args {
     /// partitions. Defaults to 60% of the total memory.
     #[clap(long)]
     memory_budget: Option<u64>,
-    /// Threads to use in total. Defaults to the available parallelism minus
-    /// two, to leave one physical core idle.
+    /// Threads working at the same time, shared by all stages (higher
+    /// priority to later stages). Defaults to the available parallelism
+    /// minus two, to leave one physical core idle.
     #[clap(long)]
     threads: Option<usize>,
     /// Override the number of passes over the input.
@@ -310,19 +410,6 @@ struct Args {
     /// Directory for the final SST files.
     #[clap(long)]
     out: PathBuf,
-    /// Threads for reading the input (default: half of the threads).
-    #[clap(long)]
-    read_threads: Option<usize>,
-    /// Threads for compressing and writing scratch chunks (default: a fifth
-    /// of the threads).
-    #[clap(long)]
-    write_threads: Option<usize>,
-    /// Threads for loading scratch files (default: a fifth of the threads).
-    #[clap(long)]
-    load_threads: Option<usize>,
-    /// Threads for writing SST files (default: a quarter of the threads).
-    #[clap(long)]
-    sst_threads: Option<usize>,
     /// Only process the first row groups of the inputs (for benchmarking).
     #[clap(long)]
     row_groups: Option<usize>,
@@ -412,16 +499,6 @@ impl MemoryPartition {
         Ok(())
     }
 
-    /// Appends a chunk of records and indexes them.
-    fn push_chunk(&mut self, chunk: Vec<u8>) {
-        Self::index_records(
-            &chunk,
-            self.chunks.len() as u64 * CHUNK_STRIDE,
-            &mut self.index,
-        );
-        self.chunks.push(chunk);
-    }
-
     fn record_bytes(&self) -> usize {
         self.chunks.iter().map(Vec::len).sum()
     }
@@ -457,7 +534,7 @@ impl MemoryPartition {
 
     /// Sorts the index by game id, in parallel over sub-buckets of the key
     /// range. All entries must belong to one memory partition of `layout`.
-    fn sort(&mut self, layout: Layout, threads: usize) {
+    fn sort(&mut self, layout: Layout, threads: usize, permits: &Permits) {
         let buckets = 1 << SORT_BUCKET_BITS;
         let bits = layout.memory_bits + SORT_BUCKET_BITS;
         let mut bucketed: Vec<Vec<(GameId, u64)>> = (0..buckets).map(|_| Vec::new()).collect();
@@ -477,6 +554,7 @@ impl MemoryPartition {
                         let Some(slot) = slots.get(i) else {
                             break;
                         };
+                        let _permit = permits.acquire(Stage::Load);
                         slot.lock()
                             .expect("lock bucket")
                             .sort_unstable_by_key(|&(game_id, _)| game_id);
@@ -617,7 +695,7 @@ struct ChunkMeta {
     compressed_len: u32,
 }
 
-/// A scratch file holding LZ4 compressed chunks of records.
+/// A scratch file holding compressed chunks of records.
 struct ScratchFile {
     path: PathBuf,
     file: File,
@@ -651,18 +729,19 @@ impl ScratchFile {
             compressed_len: compressed.len() as u32,
         });
         self.len += compressed.len() as u64;
-        SCRATCH_USAGE.fetch_add(compressed.len() as u64, Ordering::Relaxed);
+        SCRATCH_USAGE.add(compressed.len() as u64);
         Ok(())
     }
 
-    /// Loads and decompresses all chunks in parallel.
-    fn load(&self, threads: usize) -> MemoryPartition {
+    /// Loads, decompresses and indexes all chunks in parallel.
+    fn load(&self, threads: usize, permits: &Permits) -> MemoryPartition {
+        type Loaded = (Vec<u8>, Vec<(GameId, u64)>);
         let next = AtomicUsize::new(0);
-        let mut slots: Vec<Option<Vec<u8>>> = (0..self.chunks.len()).map(|_| None).collect();
+        let mut slots: Vec<Option<Loaded>> = (0..self.chunks.len()).map(|_| None).collect();
         let slots_ref = Mutex::new(&mut slots);
 
         thread::scope(|s| {
-            for _ in 0..threads {
+            for _ in 0..threads.min(self.chunks.len()) {
                 s.spawn(|| {
                     let mut decompressor = ChunkDecompressor::new(self.codec);
                     let mut compressed = Vec::new();
@@ -671,6 +750,7 @@ impl ScratchFile {
                         let Some(chunk) = self.chunks.get(i) else {
                             break;
                         };
+                        let permit = permits.acquire(Stage::Load);
                         compressed.resize(chunk.compressed_len as usize, 0);
                         self.file
                             .read_exact_at(&mut compressed, chunk.offset)
@@ -678,7 +758,10 @@ impl ScratchFile {
                         let mut raw = new_chunk();
                         raw.resize(chunk.raw_len as usize, 0);
                         decompressor.decompress(&compressed, &mut raw);
-                        slots_ref.lock().expect("lock slots")[i] = Some(raw);
+                        let mut index = Vec::new();
+                        MemoryPartition::index_records(&raw, i as u64 * CHUNK_STRIDE, &mut index);
+                        drop(permit);
+                        slots_ref.lock().expect("lock slots")[i] = Some((raw, index));
                     }
                 });
             }
@@ -686,8 +769,16 @@ impl ScratchFile {
 
         let mut partition = MemoryPartition::default();
         partition.chunks.reserve_exact(slots.len());
+        partition.index.reserve_exact(
+            slots
+                .iter()
+                .map(|slot| slot.as_ref().map_or(0, |(_, index)| index.len()))
+                .sum(),
+        );
         for slot in slots {
-            partition.push_chunk(slot.expect("loaded chunk"));
+            let (chunk, index) = slot.expect("loaded chunk");
+            partition.chunks.push(chunk);
+            partition.index.extend(index);
         }
         partition
     }
@@ -695,7 +786,7 @@ impl ScratchFile {
     fn remove(self) -> io::Result<()> {
         drop(self.file);
         fs::remove_file(&self.path)?;
-        SCRATCH_USAGE.fetch_sub(self.len, Ordering::Relaxed);
+        SCRATCH_USAGE.sub(self.len);
         Ok(())
     }
 }
@@ -765,46 +856,21 @@ fn main() -> io::Result<()> {
 
     let estimate = Estimate::sample(&input);
     let num_rows = estimate.rows;
-    // The layout depends on the read threads (buffers), which depend on the
-    // layout (overlap). Resolve with the smaller read thread count first.
-    let provisional_read_threads = args.read_threads.unwrap_or(threads / 2).max(1);
-    let mut layout = estimate.layout(
+    let layout = estimate.layout(
         memory_budget,
         scratch_budget,
-        provisional_read_threads as u64,
+        threads as u64,
         args.passes,
         args.memory_partitions,
     );
-    // With a single pass the scan and the partition writes never overlap, so
-    // each phase can use all threads. With several passes the scan of the
-    // next pass runs while partitions are written.
-    let single_pass = layout.passes() == 1 || args.no_overlap;
-    let (read_default, write_default, load_default, sst_default) = if single_pass {
-        (threads * 3 / 4, threads / 4, threads / 3, threads * 2 / 3)
-    } else {
-        (threads / 2, threads / 5, threads / 5, threads / 4)
-    };
-    let read_threads = args.read_threads.unwrap_or(read_default).max(1);
-    let write_threads = args.write_threads.unwrap_or(write_default).max(1);
-    let load_threads = args.load_threads.unwrap_or(load_default).max(1);
-    let sst_threads = args.sst_threads.unwrap_or(sst_default).max(2);
-    if read_threads > provisional_read_threads {
-        layout = estimate.layout(
-            memory_budget,
-            scratch_budget,
-            read_threads as u64,
-            args.passes,
-            args.memory_partitions,
-        );
-    }
     eprintln!(
-        "{} games, about {} GB of records; {} passes with {} memory partitions each, about {} GB scratch per pass and {} GB memory; threads: {read_threads} read, {write_threads} write, {load_threads} load, {sst_threads} sst",
+        "{} games, about {} GB of records; {} passes with {} memory partitions each, about {} GB scratch per pass and {} GB memory; {threads} threads",
         num_rows,
         estimate.record_bytes >> 30,
         layout.passes(),
         layout.memory_partitions_per_pass(),
         estimate.scratch(layout) >> 30,
-        estimate.memory(layout, read_threads as u64) >> 30,
+        estimate.memory(layout, threads as u64) >> 30,
     );
     if args.plan_only {
         return Ok(());
@@ -834,6 +900,8 @@ fn main() -> io::Result<()> {
         stats: Mutex::new(SstStats::default()),
     };
 
+    let permits = Permits::new(threads);
+
     let started = Instant::now();
 
     let progress = ProgressBar::with_draw_target(
@@ -852,6 +920,7 @@ fn main() -> io::Result<()> {
         let sst = &sst;
         let input = &input;
         let args = &args;
+        let permits = &permits;
 
         // Loader: loads and sorts partitions in order, one ahead of the
         // writer.
@@ -864,7 +933,7 @@ fn main() -> io::Result<()> {
                 let mut partition = match job.source {
                     PartitionSource::Resident(partition) => partition,
                     PartitionSource::Scratch(scratch) => {
-                        let partition = scratch.load(load_threads);
+                        let partition = scratch.load(threads, permits);
                         scratch.remove().expect("remove scratch");
                         partition
                     }
@@ -872,7 +941,7 @@ fn main() -> io::Result<()> {
                 let load = timer.elapsed();
 
                 let timer = Instant::now();
-                partition.sort(layout, load_threads);
+                partition.sort(layout, threads, permits);
                 if let Err(game_id) = partition.check_unique() {
                     // Duplicates must be resolved when creating the parquet
                     // file. Exit instead of panicking, which would leave the
@@ -899,8 +968,8 @@ fn main() -> io::Result<()> {
         s.spawn(move || {
             for (memory_partition, partition) in sorted_rx {
                 let timer = Instant::now();
-                write_partition(&partition, memory_partition, sst, sst_threads);
-                WRITTEN_PARTITIONS.fetch_add(1, Ordering::Relaxed);
+                write_partition(&partition, memory_partition, sst, threads, permits);
+                WRITTEN_PARTITIONS.add(1);
                 let stats = sst.stats.lock().expect("lock stats");
                 log(
                     progress,
@@ -918,18 +987,11 @@ fn main() -> io::Result<()> {
             progress.set_prefix(format!("pass {}/{}", pass + 1, layout.passes()));
             if args.no_overlap && pass > 0 {
                 progress.set_message("waiting for previous pass");
-                let timer = Instant::now();
-                while WRITTEN_PARTITIONS.load(Ordering::Relaxed)
-                    < pass * layout.memory_partitions_per_pass()
-                {
-                    thread::sleep(Duration::from_millis(100));
-                }
+                let waited = WRITTEN_PARTITIONS
+                    .wait_until(|n| n >= (pass * layout.memory_partitions_per_pass()) as u64);
                 log(
                     progress,
-                    format!(
-                        "pass {pass}: waited {:.1?} for previous pass",
-                        timer.elapsed()
-                    ),
+                    format!("pass {pass}: waited {waited:.1?} for previous pass"),
                 );
             }
             progress.set_message("scattering");
@@ -943,9 +1005,9 @@ fn main() -> io::Result<()> {
                     // The first pass has nothing to wait for.
                     budget: (pass > 0).then_some(scratch_budget),
                     layout,
-                    read_threads,
-                    write_threads,
+                    threads,
                 },
+                permits,
                 progress,
             )
             .expect("scatter");
@@ -1014,8 +1076,8 @@ struct ScatterConfig<'a> {
     /// freeing scratch space.
     budget: Option<u64>,
     layout: Layout,
-    read_threads: usize,
-    write_threads: usize,
+    /// Threads per stage.
+    threads: usize,
 }
 
 /// Reads the entire input and distributes the games of the given disk
@@ -1026,6 +1088,7 @@ fn scatter_pass(
     input: &Input,
     pass: usize,
     config: &ScatterConfig<'_>,
+    permits: &Permits,
     progress: &ProgressBar,
 ) -> io::Result<(Resident, Vec<ScratchFile>, Duration)> {
     let layout = config.layout;
@@ -1055,23 +1118,20 @@ fn scatter_pass(
 
         // Write threads compress full chunks and append them to scratch
         // files, throttled by the scratch budget.
-        let (tx, rx) = channel::bounded::<(usize, Vec<u8>)>(config.write_threads * 2);
+        let (tx, rx) = channel::bounded::<(usize, Vec<u8>)>(config.threads * 2);
 
-        for _ in 0..config.write_threads {
+        for _ in 0..config.threads {
             let rx = rx.clone();
             s.spawn(move || {
                 let mut compressor = ChunkCompressor::new(config.codec);
                 for (file, raw) in rx {
+                    let permit = permits.acquire(Stage::Compress);
                     let compressed = compressor.compress(&raw);
+                    drop(permit);
                     if let Some(budget) = config.budget {
-                        let timer = Instant::now();
-                        while SCRATCH_USAGE.load(Ordering::Relaxed) + compressed.len() as u64
-                            > budget
-                        {
-                            thread::sleep(Duration::from_millis(20));
-                        }
-                        throttled_nanos
-                            .fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        let waited = SCRATCH_USAGE
+                            .wait_until(|usage| usage + compressed.len() as u64 <= budget);
+                        throttled_nanos.fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
                     }
                     files[file]
                         .lock()
@@ -1086,7 +1146,7 @@ fn scatter_pass(
 
         // Read threads pack the games of this pass and route them to
         // resident partitions or scratch chunks.
-        for _ in 0..config.read_threads {
+        for _ in 0..config.threads {
             let tx = tx.clone();
             s.spawn(move || {
                 let mut local_resident: Vec<MemoryPartition> = (0..RESIDENT_PARTITIONS_PER_PASS)
@@ -1094,45 +1154,53 @@ fn scatter_pass(
                     .collect();
                 let mut chunks: Vec<Vec<u8>> =
                     (0..scratch_partitions).map(|_| new_chunk()).collect();
+                // Full chunks, sent after releasing the permit.
+                let mut full_chunks: Vec<(usize, Vec<u8>)> = Vec::new();
                 let mut skipped = 0;
 
-                let mut route = |row: GameRow<'_>,
-                                 local_resident: &mut Vec<MemoryPartition>,
-                                 chunks: &mut Vec<Vec<u8>>| {
-                    let Some(j) = layout.pass_memory_partition(row.game_id, pass) else {
-                        return;
+                let mut route =
+                    |row: GameRow<'_>,
+                     local_resident: &mut Vec<MemoryPartition>,
+                     chunks: &mut Vec<Vec<u8>>,
+                     full_chunks: &mut Vec<(usize, Vec<u8>)>| {
+                        let Some(j) = layout.pass_memory_partition(row.game_id, pass) else {
+                            return;
+                        };
+                        let pack = |buf: &mut Vec<u8>| row.pack_lichess_game(buf);
+                        if j >= scratch_partitions {
+                            if local_resident[j - scratch_partitions]
+                                .push(row.game_id, pack)
+                                .is_err()
+                            {
+                                skipped += 1;
+                            }
+                        } else {
+                            let chunk = &mut chunks[j];
+                            if push_record(chunk, row.game_id, pack).is_err() {
+                                skipped += 1;
+                            }
+                            if chunk.len() >= CHUNK_SIZE {
+                                full_chunks.push((j, mem::replace(chunk, new_chunk())));
+                            }
+                        }
                     };
-                    let pack = |buf: &mut Vec<u8>| row.pack_lichess_game(buf);
-                    if j >= scratch_partitions {
-                        if local_resident[j - scratch_partitions]
-                            .push(row.game_id, pack)
-                            .is_err()
-                        {
-                            skipped += 1;
-                        }
-                    } else {
-                        let chunk = &mut chunks[j];
-                        if push_record(chunk, row.game_id, pack).is_err() {
-                            skipped += 1;
-                        }
-                        if chunk.len() >= CHUNK_SIZE {
-                            let full = mem::replace(chunk, new_chunk());
-                            tx.send((j, full)).expect("send chunk");
-                        }
-                    }
-                };
 
                 loop {
                     let i = next_row_group.fetch_add(1, Ordering::Relaxed);
                     if i >= input.num_row_groups() {
                         break;
                     }
+                    let permit = permits.acquire(Stage::Read);
                     let batch = input.read_games(i).expect("read row group");
                     for row in batch.rows() {
-                        route(row, &mut local_resident, &mut chunks);
+                        route(row, &mut local_resident, &mut chunks, &mut full_chunks);
                     }
+                    drop(permit);
 
                     progress.inc(batch.len() as u64);
+                    for full in full_chunks.drain(..) {
+                        tx.send(full).expect("send chunk");
+                    }
                 }
 
                 for (j, chunk) in chunks.into_iter().enumerate() {
@@ -1196,6 +1264,7 @@ fn write_partition(
     memory_partition: usize,
     sst: &SstContext<'_>,
     threads: usize,
+    permits: &Permits,
 ) {
     if partition.index.is_empty() {
         return;
@@ -1204,9 +1273,7 @@ fn write_partition(
     let ratio = sst.stats.lock().expect("lock stats").ratio();
     let raw_per_range = (SST_ROLL_SIZE as f64 * 0.97 / ratio) as usize;
     let raw_per_game = partition.record_bytes() / partition.index.len();
-    let games_per_range = (raw_per_range / raw_per_game.max(1))
-        .min(partition.index.len().div_ceil(threads))
-        .max(1);
+    let games_per_range = (raw_per_range / raw_per_game.max(1)).max(1);
     let ranges: Vec<&[(GameId, u64)]> = partition.index.chunks(games_per_range).collect();
     let next_range = AtomicUsize::new(0);
 
@@ -1218,6 +1285,7 @@ fn write_partition(
                     let Some(index) = ranges.get(range) else {
                         break;
                     };
+                    let _permit = permits.acquire(Stage::Write);
                     write_sst_range(
                         partition,
                         index,
@@ -1317,7 +1385,7 @@ mod tests {
             memory_bits: 0,
             disk_bits: 0,
         };
-        partition.sort(layout, 3);
+        partition.sort(layout, 3, &Permits::new(3));
         assert_eq!(partition.check_unique(), Err(id("abcdefgh")));
         let result: Vec<(GameId, Vec<u8>)> = partition
             .index
@@ -1347,7 +1415,7 @@ mod tests {
         for game_id in &ids {
             partition.push::<()>(*game_id, |_| Ok(())).unwrap();
         }
-        partition.sort(layout, 4);
+        partition.sort(layout, 4, &Permits::new(2));
         ids.sort();
         assert_eq!(partition.index.iter().map(|e| e.0).collect::<Vec<_>>(), ids);
     }
