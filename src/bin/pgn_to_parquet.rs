@@ -4,7 +4,7 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use lila_openingexplorer4::{
     pgn_to_parquet::{Config, convert},
-    util::ByteSize,
+    util::{ByteSize, total_memory},
 };
 use tikv_jemallocator::Jemalloc;
 
@@ -58,13 +58,6 @@ struct Args {
     moves_zstd_level: i32,
 }
 
-fn total_memory() -> u64 {
-    // SAFETY: sysconf has no preconditions.
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(pages.max(0)).unwrap_or(0) * u64::try_from(page_size.max(0)).unwrap_or(0)
-}
-
 fn main() {
     let args = Args::parse();
 
@@ -77,9 +70,10 @@ fn main() {
         }),
         readers: args.readers,
         games_per_chunk: args.row_group_len,
-        memory_budget: args
-            .memory_budget
-            .map_or_else(|| total_memory() / 10 * 6, u64::from),
+        memory_budget: args.memory_budget.map_or_else(
+            || total_memory().expect("total memory; pass --memory-budget") / 10 * 6,
+            u64::from,
+        ),
         read_buffer: usize::try_from(args.read_buffer.0).expect("read buffer fits in memory"),
         zstd_level: args.zstd_level,
         moves_zstd_level: args.moves_zstd_level,

@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Condvar, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -18,6 +18,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
     packed::GameId,
     parquet::{GameBatch, GameReader, GameRow, PositionalFile},
+    util::total_memory,
 };
 use rocksdb::{BlockBasedOptions, DBCompressionType, Options, SstFileWriter};
 use tikv_jemallocator::Jemalloc;
@@ -215,13 +216,6 @@ impl Estimate {
     }
 }
 
-fn total_memory() -> Option<u64> {
-    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
-}
-
 fn free_space(path: &Path) -> Option<u64> {
     let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { mem::zeroed() };
@@ -264,10 +258,46 @@ static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
 const SORT_BUCKET_BITS: u32 = 3;
 
 /// Bytes currently occupied by scratch files.
-static SCRATCH_USAGE: AtomicU64 = AtomicU64::new(0);
+static SCRATCH_USAGE: Gauge = Gauge::new();
 
 /// Partitions written to SST files so far.
-static WRITTEN_PARTITIONS: AtomicUsize = AtomicUsize::new(0);
+static WRITTEN_PARTITIONS: Gauge = Gauge::new();
+
+/// A counter that threads can wait on.
+struct Gauge {
+    value: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl Gauge {
+    const fn new() -> Gauge {
+        Gauge {
+            value: Mutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn add(&self, n: u64) {
+        *self.value.lock().expect("lock gauge") += n;
+        self.changed.notify_all();
+    }
+
+    fn sub(&self, n: u64) {
+        *self.value.lock().expect("lock gauge") -= n;
+        self.changed.notify_all();
+    }
+
+    /// Blocks until the value satisfies `ready`, and returns the time
+    /// waited.
+    fn wait_until(&self, ready: impl Fn(u64) -> bool) -> Duration {
+        let timer = Instant::now();
+        let mut value = self.value.lock().expect("lock gauge");
+        while !ready(*value) {
+            value = self.changed.wait(value).expect("wait gauge");
+        }
+        timer.elapsed()
+    }
+}
 
 /// Sorts games from parquet files into non-overlapping SST files.
 ///
@@ -350,9 +380,12 @@ struct Args {
 }
 
 /// Bytes of the fixed length prefix of each record.
-const LEN_PREFIX: usize = 4;
+const LEN_PREFIX: usize = 2;
 
-/// Appends a record to a buffer of records: `game_id` (6 bytes), a 4 byte
+// Every value of a record within the size limit fits the length prefix.
+const _: () = assert!(MAX_RECORD_SIZE - GameId::SIZE - LEN_PREFIX <= u16::MAX as usize);
+
+/// Appends a record to a buffer of records: `game_id` (6 bytes), a 2 byte
 /// little endian value length, and the value produced by `pack`. Nothing is
 /// appended if `pack` fails. Returns the offset of the length prefix.
 fn push_record<E>(
@@ -366,12 +399,12 @@ fn push_record<E>(
     buf.extend_from_slice(&[0; LEN_PREFIX]);
     match pack(buf) {
         Ok(()) => {
-            let len = (buf.len() - len_offset - LEN_PREFIX) as u32;
             assert!(
                 buf.len() - start <= MAX_RECORD_SIZE,
                 "record of {} too large",
                 game_id
             );
+            let len = (buf.len() - len_offset - LEN_PREFIX) as u16;
             buf[len_offset..len_offset + LEN_PREFIX].copy_from_slice(&len.to_le_bytes());
             Ok(len_offset as u64)
         }
@@ -380,6 +413,15 @@ fn push_record<E>(
             Err(err)
         }
     }
+}
+
+/// Reads the length prefix at the given offset of a buffer of records.
+fn value_len(records: &[u8], len_offset: usize) -> usize {
+    u16::from_le_bytes(
+        records[len_offset..len_offset + LEN_PREFIX]
+            .try_into()
+            .expect("length prefix"),
+    ) as usize
 }
 
 /// A memory partition, loaded in a compact form ready to be sorted.
@@ -420,11 +462,7 @@ impl MemoryPartition {
     fn value_at(&self, offset: u64) -> &[u8] {
         let chunk = &self.chunks[(offset / CHUNK_STRIDE) as usize];
         let offset = (offset % CHUNK_STRIDE) as usize;
-        let len = u32::from_le_bytes(
-            chunk[offset..offset + LEN_PREFIX]
-                .try_into()
-                .expect("length prefix"),
-        ) as usize;
+        let len = value_len(chunk, offset);
         &chunk[offset + LEN_PREFIX..offset + LEN_PREFIX + len]
     }
 
@@ -434,11 +472,7 @@ impl MemoryPartition {
         while pos < records.len() {
             let game_id = GameId::unpack(&mut &records[pos..]);
             let len_offset = pos + GameId::SIZE;
-            let len = u32::from_le_bytes(
-                records[len_offset..len_offset + LEN_PREFIX]
-                    .try_into()
-                    .expect("length prefix"),
-            ) as usize;
+            let len = value_len(records, len_offset);
             index.push((game_id, base + len_offset as u64));
             pos = len_offset + LEN_PREFIX + len;
         }
@@ -607,7 +641,7 @@ struct ChunkMeta {
     compressed_len: u32,
 }
 
-/// A scratch file holding LZ4 compressed chunks of records.
+/// A scratch file holding compressed chunks of records.
 struct ScratchFile {
     path: PathBuf,
     file: File,
@@ -641,7 +675,7 @@ impl ScratchFile {
             compressed_len: compressed.len() as u32,
         });
         self.len += compressed.len() as u64;
-        SCRATCH_USAGE.fetch_add(compressed.len() as u64, Ordering::Relaxed);
+        SCRATCH_USAGE.add(compressed.len() as u64);
         Ok(())
     }
 
@@ -696,7 +730,7 @@ impl ScratchFile {
     fn remove(self) -> io::Result<()> {
         drop(self.file);
         fs::remove_file(&self.path)?;
-        SCRATCH_USAGE.fetch_sub(self.len, Ordering::Relaxed);
+        SCRATCH_USAGE.sub(self.len);
         Ok(())
     }
 }
@@ -901,7 +935,7 @@ fn main() -> io::Result<()> {
             for (memory_partition, partition) in sorted_rx {
                 let timer = Instant::now();
                 write_partition(&partition, memory_partition, sst, sst_threads);
-                WRITTEN_PARTITIONS.fetch_add(1, Ordering::Relaxed);
+                WRITTEN_PARTITIONS.add(1);
                 let stats = sst.stats.lock().expect("lock stats");
                 log(
                     progress,
@@ -919,18 +953,11 @@ fn main() -> io::Result<()> {
             progress.set_prefix(format!("pass {}/{}", pass + 1, layout.passes()));
             if args.no_overlap && pass > 0 {
                 progress.set_message("waiting for previous pass");
-                let timer = Instant::now();
-                while WRITTEN_PARTITIONS.load(Ordering::Relaxed)
-                    < pass * layout.memory_partitions_per_pass()
-                {
-                    thread::sleep(Duration::from_millis(100));
-                }
+                let waited = WRITTEN_PARTITIONS
+                    .wait_until(|n| n >= (pass * layout.memory_partitions_per_pass()) as u64);
                 log(
                     progress,
-                    format!(
-                        "pass {pass}: waited {:.1?} for previous pass",
-                        timer.elapsed()
-                    ),
+                    format!("pass {pass}: waited {waited:.1?} for previous pass"),
                 );
             }
             progress.set_message("scattering");
@@ -1065,14 +1092,9 @@ fn scatter_pass(
                 for (file, raw) in rx {
                     let compressed = compressor.compress(&raw);
                     if let Some(budget) = config.budget {
-                        let timer = Instant::now();
-                        while SCRATCH_USAGE.load(Ordering::Relaxed) + compressed.len() as u64
-                            > budget
-                        {
-                            thread::sleep(Duration::from_millis(20));
-                        }
-                        throttled_nanos
-                            .fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        let waited = SCRATCH_USAGE
+                            .wait_until(|usage| usage + compressed.len() as u64 <= budget);
+                        throttled_nanos.fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
                     }
                     files[file]
                         .lock()
@@ -1293,6 +1315,34 @@ mod tests {
 
     fn id(s: &str) -> GameId {
         GameId::from_ascii(s.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn test_largest_record() {
+        let value = vec![0xab; MAX_RECORD_SIZE - GameId::SIZE - LEN_PREFIX];
+        let mut chunk = Vec::new();
+        push_record::<()>(&mut chunk, id("abcdefgh"), |buf| {
+            buf.extend_from_slice(&value);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(chunk.len(), MAX_RECORD_SIZE);
+        let mut partition = MemoryPartition::default();
+        MemoryPartition::index_records(&chunk, 0, &mut partition.index);
+        partition.chunks.push(chunk);
+        assert_eq!(partition.index.len(), 1);
+        assert_eq!(partition.value_at(partition.index[0].1), value);
+    }
+
+    #[test]
+    #[should_panic(expected = "too large")]
+    fn test_record_too_large() {
+        let value = vec![0; MAX_RECORD_SIZE - GameId::SIZE - LEN_PREFIX + 1];
+        push_record::<()>(&mut Vec::new(), id("abcdefgh"), |buf| {
+            buf.extend_from_slice(&value);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
