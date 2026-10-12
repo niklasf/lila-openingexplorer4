@@ -254,8 +254,8 @@ const SST_MAX_SIZE: u64 = 512 * 1024 * 1024;
 const SST_ROLL_SIZE: u64 = SST_MAX_SIZE - 16 * 1024 * 1024;
 
 /// Initial guess for the ratio of SST bytes to uncompressed value bytes, used
-/// until measured.
-const INITIAL_SST_RATIO: f64 = 0.9;
+/// until measured (about 1.1 with `PackedMoves` and 4 KB zstd blocks).
+const INITIAL_SST_RATIO: f64 = 1.1;
 
 /// Games that could not be represented as `LichessGame`.
 static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
@@ -410,16 +410,6 @@ impl MemoryPartition {
         self.index
             .push((game_id, chunk as u64 * CHUNK_STRIDE + offset));
         Ok(())
-    }
-
-    /// Appends a chunk of records and indexes them.
-    fn push_chunk(&mut self, chunk: Vec<u8>) {
-        Self::index_records(
-            &chunk,
-            self.chunks.len() as u64 * CHUNK_STRIDE,
-            &mut self.index,
-        );
-        self.chunks.push(chunk);
     }
 
     fn record_bytes(&self) -> usize {
@@ -655,10 +645,11 @@ impl ScratchFile {
         Ok(())
     }
 
-    /// Loads and decompresses all chunks in parallel.
+    /// Loads, decompresses and indexes all chunks in parallel.
     fn load(&self, threads: usize) -> MemoryPartition {
+        type Loaded = (Vec<u8>, Vec<(GameId, u64)>);
         let next = AtomicUsize::new(0);
-        let mut slots: Vec<Option<Vec<u8>>> = (0..self.chunks.len()).map(|_| None).collect();
+        let mut slots: Vec<Option<Loaded>> = (0..self.chunks.len()).map(|_| None).collect();
         let slots_ref = Mutex::new(&mut slots);
 
         thread::scope(|s| {
@@ -678,7 +669,9 @@ impl ScratchFile {
                         let mut raw = new_chunk();
                         raw.resize(chunk.raw_len as usize, 0);
                         decompressor.decompress(&compressed, &mut raw);
-                        slots_ref.lock().expect("lock slots")[i] = Some(raw);
+                        let mut index = Vec::new();
+                        MemoryPartition::index_records(&raw, i as u64 * CHUNK_STRIDE, &mut index);
+                        slots_ref.lock().expect("lock slots")[i] = Some((raw, index));
                     }
                 });
             }
@@ -686,8 +679,16 @@ impl ScratchFile {
 
         let mut partition = MemoryPartition::default();
         partition.chunks.reserve_exact(slots.len());
+        partition.index.reserve_exact(
+            slots
+                .iter()
+                .map(|slot| slot.as_ref().map_or(0, |(_, index)| index.len()))
+                .sum(),
+        );
         for slot in slots {
-            partition.push_chunk(slot.expect("loaded chunk"));
+            let (chunk, index) = slot.expect("loaded chunk");
+            partition.chunks.push(chunk);
+            partition.index.extend(index);
         }
         partition
     }
