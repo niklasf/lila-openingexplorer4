@@ -389,13 +389,12 @@ struct Args {
     /// Override the number of memory partitions.
     #[clap(long)]
     memory_partitions: Option<usize>,
-    /// Write scratch chunks with O_DIRECT, bypassing the page cache.
+    /// Read the input and write and read scratch files through the page
+    /// cache instead of with O_DIRECT. Direct I/O avoids dirty page
+    /// throttling of the scratch writes and reads whole row groups and
+    /// chunks with single requests instead of serial readahead.
     #[clap(long)]
-    scratch_direct: bool,
-    /// Prefetch row groups with O_DIRECT, bypassing the page cache
-    /// (requires --io-depth > 0).
-    #[clap(long)]
-    input_direct: bool,
+    no_direct_io: bool,
     /// Zstd level for scratch chunks, 0 for LZ4, or negative for no
     /// compression. Zstd level 1 saves about
     /// 7% scratch space over LZ4 and makes the whole run about 2% faster on
@@ -408,8 +407,7 @@ struct Args {
     /// Threads for decoding the input (default: half of the threads).
     #[clap(long)]
     read_threads: Option<usize>,
-    /// Concurrent reads of the input, ahead of the decoding threads. With 0,
-    /// each decoding thread reads its own row groups.
+    /// Concurrent reads of the input, ahead of the decoding threads.
     #[clap(long, default_value = "8")]
     io_depth: usize,
     /// Threads for compressing and writing scratch chunks (default: a fifth
@@ -948,7 +946,7 @@ fn main() -> io::Result<()> {
         u64::from,
     );
 
-    let input = Input::open(&args.parquet, args.row_groups, args.input_direct)?;
+    let input = Input::open(&args.parquet, args.row_groups, !args.no_direct_io)?;
 
     let estimate = Estimate::sample(&input);
     let num_rows = estimate.rows;
@@ -1125,8 +1123,8 @@ fn main() -> io::Result<()> {
                     layout,
                     read_threads,
                     write_threads,
-                    io_depth: args.io_depth,
-                    direct: args.scratch_direct,
+                    io_depth: args.io_depth.max(1),
+                    direct: !args.no_direct_io,
                 },
                 progress,
             )
@@ -1241,27 +1239,18 @@ impl ScatterTimes {
     }
 }
 
-/// A row group to decode: fetched ahead by a prefetch thread, or still to
-/// be read by the decoding thread.
-enum FetchedRowGroup {
-    Bytes(usize, RowGroupBytes),
-    Unread(usize),
-}
-
 /// Hands out row groups to decoding threads, prefetching their bytes with
 /// `io_depth` concurrent reads. Cloned into each decoding thread.
 #[derive(Clone)]
 struct Prefetcher<'a> {
     input: &'a Input,
-    next_row_group: Arc<AtomicUsize>,
-    /// Fetched row groups, in flight to the decoding threads. `None` without
-    /// prefetch threads.
-    rx: Option<channel::Receiver<FetchedRowGroup>>,
+    /// Fetched row groups, in flight to the decoding threads.
+    rx: channel::Receiver<(usize, RowGroupBytes)>,
 }
 
 impl<'a> Prefetcher<'a> {
     /// Spawns `io_depth` prefetch threads in the given scope. They finish
-    /// once the input is exhausted or the prefetcher is dropped.
+    /// once the input is exhausted or all decoding threads are done.
     fn spawn<'s>(
         input: &'a Input,
         io_depth: usize,
@@ -1272,52 +1261,33 @@ impl<'a> Prefetcher<'a> {
         'a: 's,
     {
         let next_row_group = Arc::new(AtomicUsize::new(0));
-        let rx = (io_depth > 0).then(|| {
-            let (tx, rx) = channel::bounded(io_depth);
-            for _ in 0..io_depth {
-                let tx = tx.clone();
-                let next_row_group = Arc::clone(&next_row_group);
-                s.spawn(move || {
-                    while let Some(i) = Self::next(input, &next_row_group) {
-                        let bytes =
-                            timed(&times.fetch, || input.fetch(i)).expect("fetch row group");
-                        if timed(&times.fetch_send, || {
-                            tx.send(FetchedRowGroup::Bytes(i, bytes))
-                        })
-                        .is_err()
-                        {
-                            break;
-                        }
+        let (tx, rx) = channel::bounded(io_depth);
+        for _ in 0..io_depth {
+            let tx = tx.clone();
+            let next_row_group = Arc::clone(&next_row_group);
+            s.spawn(move || {
+                loop {
+                    let i = next_row_group.fetch_add(1, Ordering::Relaxed);
+                    if i >= input.num_row_groups() {
+                        break;
                     }
-                });
-            }
-            rx
-        });
-        Prefetcher {
-            input,
-            next_row_group,
-            rx,
+                    let bytes = timed(&times.fetch, || input.fetch(i)).expect("fetch row group");
+                    if timed(&times.fetch_send, || tx.send((i, bytes))).is_err() {
+                        break;
+                    }
+                }
+            });
         }
-    }
-
-    fn next(input: &Input, next_row_group: &AtomicUsize) -> Option<usize> {
-        let i = next_row_group.fetch_add(1, Ordering::Relaxed);
-        (i < input.num_row_groups()).then_some(i)
+        Prefetcher { input, rx }
     }
 
     /// The next row group to decode, or `None` at the end of the input.
-    fn recv(&self) -> Option<FetchedRowGroup> {
-        match &self.rx {
-            Some(rx) => rx.recv().ok(),
-            None => Self::next(self.input, &self.next_row_group).map(FetchedRowGroup::Unread),
-        }
+    fn recv(&self) -> Option<(usize, RowGroupBytes)> {
+        self.rx.recv().ok()
     }
 
-    fn decode(&self, fetched: FetchedRowGroup) -> parquet::errors::Result<(usize, GameBatch)> {
-        match fetched {
-            FetchedRowGroup::Bytes(i, bytes) => Ok((i, self.input.read_games_from(i, bytes)?)),
-            FetchedRowGroup::Unread(i) => Ok((i, self.input.read_games(i)?)),
-        }
+    fn decode(&self, (i, bytes): (usize, RowGroupBytes)) -> parquet::errors::Result<GameBatch> {
+        self.input.read_games_from(i, bytes)
     }
 }
 
@@ -1426,7 +1396,7 @@ fn scatter_pass(
                 };
 
                 while let Some(fetched) = timed(&times.recv, || prefetcher.recv()) {
-                    let (_, batch) = timed(&times.decode, || prefetcher.decode(fetched))
+                    let batch = timed(&times.decode, || prefetcher.decode(fetched))
                         .expect("read row group");
                     timed(&times.route, || {
                         for row in batch.rows() {
