@@ -5,15 +5,16 @@ use arrow_array::{
     RecordBatchReader, StringArray, cast::AsArray, types::Int32Type,
 };
 use arrow_schema::{DataType, Schema};
+use bytes::{Buf, Bytes};
 use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
     },
-    errors::Result,
+    errors::{ParquetError, Result},
     file::{
         metadata::{ParquetMetaData, ParquetMetaDataReader},
-        reader::ChunkReader,
+        reader::{ChunkReader, Length},
     },
 };
 use shakmaty::ByColor;
@@ -78,16 +79,19 @@ impl<T: ChunkReader + Clone + 'static> GameReader<T> {
         self.metadata().num_row_groups()
     }
 
-    fn read(&self, row_group: usize, projection: ProjectionMask) -> Result<RecordBatch> {
+    fn read<R: ChunkReader + 'static>(
+        &self,
+        input: R,
+        row_group: usize,
+        projection: ProjectionMask,
+    ) -> Result<RecordBatch> {
         let num_rows = self.metadata().row_group(row_group).num_rows() as usize;
-        let mut reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
-            self.input.clone(),
-            self.metadata.clone(),
-        )
-        .with_projection(projection)
-        .with_row_groups(vec![row_group])
-        .with_batch_size(num_rows.max(1))
-        .build()?;
+        let mut reader =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(input, self.metadata.clone())
+                .with_projection(projection)
+                .with_row_groups(vec![row_group])
+                .with_batch_size(num_rows.max(1))
+                .build()?;
         let batch = match reader.next() {
             Some(batch) => batch?,
             None => RecordBatch::new_empty(reader.schema()),
@@ -97,11 +101,40 @@ impl<T: ChunkReader + Clone + 'static> GameReader<T> {
     }
 
     pub fn read_games(&self, row_group: usize) -> Result<GameBatch> {
-        self.read(row_group, ProjectionMask::all()).map(GameBatch)
+        self.read(self.input.clone(), row_group, ProjectionMask::all())
+            .map(GameBatch)
+    }
+
+    /// Byte range of all column chunks of a row group.
+    fn row_group_byte_range(&self, row_group: usize) -> (u64, u64) {
+        let (mut start, mut end) = (u64::MAX, 0);
+        for column in self.metadata().row_group(row_group).columns() {
+            let (column_start, column_len) = column.byte_range();
+            start = start.min(column_start);
+            end = end.max(column_start + column_len);
+        }
+        (start.min(end), end)
+    }
+
+    /// Reads all bytes of a row group with a single read, so that
+    /// `read_games_from` can decode it without touching the input again.
+    pub fn fetch_row_group(&self, row_group: usize) -> Result<RowGroupBytes> {
+        let (start, end) = self.row_group_byte_range(row_group);
+        Ok(RowGroupBytes {
+            start,
+            file_len: self.input.len(),
+            bytes: self.input.get_bytes(start, (end - start) as usize)?,
+        })
+    }
+
+    pub fn read_games_from(&self, row_group: usize, bytes: RowGroupBytes) -> Result<GameBatch> {
+        self.read(bytes, row_group, ProjectionMask::all())
+            .map(GameBatch)
     }
 
     pub fn read_game_ids(&self, row_group: usize) -> Result<Vec<GameId>> {
         let batch = self.read(
+            self.input.clone(),
             row_group,
             ProjectionMask::columns(self.metadata.parquet_schema(), ["game_id"]),
         )?;
@@ -115,6 +148,59 @@ impl<T: ChunkReader + Clone + 'static> GameReader<T> {
             .iter()
             .map(|game_id| GameId::unpack(&mut game_id.as_slice()))
             .collect())
+    }
+}
+
+/// The bytes of one row group, serving reads at the file offsets they came
+/// from.
+#[derive(Clone)]
+pub struct RowGroupBytes {
+    start: u64,
+    file_len: u64,
+    bytes: Bytes,
+}
+
+impl RowGroupBytes {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn slice(&self, start: u64, length: usize) -> Result<Bytes> {
+        let end = self.start + self.bytes.len() as u64;
+        match start.checked_sub(self.start) {
+            Some(offset) if start + length as u64 <= end => {
+                Ok(self.bytes.slice(offset as usize..offset as usize + length))
+            }
+            _ => Err(ParquetError::EOF(format!(
+                "read of {length} bytes at {start} outside of row group bytes {}..{end}",
+                self.start
+            ))),
+        }
+    }
+}
+
+impl Length for RowGroupBytes {
+    fn len(&self) -> u64 {
+        self.file_len
+    }
+}
+
+impl ChunkReader for RowGroupBytes {
+    type T = bytes::buf::Reader<Bytes>;
+
+    fn get_read(&self, start: u64) -> Result<Self::T> {
+        let end = self.start + self.bytes.len() as u64;
+        Ok(self
+            .slice(start, end.saturating_sub(start) as usize)?
+            .reader())
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+        self.slice(start, length)
     }
 }
 
@@ -254,7 +340,6 @@ fn optional_int(array: &Int32Array, i: usize) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use parquet::file::writer::SerializedFileWriter;
     use shakmaty::Outcome;
 
@@ -306,6 +391,7 @@ mod tests {
         columns.write_row_group(&mut writer).unwrap();
         writer.close().unwrap();
 
+        let file_len = file.len();
         let reader = GameReader::try_new(Bytes::from(file)).unwrap();
         assert_eq!(reader.num_row_groups(), 1);
         let batch = reader.read_games(0).unwrap();
@@ -318,6 +404,12 @@ mod tests {
             row.pack_lichess_game(&mut buf).map(|()| buf)
         };
         let expected: Vec<_> = columns.rows().map(pack).collect();
+        let actual: Vec<_> = batch.rows().map(pack).collect();
+        assert_eq!(actual, expected);
+
+        let fetched = reader.fetch_row_group(0).unwrap();
+        assert!(fetched.len() < file_len);
+        let batch = reader.read_games_from(0, fetched).unwrap();
         let actual: Vec<_> = batch.rows().map(pack).collect();
         assert_eq!(actual, expected);
 

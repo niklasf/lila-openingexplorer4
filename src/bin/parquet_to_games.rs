@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
-        Condvar, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -17,7 +17,7 @@ use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use lila_openingexplorer4::{
     packed::GameId,
-    parquet::{GameBatch, GameReader, GameRow, PositionalFile},
+    parquet::{GameBatch, GameReader, GameRow, PositionalFile, RowGroupBytes},
     util::{ByteSize, total_memory},
 };
 use rocksdb::{BlockBasedOptions, DBCompressionType, Options, SstFileWriter};
@@ -115,6 +115,20 @@ impl Input {
     fn read_games(&self, row_group: usize) -> parquet::errors::Result<GameBatch> {
         let (r, i) = self.row_groups[row_group];
         self.readers[r].read_games(i)
+    }
+
+    fn fetch(&self, row_group: usize) -> parquet::errors::Result<RowGroupBytes> {
+        let (r, i) = self.row_groups[row_group];
+        self.readers[r].fetch_row_group(i)
+    }
+
+    fn read_games_from(
+        &self,
+        row_group: usize,
+        bytes: RowGroupBytes,
+    ) -> parquet::errors::Result<GameBatch> {
+        let (r, i) = self.row_groups[row_group];
+        self.readers[r].read_games_from(i, bytes)
     }
 }
 
@@ -341,9 +355,13 @@ struct Args {
     /// Directory for the final SST files.
     #[clap(long)]
     out: PathBuf,
-    /// Threads for reading the input (default: half of the threads).
+    /// Threads for decoding the input (default: half of the threads).
     #[clap(long)]
     read_threads: Option<usize>,
+    /// Concurrent reads of the input, ahead of the decoding threads. With 0,
+    /// each decoding thread reads its own row groups.
+    #[clap(long, default_value = "8")]
+    io_depth: usize,
     /// Threads for compressing and writing scratch chunks (default: a fifth
     /// of the threads).
     #[clap(long)]
@@ -976,6 +994,7 @@ fn main() -> io::Result<()> {
                     layout,
                     read_threads,
                     write_threads,
+                    io_depth: args.io_depth,
                 },
                 progress,
             )
@@ -1047,6 +1066,77 @@ struct ScatterConfig<'a> {
     layout: Layout,
     read_threads: usize,
     write_threads: usize,
+    io_depth: usize,
+}
+
+/// A row group to decode: fetched ahead by a prefetch thread, or still to
+/// be read by the decoding thread.
+enum FetchedRowGroup {
+    Bytes(usize, RowGroupBytes),
+    Unread(usize),
+}
+
+/// Hands out row groups to decoding threads, prefetching their bytes with
+/// `io_depth` concurrent reads. Cloned into each decoding thread.
+#[derive(Clone)]
+struct Prefetcher<'a> {
+    input: &'a Input,
+    next_row_group: Arc<AtomicUsize>,
+    /// Fetched row groups, in flight to the decoding threads. `None` without
+    /// prefetch threads.
+    rx: Option<channel::Receiver<FetchedRowGroup>>,
+}
+
+impl<'a> Prefetcher<'a> {
+    /// Spawns `io_depth` prefetch threads in the given scope. They finish
+    /// once the input is exhausted or the prefetcher is dropped.
+    fn spawn<'s>(input: &'a Input, io_depth: usize, s: &'s thread::Scope<'s, '_>) -> Prefetcher<'a>
+    where
+        'a: 's,
+    {
+        let next_row_group = Arc::new(AtomicUsize::new(0));
+        let rx = (io_depth > 0).then(|| {
+            let (tx, rx) = channel::bounded(io_depth);
+            for _ in 0..io_depth {
+                let tx = tx.clone();
+                let next_row_group = Arc::clone(&next_row_group);
+                s.spawn(move || {
+                    while let Some(i) = Self::next(input, &next_row_group) {
+                        let bytes = input.fetch(i).expect("fetch row group");
+                        if tx.send(FetchedRowGroup::Bytes(i, bytes)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            rx
+        });
+        Prefetcher {
+            input,
+            next_row_group,
+            rx,
+        }
+    }
+
+    fn next(input: &Input, next_row_group: &AtomicUsize) -> Option<usize> {
+        let i = next_row_group.fetch_add(1, Ordering::Relaxed);
+        (i < input.num_row_groups()).then_some(i)
+    }
+
+    /// The next row group to decode, or `None` at the end of the input.
+    fn recv(&self) -> Option<FetchedRowGroup> {
+        match &self.rx {
+            Some(rx) => rx.recv().ok(),
+            None => Self::next(self.input, &self.next_row_group).map(FetchedRowGroup::Unread),
+        }
+    }
+
+    fn decode(&self, fetched: FetchedRowGroup) -> parquet::errors::Result<(usize, GameBatch)> {
+        match fetched {
+            FetchedRowGroup::Bytes(i, bytes) => Ok((i, self.input.read_games_from(i, bytes)?)),
+            FetchedRowGroup::Unread(i) => Ok((i, self.input.read_games(i)?)),
+        }
+    }
 }
 
 /// Reads the entire input and distributes the games of the given disk
@@ -1075,14 +1165,13 @@ fn scatter_pass(
         .collect::<io::Result<_>>()?;
 
     let resident: Mutex<Vec<MemoryPartition>> = Mutex::new(Vec::new());
-    let next_row_group = AtomicUsize::new(0);
     let throttled_nanos = AtomicU64::new(0);
 
     thread::scope(|s| {
         let files = &files;
         let resident = &resident;
-        let next_row_group = &next_row_group;
         let throttled_nanos = &throttled_nanos;
+        let prefetcher = Prefetcher::spawn(input, config.io_depth, s);
 
         // Write threads compress full chunks and append them to scratch
         // files, throttled by the scratch budget.
@@ -1114,6 +1203,7 @@ fn scatter_pass(
         // resident partitions or scratch chunks.
         for _ in 0..config.read_threads {
             let tx = tx.clone();
+            let prefetcher = prefetcher.clone();
             s.spawn(move || {
                 let mut local_resident: Vec<MemoryPartition> = (0..RESIDENT_PARTITIONS_PER_PASS)
                     .map(|_| MemoryPartition::default())
@@ -1148,12 +1238,8 @@ fn scatter_pass(
                     }
                 };
 
-                loop {
-                    let i = next_row_group.fetch_add(1, Ordering::Relaxed);
-                    if i >= input.num_row_groups() {
-                        break;
-                    }
-                    let batch = input.read_games(i).expect("read row group");
+                while let Some(fetched) = prefetcher.recv() {
+                    let (_, batch) = prefetcher.decode(fetched).expect("read row group");
                     for row in batch.rows() {
                         route(row, &mut local_resident, &mut chunks);
                     }
