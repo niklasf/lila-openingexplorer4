@@ -75,6 +75,10 @@ impl<T: ChunkReader + Clone + 'static> GameReader<T> {
         self.metadata.metadata()
     }
 
+    pub fn input(&self) -> &T {
+        &self.input
+    }
+
     pub fn num_row_groups(&self) -> usize {
         self.metadata().num_row_groups()
     }
@@ -106,7 +110,7 @@ impl<T: ChunkReader + Clone + 'static> GameReader<T> {
     }
 
     /// Byte range of all column chunks of a row group.
-    fn row_group_byte_range(&self, row_group: usize) -> (u64, u64) {
+    pub fn row_group_byte_range(&self, row_group: usize) -> (u64, u64) {
         let (mut start, mut end) = (u64::MAX, 0);
         for column in self.metadata().row_group(row_group).columns() {
             let (column_start, column_len) = column.byte_range();
@@ -120,11 +124,11 @@ impl<T: ChunkReader + Clone + 'static> GameReader<T> {
     /// `read_games_from` can decode it without touching the input again.
     pub fn fetch_row_group(&self, row_group: usize) -> Result<RowGroupBytes> {
         let (start, end) = self.row_group_byte_range(row_group);
-        Ok(RowGroupBytes {
+        Ok(RowGroupBytes::new(
             start,
-            file_len: self.input.len(),
-            bytes: self.input.get_bytes(start, (end - start) as usize)?,
-        })
+            self.input.len(),
+            self.input.get_bytes(start, (end - start) as usize)?,
+        ))
     }
 
     pub fn read_games_from(&self, row_group: usize, bytes: RowGroupBytes) -> Result<GameBatch> {
@@ -161,6 +165,15 @@ pub struct RowGroupBytes {
 }
 
 impl RowGroupBytes {
+    /// Wraps the bytes at offset `start` of a file of `file_len` bytes.
+    pub fn new(start: u64, file_len: u64, bytes: Bytes) -> RowGroupBytes {
+        RowGroupBytes {
+            start,
+            file_len,
+            bytes,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
