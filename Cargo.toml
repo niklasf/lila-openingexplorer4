@@ -20,15 +20,19 @@ nohash-hasher = "0.2.0"
 parquet = { version = "60.0.0", default-features = false, features = ["zstd", "lz4", "arrow"] }
 pgn-reader = { version = "0.29.1", git = "https://github.com/niklasf/shakmaty.git", branch = "main" }
 roaring = "0.11.4"
-rocksdb = { version = "0.24.0", features = ["lz4", "zstd", "jemalloc"], default-features = false }
+rocksdb = { version = "0.25.0", features = ["lz4", "zstd", "jemalloc"], default-features = false }
 rustc-hash = "2.1.1"
 shakmaty = { version = "0.30.2", git = "https://github.com/niklasf/shakmaty.git", branch = "main", features = ["arbitrary", "variant", "nohash-hasher"] }
 thiserror = "2.0.12"
-tikv-jemallocator = "0.6.1"
+tikv-jemallocator = "0.7"
 zstd = "0.13.3"
 
 [dev-dependencies]
 arbtest = "0.3.2"
+
+[patch.crates-io]
+# Pending upstream: EnvOptions::set_use_direct_writes for SstFileWriter.
+rocksdb = { path = "../rust-rocksdb" }
 
 [profile.release]
 debug = true

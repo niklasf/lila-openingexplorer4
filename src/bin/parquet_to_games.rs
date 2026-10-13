@@ -20,7 +20,7 @@ use lila_openingexplorer4::{
     parquet::{GameBatch, GameReader, GameRow, PositionalFile, RowGroupBytes},
     util::{ByteSize, total_memory},
 };
-use rocksdb::{BlockBasedOptions, DBCompressionType, Options, SstFileWriter};
+use rocksdb::{BlockBasedOptions, DBCompressionType, EnvOptions, Options, SstFileWriter};
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -389,9 +389,9 @@ struct Args {
     /// Override the number of memory partitions.
     #[clap(long)]
     memory_partitions: Option<usize>,
-    /// Read the input and write and read scratch files through the page
-    /// cache instead of with O_DIRECT. Direct I/O avoids dirty page
-    /// throttling of the scratch writes and reads whole row groups and
+    /// Read the input and write and read scratch files and write SST files
+    /// through the page cache instead of with O_DIRECT. Direct I/O avoids
+    /// dirty page throttling of the writes and reads whole row groups and
     /// chunks with single requests instead of serial readahead.
     #[clap(long)]
     no_direct_io: bool,
@@ -896,6 +896,7 @@ struct PartitionJob {
 
 struct SstContext<'a> {
     opts: &'a Options,
+    env_opts: &'a EnvOptions,
     out: &'a Path,
     stats: Mutex<SstStats>,
 }
@@ -1013,8 +1014,11 @@ fn main() -> io::Result<()> {
     let mut table_opts = BlockBasedOptions::default();
     table_opts.set_block_size(args.sst_block_size);
     sst_opts.set_block_based_table_factory(&table_opts);
+    let mut sst_env_opts = EnvOptions::default();
+    sst_env_opts.set_use_direct_writes(!args.no_direct_io);
     let sst = SstContext {
         opts: &sst_opts,
+        env_opts: &sst_env_opts,
         out: &args.out,
         stats: Mutex::new(SstStats::default()),
     };
@@ -1536,7 +1540,7 @@ fn write_sst_range(
         let w = match &mut writer {
             Some(w) => w,
             None => {
-                let w = SstFileWriter::create(sst.opts);
+                let w = SstFileWriter::create_with_env_options(sst.opts, sst.env_opts);
                 w.open(sst.out.join(format!("{prefix}_{seq}.sst")))?;
                 seq += 1;
                 writer.insert(w)
