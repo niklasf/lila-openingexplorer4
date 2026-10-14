@@ -11,6 +11,7 @@ use crate::{
         partition::{MemoryPartition, RUN_BUCKET_BITS, RUN_BUCKETS},
         record::{Record, SubKey},
     },
+    scatter::{seconds, timed},
     sst::{SST_MAX_SIZE, SST_ROLL_SIZE, SstContext},
 };
 
@@ -20,6 +21,28 @@ const INITIAL_COLD_RATIO: f64 = 1.15;
 
 /// Raw bytes of a cold record: hash and game id.
 const COLD_RECORD_BYTES: usize = Zobrist96::SIZE + GameId::SIZE;
+
+/// Accumulated time of each writing stage, summed over its threads.
+#[derive(Default)]
+pub struct WriteTimes {
+    /// Merging records and grouping them by key.
+    pub merge: AtomicU64,
+    /// Packing entries.
+    pub pack: AtomicU64,
+    /// Putting keys into SST files, including compression and I/O.
+    pub put: AtomicU64,
+}
+
+impl WriteTimes {
+    pub fn summary(&self) -> String {
+        format!(
+            "merge {:.1}, pack {:.1}, put {:.1}",
+            seconds(&self.merge),
+            seconds(&self.pack),
+            seconds(&self.put)
+        )
+    }
+}
 
 /// Output of a run: the two column families and their counters.
 pub struct Output {
@@ -109,6 +132,7 @@ pub fn write_partition(
     partition_bits: u32,
     output: &Output,
     threads: usize,
+    times: &WriteTimes,
 ) {
     let records = partition.len();
     let hot_lo = hot.partition_point(|h| h.hash() < lo);
@@ -144,7 +168,7 @@ pub fn write_partition(
     std::thread::scope(|s| {
         for _ in 0..threads.min(ranges) {
             s.spawn(|| {
-                let mut writer = RangeWriter::new(output, hot_set);
+                let mut writer = RangeWriter::new(output, hot_set, times);
                 loop {
                     let i = next_range.fetch_add(1, Ordering::Relaxed);
                     if i >= ranges {
@@ -176,16 +200,18 @@ pub fn write_partition(
 struct RangeWriter<'a> {
     output: &'a Output,
     hot_set: &'a HotSet,
+    times: &'a WriteTimes,
     group: Vec<Record>,
     subs: Vec<(SubKey, SubStats, Vec<GameId>)>,
     value: Vec<u8>,
 }
 
 impl<'a> RangeWriter<'a> {
-    fn new(output: &'a Output, hot_set: &'a HotSet) -> RangeWriter<'a> {
+    fn new(output: &'a Output, hot_set: &'a HotSet, times: &'a WriteTimes) -> RangeWriter<'a> {
         RangeWriter {
             output,
             hot_set,
+            times,
             group: Vec::new(),
             subs: Vec::new(),
             value: Vec::new(),
@@ -224,13 +250,15 @@ impl<'a> RangeWriter<'a> {
 
             // Records of the hash.
             self.group.clear();
-            while let Some(record) = pending {
-                if record.hash_words() != hash_words {
-                    break;
+            timed(&self.times.merge, || {
+                while let Some(record) = pending {
+                    if record.hash_words() != hash_words {
+                        break;
+                    }
+                    self.group.push(record);
+                    pending = merge.next();
                 }
-                self.group.push(record);
-                pending = merge.next();
-            }
+            });
             records += self.group.len() as u64;
 
             // Hot entries of the hash.
@@ -244,7 +272,9 @@ impl<'a> RangeWriter<'a> {
                 && self.group.len() == 1
                 && !self.hot_set.contains(hash.prefix())
             {
-                cold.put(hash.as_bytes(), &self.group[0].0[18..24])?;
+                timed(&self.times.put, || {
+                    cold.put(hash.as_bytes(), &self.group[0].0[18..24])
+                })?;
                 cold_keys += 1;
                 continue;
             }
@@ -273,7 +303,7 @@ impl<'a> RangeWriter<'a> {
                         h += 1;
                         records += hot_entry.records;
                         if month_records.is_empty() {
-                            positions.put(&key, &hot_entry.value)?;
+                            timed(&self.times.put, || positions.put(&key, &hot_entry.value))?;
                         } else {
                             // A hot position that leaked into the partition:
                             // merge with the slow path.
@@ -292,12 +322,14 @@ impl<'a> RangeWriter<'a> {
                             entry.truncate_games(GAMES_PER_SUB_ENTRY);
                             self.value.clear();
                             entry.pack_entire(&mut self.value);
-                            positions.put(&key, &self.value)?;
+                            timed(&self.times.put, || positions.put(&key, &self.value))?;
                         }
                     }
                     None => {
-                        pack_records(month_records, &mut self.subs, &mut self.value);
-                        positions.put(&key, &self.value)?;
+                        timed(&self.times.pack, || {
+                            pack_records(month_records, &mut self.subs, &mut self.value)
+                        });
+                        timed(&self.times.put, || positions.put(&key, &self.value))?;
                     }
                 }
                 position_keys += 1;

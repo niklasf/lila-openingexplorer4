@@ -13,8 +13,29 @@ use std::{
 
 use crate::{
     parquet_to_positions::record::{CHUNK_RECORDS, Record, decode_chunk},
-    scatter::{AlignedBuf, ChunkDecompressor, ScratchFile},
+    scatter::{AlignedBuf, ChunkDecompressor, ScratchFile, seconds, timed},
 };
+
+/// Accumulated time of each loading stage, summed over its threads.
+#[derive(Default)]
+pub struct LoadTimes {
+    pub read: std::sync::atomic::AtomicU64,
+    pub decompress: std::sync::atomic::AtomicU64,
+    pub decode: std::sync::atomic::AtomicU64,
+    pub sort: std::sync::atomic::AtomicU64,
+}
+
+impl LoadTimes {
+    pub fn summary(&self) -> String {
+        format!(
+            "read {:.1}, decompress {:.1}, decode and bucket {:.1}, sort {:.1}",
+            seconds(&self.read),
+            seconds(&self.decompress),
+            seconds(&self.decode),
+            seconds(&self.sort)
+        )
+    }
+}
 
 /// Bits of the hash, after the partition bits, that split a run into
 /// buckets. Sorting small buckets is faster than sorting a whole run, and
@@ -78,7 +99,12 @@ impl MemoryPartition {
     /// sorting in parallel. Chunks are assigned to threads round robin.
     /// `partition_bits` are the hash bits shared by all records of the
     /// partition.
-    pub fn load(scratch: &ScratchFile, threads: usize, partition_bits: u32) -> MemoryPartition {
+    pub fn load(
+        scratch: &ScratchFile,
+        threads: usize,
+        partition_bits: u32,
+        times: &LoadTimes,
+    ) -> MemoryPartition {
         let chunks = scratch.chunks();
         let threads = threads.clamp(1, chunks.len().max(1));
         let shift = 64 - partition_bits - RUN_BUCKET_BITS;
@@ -103,17 +129,22 @@ impl MemoryPartition {
                     let mut raw = Vec::with_capacity(CHUNK_RECORDS * std::mem::size_of::<Record>());
                     let mut records = Vec::with_capacity(CHUNK_RECORDS);
                     for (i, chunk) in chunks.iter().enumerate().skip(t).step_by(threads) {
-                        let bytes = scratch.read_chunk(i, &mut compressed).expect("read chunk");
+                        let bytes = timed(&times.read, || scratch.read_chunk(i, &mut compressed))
+                            .expect("read chunk");
                         raw.clear();
                         raw.resize(chunk.raw_len as usize, 0);
-                        decompressor.decompress(bytes, &mut raw);
-                        records.clear();
-                        decode_chunk(&raw, &mut records);
-                        for &record in &records {
-                            run.push(record, shift);
-                        }
+                        timed(&times.decompress, || {
+                            decompressor.decompress(bytes, &mut raw)
+                        });
+                        timed(&times.decode, || {
+                            records.clear();
+                            decode_chunk(&raw, &mut records);
+                            for &record in &records {
+                                run.push(record, shift);
+                            }
+                        });
                     }
-                    run.sort();
+                    timed(&times.sort, || run.sort());
                 });
             }
         });
@@ -132,6 +163,7 @@ impl MemoryPartition {
         chunks: Vec<Vec<Record>>,
         threads: usize,
         partition_bits: u32,
+        times: &LoadTimes,
     ) -> MemoryPartition {
         let threads = threads.clamp(1, chunks.len().max(1));
         let shift = 64 - partition_bits - RUN_BUCKET_BITS;
@@ -153,11 +185,13 @@ impl MemoryPartition {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(chunk) = chunks.get(i) else { break };
                         let chunk = chunk.lock().expect("lock chunk").take().expect("chunk");
-                        for record in chunk {
-                            run.push(record, shift);
-                        }
+                        timed(&times.decode, || {
+                            for record in chunk {
+                                run.push(record, shift);
+                            }
+                        });
                     }
-                    run.sort();
+                    timed(&times.sort, || run.sort());
                 });
             }
         });
@@ -277,7 +311,8 @@ mod tests {
                 all.extend(&chunk);
                 chunks.push(chunk);
             }
-            let partition = MemoryPartition::from_unsorted(chunks, 3, partition_bits);
+            let partition =
+                MemoryPartition::from_unsorted(chunks, 3, partition_bits, &LoadTimes::default());
             assert_eq!(partition.len(), all.len());
             all.sort_unstable();
             let lo = u.int_in_range(0..=RUN_BUCKETS)?;

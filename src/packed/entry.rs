@@ -265,6 +265,33 @@ impl LichessEntry {
         }
     }
 
+    /// Games of all moves and groups.
+    pub fn total_games(&self) -> u64 {
+        self.moves
+            .values()
+            .flat_map(|groups| groups.values())
+            .map(|sub| sub.white + sub.black + sub.draws)
+            .sum()
+    }
+
+    /// Games that played the given move.
+    pub fn games_for_move(&self, m: PackedUciMove) -> u64 {
+        self.moves.get(&m).map_or(0, |groups| {
+            groups
+                .values()
+                .map(|sub| sub.white + sub.black + sub.draws)
+                .sum()
+        })
+    }
+
+    /// Whether the game is among the kept games of any sub-entry.
+    pub fn contains_game(&self, game_id: GameId) -> bool {
+        self.moves
+            .values()
+            .flat_map(|groups| groups.values())
+            .any(|sub| sub.games.iter().any(|(_, id)| *id == game_id))
+    }
+
     pub fn truncate_games(&mut self, limit: usize) {
         let mut deleted_indexes = Vec::new();
         for move_entries in self.moves.values_mut() {

@@ -40,10 +40,10 @@ use crate::{
     parquet::{Input, PrefetchTimes, Prefetcher},
     parquet_to_positions::{
         hot::{HotMap, HotPacked, HotSet, LocalHot},
-        partition::MemoryPartition,
+        partition::{LoadTimes, MemoryPartition},
         record::{CHUNK_BYTES, CHUNK_RECORDS, ChunkEncoder, RECORD_SIZE, Record},
         replay::{Replayer, Skip},
-        write::{Output, write_partition},
+        write::{Output, WriteTimes, write_partition},
     },
     scatter::{ChunkCompressor, Gauge, Layout, ScratchFile, seconds, timed},
     sst::{SstConfig, SstContext, SstStats},
@@ -612,13 +612,17 @@ pub fn convert(
             for job in job_rx {
                 let memory_partition = job.memory_partition;
                 let timer = Instant::now();
+                let times = LoadTimes::default();
                 let partition = match job.source {
-                    PartitionSource::Resident(chunks) => {
-                        MemoryPartition::from_unsorted(chunks, load_threads, partition_bits)
-                    }
+                    PartitionSource::Resident(chunks) => MemoryPartition::from_unsorted(
+                        chunks,
+                        load_threads,
+                        partition_bits,
+                        &times,
+                    ),
                     PartitionSource::Scratch(scratch) => {
                         let partition =
-                            MemoryPartition::load(&scratch, load_threads, partition_bits);
+                            MemoryPartition::load(&scratch, load_threads, partition_bits, &times);
                         scratch
                             .remove(&counters.scratch_usage)
                             .expect("remove scratch");
@@ -628,10 +632,11 @@ pub fn convert(
                 log(
                     progress,
                     format!(
-                        "partition {memory_partition}: load and sort {:.1?} ({} records in {} runs)",
+                        "partition {memory_partition}: load and sort {:.1?} ({} records in {} runs; thread seconds: {})",
                         timer.elapsed(),
                         partition.len(),
-                        partition.runs.len()
+                        partition.runs.len(),
+                        times.summary(),
                     ),
                 );
                 sorted_tx
@@ -645,6 +650,7 @@ pub fn convert(
             for (memory_partition, partition) in sorted_rx {
                 let timer = Instant::now();
                 let (lo, hi) = key_space.range(memory_partition);
+                let times = WriteTimes::default();
                 write_partition(
                     &partition,
                     hot_packed.get().expect("hot entries"),
@@ -655,6 +661,7 @@ pub fn convert(
                     partition_bits,
                     output,
                     sst_threads,
+                    &times,
                 );
                 counters.written_partitions.add(1);
                 let cold = output.cold.stats.get();
@@ -662,12 +669,13 @@ pub fn convert(
                 log(
                     progress,
                     format!(
-                        "partition {memory_partition}: write {:.1?} ({} cold and {} positions files so far, {:.1} and {:.1} bytes per key)",
+                        "partition {memory_partition}: write {:.1?} ({} cold and {} positions files so far, {:.1} and {:.1} bytes per key; thread seconds: {})",
                         timer.elapsed(),
                         cold.files,
                         positions.files,
                         cold.bytes as f64 / cold.keys.max(1) as f64,
                         positions.bytes as f64 / positions.keys.max(1) as f64,
+                        times.summary(),
                     ),
                 );
             }
@@ -1008,15 +1016,18 @@ fn scatter_pass(
                 }
 
                 let counters = config.counters;
-                counters.games.fetch_add(games, Ordering::Relaxed);
-                for (count, skipped) in counters.skipped.iter().zip(skipped) {
-                    count.fetch_add(skipped, Ordering::Relaxed);
+                if pass == 0 {
+                    // Every pass replays all games; count them once.
+                    counters.games.fetch_add(games, Ordering::Relaxed);
+                    for (count, skipped) in counters.skipped.iter().zip(skipped) {
+                        count.fetch_add(skipped, Ordering::Relaxed);
+                    }
+                    counters.records.fetch_add(records, Ordering::Relaxed);
+                    counters
+                        .hot_records
+                        .fetch_add(hot_records, Ordering::Relaxed);
+                    counters.loops.fetch_add(replayer.loops, Ordering::Relaxed);
                 }
-                counters.records.fetch_add(records, Ordering::Relaxed);
-                counters
-                    .hot_records
-                    .fetch_add(hot_records, Ordering::Relaxed);
-                counters.loops.fetch_add(replayer.loops, Ordering::Relaxed);
                 resident
                     .lock()
                     .expect("lock resident")
