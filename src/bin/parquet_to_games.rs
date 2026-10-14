@@ -14,7 +14,7 @@ static ALLOC: Jemalloc = Jemalloc;
 /// Sorts games from parquet files into non-overlapping SST files.
 ///
 /// Scans the parquet files multiple times, loading and sorting partitions
-/// into memory. Uses disk scratch space to reduce the number of passes over the
+/// in memory. Uses disk scratch space to reduce the number of passes over the
 /// full input.
 #[derive(Parser)]
 struct Args {
