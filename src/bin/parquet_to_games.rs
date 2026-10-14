@@ -60,22 +60,6 @@ struct Args {
     /// Directory for the final SST files.
     #[clap(long)]
     out: PathBuf,
-    /// Threads for decoding the input (default: half of the threads).
-    #[clap(long)]
-    read_threads: Option<usize>,
-    /// Concurrent reads of the input, ahead of the decoding threads.
-    #[clap(long, default_value = "8")]
-    io_depth: usize,
-    /// Threads for compressing and writing scratch chunks (default: a fifth
-    /// of the threads).
-    #[clap(long)]
-    write_threads: Option<usize>,
-    /// Threads for loading scratch files (default: a fifth of the threads).
-    #[clap(long)]
-    load_threads: Option<usize>,
-    /// Threads for writing SST files (default: a quarter of the threads).
-    #[clap(long)]
-    sst_threads: Option<usize>,
     /// Only process the first row groups of the inputs (for benchmarking).
     #[clap(long)]
     row_groups: Option<usize>,
@@ -100,6 +84,26 @@ struct Args {
     /// (0 to disable dictionary compression).
     #[clap(long, default_value = "0")]
     sst_zstd_dict: i32,
+    /// Threads for decoding the input (default: three quarters of the
+    /// threads with a single pass or --no-overlap, otherwise half).
+    #[clap(long, help_heading = "Advanced")]
+    read_threads: Option<usize>,
+    /// Concurrent reads of the input, ahead of the decoding threads.
+    #[clap(long, default_value = "8", help_heading = "Advanced")]
+    io_depth: usize,
+    /// Threads for compressing and writing scratch chunks (default: a
+    /// quarter of the threads with a single pass or --no-overlap, otherwise
+    /// a fifth).
+    #[clap(long, help_heading = "Advanced")]
+    write_threads: Option<usize>,
+    /// Threads for loading scratch files (default: a third of the threads
+    /// with a single pass or --no-overlap, otherwise a fifth).
+    #[clap(long, help_heading = "Advanced")]
+    load_threads: Option<usize>,
+    /// Threads for writing SST files (default: two thirds of the threads
+    /// with a single pass or --no-overlap, otherwise a quarter).
+    #[clap(long, help_heading = "Advanced")]
+    sst_threads: Option<usize>,
 }
 
 fn main() {
