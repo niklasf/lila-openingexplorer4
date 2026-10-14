@@ -293,32 +293,28 @@ const SST_ROLL_SIZE: u64 = SST_MAX_SIZE - 16 * 1024 * 1024;
 /// until measured (about 1.1 with `PackedMoves` and 4 KB zstd blocks).
 const INITIAL_SST_RATIO: f64 = 1.1;
 
-/// Games that could not be represented as `LichessGame`.
-static SKIPPED_GAMES: AtomicU64 = AtomicU64::new(0);
-
 /// Sub-buckets for the parallel sort of a partition.
 const SORT_BUCKET_BITS: u32 = 3;
 
-/// Bytes currently occupied by scratch files.
-static SCRATCH_USAGE: Gauge = Gauge::new();
-
-/// Partitions written to SST files so far.
-static WRITTEN_PARTITIONS: Gauge = Gauge::new();
+/// Counters shared by the threads of one run.
+#[derive(Default)]
+struct Counters {
+    /// Games that could not be represented as `LichessGame`.
+    skipped_games: AtomicU64,
+    /// Bytes currently occupied by scratch files.
+    scratch_usage: Gauge,
+    /// Partitions written to SST files so far.
+    written_partitions: Gauge,
+}
 
 /// A counter that threads can wait on.
+#[derive(Default)]
 struct Gauge {
     value: Mutex<u64>,
     changed: Condvar,
 }
 
 impl Gauge {
-    const fn new() -> Gauge {
-        Gauge {
-            value: Mutex::new(0),
-            changed: Condvar::new(),
-        }
-    }
-
     fn add(&self, n: u64) {
         *self.value.lock().expect("lock gauge") += n;
         self.changed.notify_all();
@@ -741,7 +737,12 @@ impl ScratchFile {
         })
     }
 
-    fn append(&mut self, raw_len: usize, compressed: Compressed<'_>) -> io::Result<()> {
+    fn append(
+        &mut self,
+        raw_len: usize,
+        compressed: Compressed<'_>,
+        usage: &Gauge,
+    ) -> io::Result<()> {
         let bytes = if self.direct {
             compressed.padded
         } else {
@@ -754,7 +755,7 @@ impl ScratchFile {
             compressed_len: compressed.len as u32,
         });
         self.len += bytes.len() as u64;
-        SCRATCH_USAGE.add(bytes.len() as u64);
+        usage.add(bytes.len() as u64);
         Ok(())
     }
 
@@ -813,11 +814,11 @@ impl ScratchFile {
         partition
     }
 
-    fn remove(self) -> io::Result<()> {
+    fn remove(self, usage: &Gauge) -> io::Result<()> {
         drop(self.file);
         drop(self.write_file);
         fs::remove_file(&self.path)?;
-        SCRATCH_USAGE.sub(self.len);
+        usage.sub(self.len);
         Ok(())
     }
 }
@@ -1000,6 +1001,7 @@ pub fn convert(
         out,
         stats: Mutex::new(Stats::default()),
     };
+    let counters = Counters::default();
 
     let progress = progress.add(
         ProgressBar::new(num_rows * layout.passes() as u64).with_style(
@@ -1014,6 +1016,7 @@ pub fn convert(
         let progress = &progress;
         let sst = &sst;
         let input = &input;
+        let counters = &counters;
 
         // Loader: loads and sorts partitions in order, one ahead of the
         // writer.
@@ -1027,7 +1030,7 @@ pub fn convert(
                     PartitionSource::Resident(partition) => partition,
                     PartitionSource::Scratch(scratch) => {
                         let partition = scratch.load(load_threads);
-                        scratch.remove().expect("remove scratch");
+                        scratch.remove(&counters.scratch_usage).expect("remove scratch");
                         partition
                     }
                 };
@@ -1062,7 +1065,7 @@ pub fn convert(
             for (memory_partition, partition) in sorted_rx {
                 let timer = Instant::now();
                 write_partition(&partition, memory_partition, sst, sst_threads);
-                WRITTEN_PARTITIONS.add(1);
+                counters.written_partitions.add(1);
                 let stats = sst.stats.lock().expect("lock stats");
                 log(
                     progress,
@@ -1080,7 +1083,8 @@ pub fn convert(
             progress.set_prefix(format!("pass {}/{}", pass + 1, layout.passes()));
             if !config.overlap && pass > 0 {
                 progress.set_message("waiting for previous pass");
-                let waited = WRITTEN_PARTITIONS
+                let waited = counters
+                    .written_partitions
                     .wait_until(|n| n >= (pass * layout.memory_partitions_per_pass()) as u64);
                 log(
                     progress,
@@ -1102,6 +1106,7 @@ pub fn convert(
                     write_threads,
                     io_depth: config.io_depth.max(1),
                     direct: config.direct_io,
+                    counters,
                 },
                 progress,
             )
@@ -1118,7 +1123,8 @@ pub fn convert(
             );
             if config.scatter_only {
                 for file in scratch {
-                    file.remove().expect("remove scratch");
+                    file.remove(&counters.scratch_usage)
+                        .expect("remove scratch");
                 }
                 break;
             }
@@ -1149,7 +1155,7 @@ pub fn convert(
     progress.finish();
 
     let mut stats = sst.stats.into_inner().expect("stats");
-    stats.skipped = SKIPPED_GAMES.load(Ordering::Relaxed);
+    stats.skipped = counters.skipped_games.load(Ordering::Relaxed);
     Ok(stats)
 }
 
@@ -1166,6 +1172,7 @@ struct ScatterConfig<'a> {
     write_threads: usize,
     io_depth: usize,
     direct: bool,
+    counters: &'a Counters,
 }
 
 /// Accumulated time of each scatter stage, summed over its threads.
@@ -1307,15 +1314,18 @@ fn scatter_pass(
                 while let Ok((file, raw)) = timed(&times.compress_recv, || rx.recv()) {
                     let compressed = timed(&times.compress, || compressor.compress(&raw));
                     if let Some(budget) = config.budget {
-                        let waited = SCRATCH_USAGE
+                        let waited = config
+                            .counters
+                            .scratch_usage
                             .wait_until(|usage| usage + compressed.padded.len() as u64 <= budget);
                         throttled_nanos.fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
                     }
                     timed(&times.write, || {
-                        files[file]
-                            .lock()
-                            .expect("lock scratch file")
-                            .append(raw.len(), compressed)
+                        files[file].lock().expect("lock scratch file").append(
+                            raw.len(),
+                            compressed,
+                            &config.counters.scratch_usage,
+                        )
                     })
                     .expect("append chunk");
                 }
@@ -1381,7 +1391,10 @@ fn scatter_pass(
                     }
                 }
 
-                SKIPPED_GAMES.fetch_add(skipped, Ordering::Relaxed);
+                config
+                    .counters
+                    .skipped_games
+                    .fetch_add(skipped, Ordering::Relaxed);
                 resident
                     .lock()
                     .expect("lock resident")
