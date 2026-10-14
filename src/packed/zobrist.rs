@@ -4,9 +4,24 @@ use shakmaty::{variant::Variant, zobrist::Zobrist128};
 
 /// The top 96 bits of a position's Zobrist hash, mixed with the variant, in
 /// big endian order. The key of the position column families.
-#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Zobrist96 {
     inner: [u8; 12],
+}
+
+impl Ord for Zobrist96 {
+    /// Byte order, compared as integers.
+    #[inline]
+    fn cmp(&self, other: &Zobrist96) -> std::cmp::Ordering {
+        self.words().cmp(&other.words())
+    }
+}
+
+impl PartialOrd for Zobrist96 {
+    #[inline]
+    fn partial_cmp(&self, other: &Zobrist96) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Zobrist96 {
@@ -52,6 +67,15 @@ impl Zobrist96 {
         hash
     }
 
+    /// The bytes as big endian integers, for comparisons.
+    #[inline]
+    pub fn words(&self) -> (u64, u32) {
+        (
+            self.prefix(),
+            u32::from_be_bytes(self.inner[8..].try_into().expect("4 bytes")),
+        )
+    }
+
     /// The top 64 bits, for cheap in-memory lookups.
     pub fn prefix(&self) -> u64 {
         u64::from_be_bytes(self.inner[..8].try_into().expect("8 bytes"))
@@ -88,6 +112,16 @@ mod tests {
     use arbtest::arbtest;
 
     use super::*;
+
+    #[test]
+    fn test_ord_matches_bytes() {
+        arbtest(|u| {
+            let left: Zobrist96 = u.arbitrary()?;
+            let right: Zobrist96 = u.arbitrary()?;
+            assert_eq!(left.cmp(&right), left.inner.cmp(&right.inner));
+            Ok(())
+        });
+    }
 
     #[test]
     fn test_partition_ord() {

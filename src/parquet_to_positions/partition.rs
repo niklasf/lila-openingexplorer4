@@ -1,23 +1,73 @@
-//! Memory partitions: the records of one slice of the key space, as sorted
-//! runs that are merged when writing.
+//! Memory partitions: the records of one slice of the key space, as runs
+//! of sorted buckets that are merged when writing.
 
-use std::{cmp::Reverse, collections::BinaryHeap, sync::Mutex, thread};
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+};
 
 use crate::{
-    packed::Zobrist96,
     parquet_to_positions::record::{CHUNK_RECORDS, Record, decode_chunk},
     scatter::{AlignedBuf, ChunkDecompressor, ScratchFile},
 };
 
-/// A memory partition: sorted runs of records.
+/// Bits of the hash, after the partition bits, that split a run into
+/// buckets. Sorting small buckets is faster than sorting a whole run, and
+/// the writer merges bucket by bucket.
+pub const RUN_BUCKET_BITS: u32 = 12;
+
+/// Buckets per run.
+pub const RUN_BUCKETS: usize = 1 << RUN_BUCKET_BITS;
+
+/// Records of one loading thread, by bucket, each bucket sorted.
+pub struct Run {
+    buckets: Vec<Vec<Record>>,
+}
+
+impl Run {
+    fn with_expected_records(records: usize) -> Run {
+        // Hashes are uniform, so buckets rarely exceed the expected size
+        // by more than a few percent.
+        let per_bucket = records / RUN_BUCKETS;
+        let capacity = per_bucket + per_bucket / 16 + 16;
+        Run {
+            buckets: (0..RUN_BUCKETS)
+                .map(|_| Vec::with_capacity(capacity))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, record: Record, shift: u32) {
+        let bucket = (record.hash_prefix() >> shift) as usize & (RUN_BUCKETS - 1);
+        self.buckets[bucket].push(record);
+    }
+
+    fn sort(&mut self) {
+        for bucket in &mut self.buckets {
+            bucket.sort_unstable();
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.buckets.iter().map(Vec::len).sum()
+    }
+}
+
+/// A memory partition: runs of sorted buckets.
 #[derive(Default)]
 pub struct MemoryPartition {
-    pub runs: Vec<Vec<Record>>,
+    pub runs: Vec<Run>,
 }
 
 impl MemoryPartition {
     pub fn len(&self) -> usize {
-        self.runs.iter().map(Vec::len).sum()
+        self.runs.iter().map(Run::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -25,12 +75,14 @@ impl MemoryPartition {
     }
 
     /// Loads a scratch file into one run per thread, decompressing and
-    /// sorting in parallel. Chunks are assigned to threads round robin, so
-    /// that the runs can be allocated exactly.
-    pub fn load(scratch: &ScratchFile, threads: usize) -> MemoryPartition {
+    /// sorting in parallel. Chunks are assigned to threads round robin.
+    /// `partition_bits` are the hash bits shared by all records of the
+    /// partition.
+    pub fn load(scratch: &ScratchFile, threads: usize, partition_bits: u32) -> MemoryPartition {
         let chunks = scratch.chunks();
         let threads = threads.clamp(1, chunks.len().max(1));
-        let runs: Vec<Mutex<Vec<Record>>> = (0..threads)
+        let shift = 64 - partition_bits - RUN_BUCKET_BITS;
+        let runs: Vec<Mutex<Run>> = (0..threads)
             .map(|t| {
                 let records: usize = chunks
                     .iter()
@@ -38,7 +90,7 @@ impl MemoryPartition {
                     .step_by(threads)
                     .map(|c| c.raw_len as usize / std::mem::size_of::<Record>())
                     .sum();
-                Mutex::new(Vec::with_capacity(records))
+                Mutex::new(Run::with_expected_records(records))
             })
             .collect();
 
@@ -49,14 +101,19 @@ impl MemoryPartition {
                     let mut decompressor = ChunkDecompressor::new(scratch.zstd_level());
                     let mut compressed = AlignedBuf::new();
                     let mut raw = Vec::with_capacity(CHUNK_RECORDS * std::mem::size_of::<Record>());
+                    let mut records = Vec::with_capacity(CHUNK_RECORDS);
                     for (i, chunk) in chunks.iter().enumerate().skip(t).step_by(threads) {
                         let bytes = scratch.read_chunk(i, &mut compressed).expect("read chunk");
                         raw.clear();
                         raw.resize(chunk.raw_len as usize, 0);
                         decompressor.decompress(bytes, &mut raw);
-                        decode_chunk(&raw, &mut run);
+                        records.clear();
+                        decode_chunk(&raw, &mut records);
+                        for &record in &records {
+                            run.push(record, shift);
+                        }
                     }
-                    run.sort_unstable();
+                    run.sort();
                 });
             }
         });
@@ -65,72 +122,133 @@ impl MemoryPartition {
             runs: runs
                 .into_iter()
                 .map(|run| run.into_inner().expect("run"))
-                .filter(|run| !run.is_empty())
                 .collect(),
         }
     }
 
-    /// Sorts each run, in parallel.
-    pub fn sort_runs(&mut self, threads: usize) {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let slots: Vec<Mutex<&mut Vec<Record>>> = self.runs.iter_mut().map(Mutex::new).collect();
+    /// Builds a partition from unsorted chunks of records, one run per
+    /// thread.
+    pub fn from_unsorted(
+        chunks: Vec<Vec<Record>>,
+        threads: usize,
+        partition_bits: u32,
+    ) -> MemoryPartition {
+        let threads = threads.clamp(1, chunks.len().max(1));
+        let shift = 64 - partition_bits - RUN_BUCKET_BITS;
+        let chunks: Vec<Mutex<Option<Vec<Record>>>> =
+            chunks.into_iter().map(|c| Mutex::new(Some(c))).collect();
+        let records: usize = chunks
+            .iter()
+            .map(|c| c.lock().expect("lock chunk").as_ref().map_or(0, Vec::len))
+            .sum();
+        let next = AtomicUsize::new(0);
+        let runs: Vec<Mutex<Run>> = (0..threads)
+            .map(|_| Mutex::new(Run::with_expected_records(records / threads)))
+            .collect();
         thread::scope(|s| {
-            for _ in 0..threads.clamp(1, slots.len().max(1)) {
+            for run in &runs {
                 s.spawn(|| {
+                    let mut run = run.lock().expect("lock run");
                     loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(slot) = slots.get(i) else { break };
-                        slot.lock().expect("lock run").sort_unstable();
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(chunk) = chunks.get(i) else { break };
+                        let chunk = chunk.lock().expect("lock chunk").take().expect("chunk");
+                        for record in chunk {
+                            run.push(record, shift);
+                        }
                     }
+                    run.sort();
                 });
             }
         });
+        MemoryPartition {
+            runs: runs
+                .into_iter()
+                .map(|run| run.into_inner().expect("run"))
+                .collect(),
+        }
     }
 
-    /// Merges the runs over the hashes in `lo..hi` (`hi` exclusive, or
-    /// unbounded if `None`).
-    pub fn merge_range(&self, lo: Zobrist96, hi: Option<Zobrist96>) -> RangeMerge<'_> {
-        let mut heap = BinaryHeap::with_capacity(self.runs.len());
-        let mut cursors = Vec::with_capacity(self.runs.len());
-        for (r, run) in self.runs.iter().enumerate() {
-            let start = run.partition_point(|record| record.hash() < lo);
-            let end = match hi {
-                Some(hi) => run.partition_point(|record| record.hash() < hi),
-                None => run.len(),
-            };
-            cursors.push((start, end));
-            if start < end {
-                heap.push(Reverse((run[start], r)));
-            }
-        }
-        RangeMerge {
+    /// Records in a range of buckets.
+    pub fn bucket_range_len(&self, buckets: std::ops::Range<usize>) -> usize {
+        self.runs
+            .iter()
+            .map(|run| {
+                run.buckets[buckets.clone()]
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Merges the runs over a range of buckets.
+    pub fn merge_buckets(&self, buckets: std::ops::Range<usize>) -> BucketMerge<'_> {
+        let mut merge = BucketMerge {
             runs: &self.runs,
-            cursors,
-            heap,
-        }
+            buckets,
+            cursors: vec![0; self.runs.len()],
+            heap: BinaryHeap::with_capacity(self.runs.len()),
+        };
+        merge.start_bucket();
+        merge
     }
 }
 
-/// Iterator over the records of a key range, in order.
-pub struct RangeMerge<'a> {
-    runs: &'a [Vec<Record>],
-    /// Next index and end index per run.
-    cursors: Vec<(usize, usize)>,
+/// Iterator over the records of a range of buckets, in order.
+pub struct BucketMerge<'a> {
+    runs: &'a [Run],
+    /// Remaining buckets; the first is the current one.
+    buckets: std::ops::Range<usize>,
+    /// Next index per run within the current bucket.
+    cursors: Vec<usize>,
     heap: BinaryHeap<Reverse<(Record, usize)>>,
 }
 
-impl Iterator for RangeMerge<'_> {
+impl BucketMerge<'_> {
+    /// Starts merging the first non-empty bucket at or after the current
+    /// one, if any.
+    fn start_bucket(&mut self) {
+        while self.buckets.start < self.buckets.end {
+            let bucket = self.buckets.start;
+            for (r, run) in self.runs.iter().enumerate() {
+                self.cursors[r] = 0;
+                if let Some(&record) = run.buckets[bucket].first() {
+                    self.heap.push(Reverse((record, r)));
+                }
+            }
+            if !self.heap.is_empty() {
+                return;
+            }
+            self.buckets.start += 1;
+        }
+    }
+}
+
+impl Iterator for BucketMerge<'_> {
     type Item = Record;
 
     #[inline]
     fn next(&mut self) -> Option<Record> {
-        let Reverse((record, r)) = self.heap.pop()?;
-        let (next, end) = &mut self.cursors[r];
-        *next += 1;
-        if *next < *end {
-            self.heap.push(Reverse((self.runs[r][*next], r)));
+        loop {
+            if let Some(Reverse((record, r))) = self.heap.pop() {
+                let bucket = &self.runs[r].buckets[self.buckets.start];
+                self.cursors[r] += 1;
+                if let Some(&next) = bucket.get(self.cursors[r]) {
+                    self.heap.push(Reverse((next, r)));
+                }
+                return Some(record);
+            }
+            // Current bucket exhausted.
+            if self.buckets.start >= self.buckets.end {
+                return None;
+            }
+            self.buckets.start += 1;
+            self.start_bucket();
+            if self.heap.is_empty() {
+                return None;
+            }
         }
-        Some(record)
     }
 }
 
@@ -142,27 +260,40 @@ mod tests {
     use crate::parquet_to_positions::record::RECORD_SIZE;
 
     #[test]
-    fn test_merge_range() {
+    fn test_from_unsorted_and_merge() {
         arbtest(|u| {
-            let mut partition = MemoryPartition::default();
+            let partition_bits = u.int_in_range(0..=8)?;
             let mut all: Vec<Record> = Vec::new();
-            for run in u.arbitrary_iter::<Vec<[u8; RECORD_SIZE]>>()? {
-                let mut run: Vec<Record> = run?.into_iter().map(Record).collect();
-                run.sort_unstable();
-                all.extend(&run);
-                partition.runs.push(run);
+            let mut chunks: Vec<Vec<Record>> = Vec::new();
+            for chunk in u.arbitrary_iter::<Vec<[u8; RECORD_SIZE]>>()? {
+                let chunk: Vec<Record> = chunk?
+                    .into_iter()
+                    .map(|mut r| {
+                        // Within the partition.
+                        r[0] &= (0xffu32 >> partition_bits) as u8;
+                        Record(r)
+                    })
+                    .collect();
+                all.extend(&chunk);
+                chunks.push(chunk);
             }
-            let bits = u.int_in_range(0..=4)?;
-            let p = u.int_in_range(0..=(1usize << bits) - 1)?;
-            let lo = Zobrist96::partition_start(p, bits);
-            let hi = (p + 1 < 1 << bits).then(|| Zobrist96::partition_start(p + 1, bits));
-            let merged: Vec<Record> = partition.merge_range(lo, hi).collect();
+            let partition = MemoryPartition::from_unsorted(chunks, 3, partition_bits);
+            assert_eq!(partition.len(), all.len());
             all.sort_unstable();
+            let lo = u.int_in_range(0..=RUN_BUCKETS)?;
+            let hi = u.int_in_range(lo..=RUN_BUCKETS)?;
+            let merged: Vec<Record> = partition.merge_buckets(lo..hi).collect();
+            let shift = 64 - partition_bits - RUN_BUCKET_BITS;
             let expected: Vec<Record> = all
-                .into_iter()
-                .filter(|r| r.hash() >= lo && hi.is_none_or(|hi| r.hash() < hi))
+                .iter()
+                .copied()
+                .filter(|r| {
+                    let b = (r.hash_prefix() >> shift) as usize & (RUN_BUCKETS - 1);
+                    (lo..hi).contains(&b)
+                })
                 .collect();
             assert_eq!(merged, expected);
+            assert_eq!(partition.bucket_range_len(lo..hi), expected.len());
             Ok(())
         });
     }

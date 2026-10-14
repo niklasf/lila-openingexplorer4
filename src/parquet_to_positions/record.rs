@@ -26,8 +26,23 @@ pub const KEY_SIZE: usize = Zobrist96::SIZE + 2;
 /// * 16..18: speed (3 bits) and rating offset plus `RATING_BIAS` (13 bits)
 /// * 18..24: game id
 /// * 24: outcome
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Record(pub [u8; RECORD_SIZE]);
+
+impl Ord for Record {
+    /// Byte order, compared as integers.
+    #[inline]
+    fn cmp(&self, other: &Record) -> std::cmp::Ordering {
+        self.words().cmp(&other.words())
+    }
+}
+
+impl PartialOrd for Record {
+    #[inline]
+    fn partial_cmp(&self, other: &Record) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Added to the rating offset so that it is stored unsigned.
 const RATING_BIAS: i32 = 1 << 12;
@@ -56,6 +71,25 @@ impl Record {
         bytes[18..24].copy_from_slice(&game_id.to_bytes());
         bytes[24] = outcome_bits(shakmaty::Outcome::Known(outcome));
         Some(Record(bytes))
+    }
+
+    /// The bytes as big endian integers, for comparisons.
+    #[inline]
+    fn words(&self) -> (u128, u64, u8) {
+        (
+            u128::from_be_bytes(self.0[..16].try_into().expect("16 bytes")),
+            u64::from_be_bytes(self.0[16..24].try_into().expect("8 bytes")),
+            self.0[24],
+        )
+    }
+
+    /// The hash as integers, for comparisons.
+    #[inline]
+    pub fn hash_words(&self) -> (u64, u32) {
+        (
+            self.hash_prefix(),
+            u32::from_be_bytes(self.0[8..12].try_into().expect("4 bytes")),
+        )
     }
 
     #[inline]
@@ -138,14 +172,14 @@ impl Record {
 
 impl std::fmt::Debug for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Raw fields, so that invalid records can be printed.
         f.debug_struct("Record")
             .field("hash", &self.hash())
             .field("month", &self.month())
             .field("move", &self.uci_move())
-            .field("speed", &self.speed())
-            .field("rating", &self.rating())
-            .field("game_id", &self.game_id())
-            .field("outcome", &self.outcome())
+            .field("speed_and_rating", &self.speed_and_rating())
+            .field("game_id", &&self.0[18..24])
+            .field("outcome", &self.0[24])
             .finish()
     }
 }
@@ -179,50 +213,83 @@ pub const CHUNK_BYTES: usize = CHUNK_RECORDS * RECORD_SIZE;
 /// partition bits.
 const BUCKET_BITS: u32 = 16;
 
-/// Serializes a chunk of records for compression: records are bucketed by
-/// the hash bits following the `partition_bits` and stored column major, so
-/// that the leading hash bytes and the low entropy fields compress well.
-/// Uses `records` as scratch space.
-pub fn encode_chunk(records: &mut [Record], partition_bits: u32, out: &mut Vec<u8>) {
-    let n = records.len();
-    out.clear();
-    out.resize(n * RECORD_SIZE, 0);
-    if n == 0 {
-        return;
+/// Records per tile of the transposition, so that a tile stays in the L2
+/// cache while its columns are gathered.
+const TILE_RECORDS: usize = 8192;
+
+/// Serializes chunks of records for compression, reusing buffers.
+pub struct ChunkEncoder {
+    partition_bits: u32,
+    offsets: Vec<u32>,
+    sorted: Vec<Record>,
+    out: Vec<u8>,
+}
+
+impl ChunkEncoder {
+    /// `partition_bits` are the hash bits shared by all records of a chunk.
+    pub fn new(partition_bits: u32) -> ChunkEncoder {
+        ChunkEncoder {
+            partition_bits,
+            offsets: vec![0; 1 << BUCKET_BITS],
+            // Sized once; every used slot is overwritten per chunk.
+            sorted: vec![Record([0; RECORD_SIZE]); CHUNK_RECORDS],
+            out: vec![0; CHUNK_BYTES],
+        }
     }
 
-    // Counting sort by the bucket bits.
-    let shift = 64 - partition_bits - BUCKET_BITS;
-    let bucket = |r: &Record| (r.hash_prefix() >> shift) as usize & ((1 << BUCKET_BITS) - 1);
-    let mut offsets = vec![0u32; 1 << BUCKET_BITS];
-    for r in records.iter() {
-        offsets[bucket(r)] += 1;
+    /// Serializes a chunk of at most `CHUNK_RECORDS` records: records are
+    /// bucketed by the hash bits following the partition bits and stored
+    /// column major, so that the leading hash bytes and the low entropy
+    /// fields compress well.
+    pub fn encode(&mut self, records: &[Record]) -> &[u8] {
+        let n = records.len();
+        assert!(n <= CHUNK_RECORDS, "chunk too large");
+        if n == 0 {
+            return &[];
+        }
+        let shift = 64 - self.partition_bits - BUCKET_BITS;
+        let bucket = |r: &Record| (r.hash_prefix() >> shift) as usize & ((1 << BUCKET_BITS) - 1);
+        let sorted = &mut self.sorted[..n];
+        counting_sort_into(records, sorted, &mut self.offsets, bucket);
+
+        // Transpose, by tiles.
+        let out = &mut self.out[..n * RECORD_SIZE];
+        for (t, tile) in sorted.chunks(TILE_RECORDS).enumerate() {
+            let base = t * TILE_RECORDS;
+            for i in 0..RECORD_SIZE {
+                let column = &mut out[i * n + base..i * n + base + tile.len()];
+                for (dst, r) in column.iter_mut().zip(tile) {
+                    *dst = r.0[i];
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Counting sort of `records` into `out` (same length) by `key`, leaving
+/// the end offset of each key in `offsets`.
+fn counting_sort_into(
+    records: &[Record],
+    out: &mut [Record],
+    offsets: &mut [u32],
+    key: impl Fn(&Record) -> usize,
+) {
+    offsets.fill(0);
+    for r in records {
+        offsets[key(r)] += 1;
     }
     let mut sum = 0;
-    for count in &mut offsets {
+    for count in offsets.iter_mut() {
         let c = *count;
         *count = sum;
         sum += c;
     }
-    let mut sorted: Vec<Record> = Vec::with_capacity(n);
-    // SAFETY: every index in 0..n is written exactly once below, because
-    // the offsets are the exclusive prefix sums of the bucket counts.
-    unsafe {
-        sorted.set_len(n);
+    for r in records {
+        let k = key(r);
+        out[offsets[k] as usize] = *r;
+        offsets[k] += 1;
     }
-    for r in records.iter() {
-        let b = bucket(r);
-        sorted[offsets[b] as usize] = *r;
-        offsets[b] += 1;
-    }
-
-    // Transpose.
-    for (i, column) in out.chunks_exact_mut(n).enumerate() {
-        for (dst, r) in column.iter_mut().zip(&sorted) {
-            *dst = r.0[i];
-        }
-    }
-    records.copy_from_slice(&sorted);
 }
 
 /// Appends the records of an encoded chunk.
@@ -235,9 +302,13 @@ pub fn decode_chunk(bytes: &[u8], out: &mut Vec<Record>) {
     let start = out.len();
     out.resize(start + n, Record([0; RECORD_SIZE]));
     let records = &mut out[start..];
-    for (i, column) in bytes.chunks_exact(n).enumerate() {
-        for (r, src) in records.iter_mut().zip(column) {
-            r.0[i] = *src;
+    for (t, tile) in records.chunks_mut(TILE_RECORDS).enumerate() {
+        let base = t * TILE_RECORDS;
+        for i in 0..RECORD_SIZE {
+            let column = &bytes[i * n + base..i * n + base + tile.len()];
+            for (r, src) in tile.iter_mut().zip(column) {
+                r.0[i] = *src;
+            }
         }
     }
 }
@@ -311,12 +382,12 @@ mod tests {
                 records.push(r);
             }
             let partition_bits = u.int_in_range(0..=20)?;
-            let mut encoded = Vec::new();
-            encode_chunk(&mut records, partition_bits, &mut encoded);
+            records.truncate(CHUNK_RECORDS);
+            let mut encoder = ChunkEncoder::new(partition_bits);
+            let encoded = encoder.encode(&records);
             assert_eq!(encoded.len(), records.len() * RECORD_SIZE);
             let mut decoded = Vec::new();
-            decode_chunk(&encoded, &mut decoded);
-            assert_eq!(decoded, records);
+            decode_chunk(encoded, &mut decoded);
             let mut sorted = records.clone();
             sorted.sort();
             decoded.sort();

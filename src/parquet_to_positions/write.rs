@@ -8,7 +8,7 @@ use crate::{
     packed::{GameId, LichessEntry, SubStats, Zobrist96, pack_sorted_entry},
     parquet_to_positions::{
         hot::{GAMES_PER_SUB_ENTRY, HotPacked, HotSet},
-        partition::MemoryPartition,
+        partition::{MemoryPartition, RUN_BUCKET_BITS, RUN_BUCKETS},
         record::{Record, SubKey},
     },
     sst::{SST_MAX_SIZE, SST_ROLL_SIZE, SstContext},
@@ -96,8 +96,8 @@ impl<'a> SstSequence<'a> {
 /// Writes a memory partition covering the hashes `lo..hi`, together with
 /// the hot entries of that range, to SST files of both column families.
 ///
-/// The range is split into sub-ranges of about one full cold SST file
-/// each, written in parallel. File names sort in key order.
+/// The range is split into sub-ranges of whole buckets, of about one full
+/// cold SST file each, written in parallel. File names sort in key order.
 #[allow(clippy::too_many_arguments)]
 pub fn write_partition(
     partition: &MemoryPartition,
@@ -106,6 +106,7 @@ pub fn write_partition(
     memory_partition: usize,
     lo: Zobrist96,
     hi: Option<Zobrist96>,
+    partition_bits: u32,
     output: &Output,
     threads: usize,
 ) {
@@ -125,18 +126,16 @@ pub fn write_partition(
     let ranges = records
         .div_ceil(records_per_range.max(1))
         .max(threads)
-        .max(1);
+        .clamp(1, RUN_BUCKETS);
 
-    // Split the hash range evenly by prefix.
-    let lo_prefix = lo.prefix();
-    let hi_prefix = hi.map_or(u64::MAX, |hi| hi.prefix());
-    let width = hi_prefix - lo_prefix;
-    let range_bounds = |i: usize| -> Option<Zobrist96> {
-        if i >= ranges {
+    // Hash of the start of a bucket.
+    let bucket_shift = 64 - partition_bits - RUN_BUCKET_BITS;
+    let bucket_start = |bucket: usize| -> Option<Zobrist96> {
+        if bucket >= RUN_BUCKETS {
             hi
         } else {
             Some(Zobrist96::from_prefix(
-                lo_prefix + (u128::from(width) * i as u128 / ranges as u128) as u64,
+                lo.prefix() + ((bucket as u64) << bucket_shift),
             ))
         }
     };
@@ -151,8 +150,9 @@ pub fn write_partition(
                     if i >= ranges {
                         break;
                     }
-                    let range_lo = range_bounds(i).expect("range start");
-                    let range_hi = range_bounds(i + 1);
+                    let buckets = i * RUN_BUCKETS / ranges..(i + 1) * RUN_BUCKETS / ranges;
+                    let range_lo = bucket_start(buckets.start).expect("range start");
+                    let range_hi = bucket_start(buckets.end);
                     let hot_range = &hot[hot.partition_point(|h| h.hash() < range_lo)
                         ..match range_hi {
                             Some(hi) => hot.partition_point(|h| h.hash() < hi),
@@ -161,9 +161,8 @@ pub fn write_partition(
                     writer
                         .write_range(
                             partition,
+                            buckets,
                             hot_range,
-                            range_lo,
-                            range_hi,
                             &format!("{memory_partition:04}_{i:05}"),
                         )
                         .expect("write sst files");
@@ -193,47 +192,59 @@ impl<'a> RangeWriter<'a> {
         }
     }
 
+    /// Writes the records of a range of buckets and the hot entries of the
+    /// same hash range.
     fn write_range(
         &mut self,
         partition: &MemoryPartition,
+        buckets: std::ops::Range<usize>,
         hot: &[HotPacked],
-        lo: Zobrist96,
-        hi: Option<Zobrist96>,
         name: &str,
     ) -> Result<(), rocksdb::Error> {
         let mut cold = SstSequence::new(&self.output.cold, format!("cold_{name}"));
         let mut positions = SstSequence::new(&self.output.positions, format!("positions_{name}"));
-        let mut merge = partition.merge_range(lo, hi).peekable();
-        let mut hot = hot.iter().peekable();
+        let mut merge = partition.merge_buckets(buckets);
+        let mut pending = merge.next();
+        let mut hot_next = 0;
         let (mut records, mut cold_keys, mut position_keys, mut hot_merged) =
             (0u64, 0u64, 0u64, 0u64);
 
         loop {
             // The next hash from either source.
-            let hash = match (merge.peek().map(Record::hash), hot.peek().map(|h| h.hash())) {
+            let hash = match (
+                pending.map(|r| r.hash()),
+                hot.get(hot_next).map(|h| h.hash()),
+            ) {
                 (Some(a), Some(b)) => a.min(b),
                 (Some(a), None) => a,
                 (None, Some(b)) => b,
                 (None, None) => break,
             };
+            let hash_words = hash.words();
 
+            // Records of the hash.
             self.group.clear();
-            while let Some(record) = merge.next_if(|r| r.hash() == hash) {
+            while let Some(record) = pending {
+                if record.hash_words() != hash_words {
+                    break;
+                }
                 self.group.push(record);
+                pending = merge.next();
             }
             records += self.group.len() as u64;
-            let hot_start = hot.clone();
-            let mut hot_count = 0;
-            while hot.next_if(|h| h.hash() == hash).is_some() {
-                hot_count += 1;
+
+            // Hot entries of the hash.
+            let hot_start = hot_next;
+            while hot.get(hot_next).is_some_and(|h| h.hash() == hash) {
+                hot_next += 1;
             }
-            let hot_entries: Vec<&HotPacked> = hot_start.take(hot_count).collect();
+            let hot_entries = &hot[hot_start..hot_next];
 
             if hot_entries.is_empty()
                 && self.group.len() == 1
                 && !self.hot_set.contains(hash.prefix())
             {
-                cold.put(hash.as_bytes(), &self.group[0].game_id().to_bytes())?;
+                cold.put(hash.as_bytes(), &self.group[0].0[18..24])?;
                 cold_keys += 1;
                 continue;
             }
@@ -241,10 +252,10 @@ impl<'a> RangeWriter<'a> {
             // Entries per month, from partitioned records, hot entries or
             // both.
             let mut i = 0;
-            let mut hot_entries = hot_entries.into_iter().peekable();
-            while i < self.group.len() || hot_entries.peek().is_some() {
+            let mut h = 0;
+            while i < self.group.len() || h < hot_entries.len() {
                 let record_key = (i < self.group.len()).then(|| *self.group[i].key());
-                let hot_key = hot_entries.peek().map(|h| h.key);
+                let hot_key = hot_entries.get(h).map(|e| e.key);
                 let key = match (record_key, hot_key) {
                     (Some(a), Some(b)) => a.min(b),
                     (Some(a), None) => a,
@@ -256,9 +267,10 @@ impl<'a> RangeWriter<'a> {
                     i += 1;
                 }
                 let month_records = &self.group[start..i];
-                let hot_entry = hot_entries.next_if(|h| h.key == key);
+                let hot_entry = hot_entries.get(h).filter(|e| e.key == key);
                 match hot_entry {
                     Some(hot_entry) => {
+                        h += 1;
                         records += hot_entry.records;
                         if month_records.is_empty() {
                             positions.put(&key, &hot_entry.value)?;

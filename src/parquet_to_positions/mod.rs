@@ -41,7 +41,7 @@ use crate::{
     parquet_to_positions::{
         hot::{HotMap, HotPacked, HotSet, LocalHot},
         partition::MemoryPartition,
-        record::{CHUNK_BYTES, CHUNK_RECORDS, RECORD_SIZE, Record, encode_chunk},
+        record::{CHUNK_BYTES, CHUNK_RECORDS, ChunkEncoder, RECORD_SIZE, Record},
         replay::{Replayer, Skip},
         write::{Output, write_partition},
     },
@@ -439,9 +439,9 @@ impl Plan {
 
         let single_pass = layout.passes() == 1 || !config.overlap;
         let (read_default, write_default, load_default, sst_default) = if single_pass {
-            (threads * 3 / 4, threads / 4, threads / 3, threads * 2 / 3)
+            (threads * 2 / 3, threads / 3, threads / 3, threads * 2 / 3)
         } else {
-            (threads / 2, threads / 5, threads / 5, threads / 4)
+            (threads / 2, threads / 4, threads / 5, threads / 4)
         };
         let read_threads = config.read_threads.unwrap_or(read_default).max(1);
         let write_threads = config.write_threads.unwrap_or(write_default).max(1);
@@ -521,9 +521,10 @@ pub struct Stats {
     pub positions: SstStats,
 }
 
-/// A memory partition to process, either resident or in scratch space.
+/// A memory partition to process, either resident (as unsorted chunks) or
+/// in scratch space.
 enum PartitionSource {
-    Resident(MemoryPartition),
+    Resident(Vec<Vec<Record>>),
     Scratch(ScratchFile),
 }
 
@@ -554,6 +555,7 @@ pub fn convert(
         ..
     } = *plan;
     let num_rows = estimate.rows;
+    let partition_bits = key_space.subset_bits + key_space.memory_bits;
 
     // Fail early rather than after the first scatter pass.
     if !fs::metadata(out)
@@ -611,12 +613,12 @@ pub fn convert(
                 let memory_partition = job.memory_partition;
                 let timer = Instant::now();
                 let partition = match job.source {
-                    PartitionSource::Resident(mut partition) => {
-                        partition.sort_runs(load_threads);
-                        partition
+                    PartitionSource::Resident(chunks) => {
+                        MemoryPartition::from_unsorted(chunks, load_threads, partition_bits)
                     }
                     PartitionSource::Scratch(scratch) => {
-                        let partition = MemoryPartition::load(&scratch, load_threads);
+                        let partition =
+                            MemoryPartition::load(&scratch, load_threads, partition_bits);
                         scratch
                             .remove(&counters.scratch_usage)
                             .expect("remove scratch");
@@ -650,6 +652,7 @@ pub fn convert(
                     memory_partition,
                     lo,
                     hi,
+                    partition_bits,
                     output,
                     sst_threads,
                 );
@@ -785,7 +788,7 @@ pub fn convert(
     })
 }
 
-type Resident = Vec<(usize, MemoryPartition)>;
+type Resident = Vec<(usize, Vec<Vec<Record>>)>;
 
 struct ScatterConfig<'a> {
     scratch: &'a Path,
@@ -889,13 +892,12 @@ fn scatter_pass(
             let rx = rx.clone();
             s.spawn(move || {
                 let mut compressor = ChunkCompressor::new(config.zstd_level);
-                let mut encoded = Vec::with_capacity(CHUNK_BYTES);
-                while let Ok((file, mut records)) = timed(&times.compress_recv, || rx.recv()) {
-                    timed(&times.encode, || {
-                        encode_chunk(&mut records, partition_bits, &mut encoded)
-                    });
+                let mut encoder = ChunkEncoder::new(partition_bits);
+                while let Ok((file, records)) = timed(&times.compress_recv, || rx.recv()) {
+                    let encoded = timed(&times.encode, || encoder.encode(&records));
+                    let raw_len = encoded.len();
+                    let compressed = timed(&times.compress, || compressor.compress(encoded));
                     drop(records);
-                    let compressed = timed(&times.compress, || compressor.compress(&encoded));
                     if let Some(budget) = config.budget {
                         let waited = config
                             .counters
@@ -905,7 +907,7 @@ fn scatter_pass(
                     }
                     timed(&times.write, || {
                         files[file].lock().expect("lock scratch file").append(
-                            encoded.len(),
+                            raw_len,
                             compressed,
                             &config.counters.scratch_usage,
                         )
@@ -1033,16 +1035,14 @@ fn scatter_pass(
         .map(|file| file.into_inner().expect("scratch file"))
         .collect();
 
-    // Merge per-thread resident runs.
+    // Merge per-thread resident chunks.
     let mut per_thread = resident.into_inner().expect("resident");
-    let mut merged: Vec<MemoryPartition> = (0..RESIDENT_PARTITIONS_PER_PASS)
-        .map(|_| MemoryPartition::default())
+    let mut merged: Vec<Vec<Vec<Record>>> = (0..RESIDENT_PARTITIONS_PER_PASS)
+        .map(|_| Vec::new())
         .collect();
     while !per_thread.is_empty() {
-        for (i, runs) in per_thread.drain(..RESIDENT_PARTITIONS_PER_PASS).enumerate() {
-            merged[i]
-                .runs
-                .extend(runs.into_iter().filter(|run| !run.is_empty()));
+        for (i, chunks) in per_thread.drain(..RESIDENT_PARTITIONS_PER_PASS).enumerate() {
+            merged[i].extend(chunks.into_iter().filter(|chunk| !chunk.is_empty()));
         }
     }
     let resident = merged
