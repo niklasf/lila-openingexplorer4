@@ -66,16 +66,20 @@ impl Zobrist96 {
         }
     }
 
-    /// The smallest hash with the given partition index.
-    pub fn partition_start(partition: usize, bits: u32) -> Zobrist96 {
-        let prefix = if bits == 0 {
-            0
-        } else {
-            (partition as u64) << (64 - bits)
-        };
+    /// The smallest hash with the given top 64 bits.
+    pub fn from_prefix(prefix: u64) -> Zobrist96 {
         let mut inner = [0; 12];
         inner[..8].copy_from_slice(&prefix.to_be_bytes());
         Zobrist96 { inner }
+    }
+
+    /// The smallest hash with the given partition index.
+    pub fn partition_start(partition: usize, bits: u32) -> Zobrist96 {
+        Zobrist96::from_prefix(if bits == 0 {
+            0
+        } else {
+            (partition as u64) << (64 - bits)
+        })
     }
 }
 
