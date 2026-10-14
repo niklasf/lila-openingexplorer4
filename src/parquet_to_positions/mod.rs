@@ -395,6 +395,8 @@ pub struct Plan {
     write_threads: usize,
     load_threads: usize,
     sst_threads: usize,
+    final_load_threads: usize,
+    final_sst_threads: usize,
 }
 
 impl Plan {
@@ -447,6 +449,9 @@ impl Plan {
         let write_threads = config.write_threads.unwrap_or(write_default).max(1);
         let load_threads = config.load_threads.unwrap_or(load_default).max(1);
         let sst_threads = config.sst_threads.unwrap_or(sst_default).max(2);
+        // Once the last scatter is done, loading and writing get all threads.
+        let final_load_threads = config.load_threads.unwrap_or(threads / 3).max(1);
+        let final_sst_threads = config.sst_threads.unwrap_or(threads * 2 / 3).max(2);
         if read_threads > provisional_read_threads {
             layout = layout_for(&sizing, read_threads);
         }
@@ -464,6 +469,8 @@ impl Plan {
             write_threads,
             load_threads,
             sst_threads,
+            final_load_threads,
+            final_sst_threads,
         })
     }
 }
@@ -499,6 +506,15 @@ impl fmt::Display for Plan {
             self.load_threads,
             self.sst_threads,
         )?;
+        if (self.final_load_threads, self.final_sst_threads)
+            != (self.load_threads, self.sst_threads)
+        {
+            write!(
+                f,
+                " ({} load, {} sst after the last scatter)",
+                self.final_load_threads, self.final_sst_threads
+            )?;
+        }
         for (i, &(_, games)) in self.hot.iter().enumerate().take(5) {
             write!(f, "{}{games}", if i == 0 { "; top hot: " } else { ", " })?;
         }
@@ -552,6 +568,8 @@ pub fn convert(
         write_threads,
         load_threads,
         sst_threads,
+        final_load_threads,
+        final_sst_threads,
         ..
     } = *plan;
     let num_rows = estimate.rows;
@@ -591,6 +609,8 @@ pub fn convert(
     let hot_map = HotMap::new();
     // Hot entries, packed after the first scatter pass.
     let hot_packed: OnceLock<Vec<HotPacked>> = OnceLock::new();
+    // Set once the last scatter is done.
+    let scatters_done = std::sync::atomic::AtomicBool::new(false);
 
     let progress =
         progress.add(ProgressBar::new(num_rows * layout.passes() as u64).with_style(rows_style()));
@@ -603,6 +623,7 @@ pub fn convert(
         let hot_set = &hot_set;
         let hot_map = &hot_map;
         let hot_packed = &hot_packed;
+        let scatters_done = &scatters_done;
 
         // Loader: loads and sorts partitions in order, one ahead of the
         // writer.
@@ -613,6 +634,11 @@ pub fn convert(
                 let memory_partition = job.memory_partition;
                 let timer = Instant::now();
                 let times = LoadTimes::default();
+                let load_threads = if scatters_done.load(Ordering::Relaxed) {
+                    final_load_threads
+                } else {
+                    load_threads
+                };
                 let partition = match job.source {
                     PartitionSource::Resident(chunks) => MemoryPartition::from_unsorted(
                         chunks,
@@ -651,6 +677,11 @@ pub fn convert(
                 let timer = Instant::now();
                 let (lo, hi) = key_space.range(memory_partition);
                 let times = WriteTimes::default();
+                let sst_threads = if scatters_done.load(Ordering::Relaxed) {
+                    final_sst_threads
+                } else {
+                    sst_threads
+                };
                 write_partition(
                     &partition,
                     hot_packed.get().expect("hot entries"),
@@ -773,6 +804,7 @@ pub fn convert(
             }
         }
 
+        scatters_done.store(true, Ordering::Relaxed);
         drop(job_tx);
     });
 
