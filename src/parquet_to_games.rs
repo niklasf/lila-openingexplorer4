@@ -227,40 +227,21 @@ impl Estimate {
 
     /// Picks the fewest passes that fit the scratch budget, and the fewest
     /// memory partitions that fit the memory budget.
-    fn layout(
-        &self,
-        memory_budget: u64,
-        scratch_budget: u64,
-        read_threads: u64,
-        passes: Option<usize>,
-        memory_partitions: Option<usize>,
-    ) -> Layout {
+    fn layout(&self, memory_budget: u64, scratch_budget: u64, read_threads: u64) -> Layout {
         let mut layout = Layout {
             memory_bits: 0,
             disk_bits: 0,
         };
-        if let Some(passes) = passes {
-            layout.disk_bits = passes.max(1).next_power_of_two().trailing_zeros();
-        }
-        if let Some(partitions) = memory_partitions {
-            layout.memory_bits = partitions
-                .max(1)
-                .next_power_of_two()
-                .trailing_zeros()
-                .max(layout.disk_bits);
-        }
         loop {
             let fits_memory = self.memory(layout, read_threads) <= memory_budget;
             let fits_scratch = self.scratch(layout) <= scratch_budget;
-            if (fits_memory || memory_partitions.is_some()) && (fits_scratch || passes.is_some()) {
+            if fits_memory && fits_scratch {
                 return layout;
             }
-            if !fits_scratch && passes.is_none() && layout.disk_bits < layout.memory_bits {
+            if !fits_scratch && layout.disk_bits < layout.memory_bits {
                 layout.disk_bits += 1;
-            } else if memory_partitions.is_none() {
-                layout.memory_bits += 1;
             } else {
-                layout.disk_bits += 1;
+                layout.memory_bits += 1;
             }
             assert!(layout.memory_bits <= 13, "no layout fits the budgets");
         }
@@ -346,10 +327,6 @@ pub struct Config {
     /// Maximum bytes to use in scratch space. Determines the number of
     /// passes over the input.
     pub scratch_budget: u64,
-    /// Override the number of passes over the input.
-    pub passes: Option<usize>,
-    /// Override the number of memory partitions.
-    pub memory_partitions: Option<usize>,
     /// Threads for decoding the input.
     pub read_threads: Option<usize>,
     /// Threads for compressing and writing scratch chunks.
@@ -855,8 +832,6 @@ impl Plan {
             config.memory_budget,
             config.scratch_budget,
             provisional_read_threads as u64,
-            config.passes,
-            config.memory_partitions,
         );
         // With a single pass the scan and the partition writes never overlap,
         // so each phase can use all threads. With several passes the scan of
@@ -876,8 +851,6 @@ impl Plan {
                 config.memory_budget,
                 config.scratch_budget,
                 read_threads as u64,
-                config.passes,
-                config.memory_partitions,
             );
         }
 

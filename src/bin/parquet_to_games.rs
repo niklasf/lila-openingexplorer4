@@ -37,12 +37,6 @@ struct Args {
     /// two, to leave one physical core idle.
     #[clap(long)]
     threads: Option<usize>,
-    /// Override the number of passes over the input.
-    #[clap(long, help_heading = "Disable automatic planning")]
-    passes: Option<usize>,
-    /// Override the number of memory partitions.
-    #[clap(long, help_heading = "Disable automatic planning")]
-    memory_partitions: Option<usize>,
     /// Disable O_DIRECT for reading input, reading/writing scratch files,
     /// and writing SST files.
     #[clap(long)]
@@ -120,8 +114,6 @@ fn main() {
             },
             u64::from,
         ),
-        passes: args.passes,
-        memory_partitions: args.memory_partitions,
         read_threads: args.read_threads,
         write_threads: args.write_threads,
         load_threads: args.load_threads,
