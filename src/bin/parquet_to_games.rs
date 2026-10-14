@@ -154,11 +154,11 @@ fn main() {
     println!(
         "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes, ratio {:.3}), {} skipped games",
         started.elapsed(),
-        stats.games,
-        stats.files,
-        stats.bytes,
-        stats.largest_file,
-        stats.ratio(),
+        stats.sst.keys,
+        stats.sst.files,
+        stats.sst.bytes,
+        stats.sst.largest_file,
+        stats.sst.ratio(1.0),
         stats.skipped,
     );
 }
