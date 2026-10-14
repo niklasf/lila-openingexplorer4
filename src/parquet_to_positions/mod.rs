@@ -55,8 +55,10 @@ use crate::{
 const RESIDENT_PARTITIONS_PER_PASS: usize = 1;
 
 /// Partitions in memory at the same time: one being written to SST files,
-/// one being loaded and sorted, and one resident partition of the next pass.
-const PARTITIONS_IN_MEMORY: u64 = 3;
+/// one being loaded and sorted, one resident partition of the next pass,
+/// and one more for the resident partition's chunks and runs coexisting
+/// while it is bucketed (measured: 88 GB peak RSS with 20 GB partitions).
+const PARTITIONS_IN_MEMORY: u64 = 4;
 
 /// Assumed ratio of compressed scratch chunks to record bytes (measured
 /// about 0.70 with zstd level 1 and the bucketed, transposed chunk layout).
