@@ -13,7 +13,7 @@ use std::{
 };
 
 use crossbeam::channel;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use rocksdb::{BlockBasedOptions, DBCompressionType, EnvOptions, Options, SstFileWriter};
 
 use crate::{
@@ -932,6 +932,17 @@ pub fn convert(
     } = *plan;
     let num_rows = estimate.rows;
 
+    // Fail early rather than after the first scatter pass.
+    if !fs::metadata(out)
+        .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", out.display())))?
+        .is_dir()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{}: not a directory", out.display()),
+        ));
+    }
+
     let mut sst_opts = Options::default();
     if config.sst_zstd_level == 0 {
         sst_opts.set_compression_type(DBCompressionType::None);
@@ -959,9 +970,12 @@ pub fn convert(
     let progress = progress.add(
         ProgressBar::new(num_rows * layout.passes() as u64).with_style(
             ProgressStyle::with_template(
-                "{spinner} {prefix} {msg} {wide_bar} {human_pos}/{human_len} {per_sec} {eta:>7}",
+                "{spinner} {prefix} {msg} {wide_bar} {human_pos}/{human_len} {rate:>9} {eta:>7}",
             )
-            .expect("progress template"),
+            .expect("progress template")
+            .with_key("rate", |state: &ProgressState, w: &mut dyn fmt::Write| {
+                let _ = write!(w, "{}/s", SignificantRate(state.per_sec()));
+            }),
         ),
     );
 
@@ -1488,6 +1502,27 @@ fn write_sst_range(
     }
 
     finish(&mut writer, &mut games_in_file, &mut raw_in_file)
+}
+
+/// Formats a rate with 3 significant digits and an SI suffix, so that the
+/// progress bar does not jitter with every update.
+struct SignificantRate(f64);
+
+impl fmt::Display for SignificantRate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (value, suffix) = match self.0 {
+            r if r >= 1e9 => (r / 1e9, "G"),
+            r if r >= 1e6 => (r / 1e6, "M"),
+            r if r >= 1e3 => (r / 1e3, "k"),
+            r => (r, ""),
+        };
+        let decimals = match value {
+            v if v >= 100.0 => 0,
+            v if v >= 10.0 => 1,
+            _ => 2,
+        };
+        write!(f, "{value:.decimals$}{suffix}")
+    }
 }
 
 fn log(progress: &ProgressBar, msg: String) {
