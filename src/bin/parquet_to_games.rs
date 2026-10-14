@@ -13,19 +13,17 @@ static ALLOC: Jemalloc = Jemalloc;
 
 /// Sorts games from parquet files into non-overlapping SST files.
 ///
-/// All inputs are sorted together, so a game id may appear in only one of
-/// them. For a monthly update, pass only the new parquet file (it fits in
-/// memory and needs no scratch space) and ingest the resulting SST files
-/// alongside the existing ones.
+/// Scans the parquet files multiple times, loading and sorting partitions
+/// into memory. Uses disk scratch space to reduce the number of passes over the
+/// full input.
 #[derive(Parser)]
 struct Args {
-    /// Parquet files to read.
     #[clap(required = true)]
     parquet: Vec<PathBuf>,
     /// Directory for temporary partition files.
     #[clap(long)]
     scratch: PathBuf,
-    /// Maximum bytes to use in scratch space. Determines the number of
+    /// Maximum bytes to use for scratch space. Determines the number of
     /// passes over the input. Defaults to 90% of the free space of the
     /// scratch directory. Accepts units, like 500g.
     #[clap(long)]
@@ -40,34 +38,30 @@ struct Args {
     #[clap(long)]
     threads: Option<usize>,
     /// Override the number of passes over the input.
-    #[clap(long)]
+    #[clap(long, help_heading = "Disable automatic planning")]
     passes: Option<usize>,
     /// Override the number of memory partitions.
-    #[clap(long)]
+    #[clap(long, help_heading = "Disable automatic planning")]
     memory_partitions: Option<usize>,
-    /// Read the input and write and read scratch files and write SST files
-    /// through the page cache instead of with O_DIRECT. Direct I/O avoids
-    /// dirty page throttling of the writes and reads whole row groups and
-    /// chunks with single requests instead of serial readahead.
+    /// Disable O_DIRECT for reading input, reading/writing scratch files,
+    /// and writing SST files.
     #[clap(long)]
     no_direct_io: bool,
     /// Zstd level for scratch chunks, 0 for LZ4, or negative for no
-    /// compression. Zstd level 1 saves about
-    /// 7% scratch space over LZ4 and makes the whole run about 2% faster on
-    /// NVMe.
+    /// compression.
     #[clap(long, default_value = "1", allow_negative_numbers = true)]
     scratch_zstd_level: i32,
     /// Directory for the final SST files.
     #[clap(long)]
     out: PathBuf,
-    /// Only process the first row groups of the inputs (for benchmarking).
-    #[clap(long)]
+    /// Only process the first row groups of the inputs.
+    #[clap(long, help_heading = "Benchmarking")]
     row_groups: Option<usize>,
-    /// Stop after the scatter of the first pass (for benchmarking).
-    #[clap(long)]
+    /// Stop after the scatter of the first pass.
+    #[clap(long, help_heading = "Benchmarking")]
     scatter_only: bool,
     /// Only print the estimated sizes and the chosen layout.
-    #[clap(long)]
+    #[clap(long, help_heading = "Benchmarking")]
     plan_only: bool,
     /// Finish writing all partitions of a pass before scanning the input for
     /// the next pass. Use when the input is on the output disk, so that the
@@ -89,7 +83,7 @@ struct Args {
     #[clap(long, help_heading = "Advanced")]
     read_threads: Option<usize>,
     /// Concurrent reads of the input, ahead of the decoding threads.
-    #[clap(long, default_value = "8", help_heading = "Advanced")]
+    #[clap(long, default_value = "8")]
     io_depth: usize,
     /// Threads for compressing and writing scratch chunks (default: a
     /// quarter of the threads with a single pass or --no-overlap, otherwise
