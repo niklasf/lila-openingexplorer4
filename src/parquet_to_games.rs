@@ -30,7 +30,7 @@ const RESIDENT_PARTITIONS_PER_PASS: usize = 1;
 const PARTITIONS_IN_MEMORY: u64 = 3;
 
 /// Assumed ratio of compressed scratch chunks to record bytes (measured
-/// about 0.81 with zstd level 1 and about 0.87 with LZ4).
+/// about 0.81 with zstd level 1).
 const SCRATCH_RATIO: f64 = 1.0;
 
 /// Fixed memory overhead for the parquet reader, rocksdb and allocator slack.
@@ -362,8 +362,7 @@ pub struct Config {
     pub io_depth: usize,
     /// Use O_DIRECT for the input, scratch files and SST files.
     pub direct_io: bool,
-    /// Zstd level for scratch chunks, 0 for LZ4, or negative for no
-    /// compression.
+    /// Zstd level for scratch chunks, or 0 for no compression.
     pub scratch_zstd_level: i32,
     /// Only process the first row groups of the inputs.
     pub row_groups: Option<usize>,
@@ -374,7 +373,7 @@ pub struct Config {
     pub overlap: bool,
     /// Block size of the SST files.
     pub sst_block_size: usize,
-    /// Zstd compression level of the SST files (0 for the default).
+    /// Zstd level of the SST files, or 0 for no compression.
     pub sst_zstd_level: i32,
     /// Maximum size of the zstd dictionary trained for each SST file (0 to
     /// disable dictionary compression).
@@ -545,24 +544,6 @@ impl MemoryPartition {
     }
 }
 
-/// Compression of scratch chunks.
-#[derive(Copy, Clone)]
-enum ChunkCodec {
-    None,
-    Lz4,
-    Zstd(i32),
-}
-
-impl ChunkCodec {
-    fn from_level(zstd_level: i32) -> ChunkCodec {
-        match zstd_level {
-            ..0 => ChunkCodec::None,
-            0 => ChunkCodec::Lz4,
-            level => ChunkCodec::Zstd(level),
-        }
-    }
-}
-
 /// Alignment of buffers, offsets and lengths for `O_DIRECT` scratch writes.
 const DIRECT_ALIGN: usize = 4096;
 
@@ -606,44 +587,29 @@ struct Compressed<'a> {
 }
 
 struct ChunkCompressor {
-    codec: ChunkCodec,
+    /// `None` for no compression.
     zstd: Option<zstd::bulk::Compressor<'static>>,
     buf: AlignedBuf,
 }
 
 impl ChunkCompressor {
-    fn new(codec: ChunkCodec) -> ChunkCompressor {
+    fn new(zstd_level: i32) -> ChunkCompressor {
         ChunkCompressor {
-            codec,
-            zstd: match codec {
-                ChunkCodec::None | ChunkCodec::Lz4 => None,
-                ChunkCodec::Zstd(level) => {
-                    Some(zstd::bulk::Compressor::new(level).expect("zstd compressor"))
-                }
-            },
+            zstd: (zstd_level != 0)
+                .then(|| zstd::bulk::Compressor::new(zstd_level).expect("zstd compressor")),
             buf: AlignedBuf::new(),
         }
     }
 
     fn compress(&mut self, raw: &[u8]) -> Compressed<'_> {
-        let len = match self.codec {
-            ChunkCodec::None => {
+        let len = match &mut self.zstd {
+            None => {
                 self.buf.resize(raw.len())[..raw.len()].copy_from_slice(raw);
                 raw.len()
             }
-            ChunkCodec::Lz4 => {
-                let dst = self
-                    .buf
-                    .resize(lz4_flex::block::get_maximum_output_size(raw.len()));
-                lz4_flex::compress_into(raw, dst).expect("compress")
-            }
-            ChunkCodec::Zstd(_) => {
+            Some(zstd) => {
                 let dst = self.buf.resize(zstd::zstd_safe::compress_bound(raw.len()));
-                self.zstd
-                    .as_mut()
-                    .expect("zstd")
-                    .compress_to_buffer(raw, dst)
-                    .expect("compress")
+                zstd.compress_to_buffer(raw, dst).expect("compress")
             }
         };
         // The padding is zero filled by `resize`.
@@ -653,34 +619,25 @@ impl ChunkCompressor {
 }
 
 struct ChunkDecompressor {
-    codec: ChunkCodec,
+    /// `None` for no compression.
     zstd: Option<zstd::bulk::Decompressor<'static>>,
 }
 
 impl ChunkDecompressor {
-    fn new(codec: ChunkCodec) -> ChunkDecompressor {
+    fn new(zstd_level: i32) -> ChunkDecompressor {
         ChunkDecompressor {
-            codec,
-            zstd: match codec {
-                ChunkCodec::None | ChunkCodec::Lz4 => None,
-                ChunkCodec::Zstd(_) => {
-                    Some(zstd::bulk::Decompressor::new().expect("zstd decompressor"))
-                }
-            },
+            zstd: (zstd_level != 0)
+                .then(|| zstd::bulk::Decompressor::new().expect("zstd decompressor")),
         }
     }
 
     fn decompress(&mut self, compressed: &[u8], dst: &mut [u8]) {
-        let n = match self.codec {
-            ChunkCodec::None => {
+        let n = match &mut self.zstd {
+            None => {
                 dst.copy_from_slice(compressed);
                 compressed.len()
             }
-            ChunkCodec::Lz4 => lz4_flex::decompress_into(compressed, dst).expect("decompress"),
-            ChunkCodec::Zstd(_) => self
-                .zstd
-                .as_mut()
-                .expect("zstd")
+            Some(zstd) => zstd
                 .decompress_to_buffer(compressed, dst)
                 .expect("decompress"),
         };
@@ -704,13 +661,13 @@ struct ScratchFile {
     /// `O_DIRECT`, and chunks padded to `DIRECT_ALIGN`.
     write_file: File,
     direct: bool,
-    codec: ChunkCodec,
+    zstd_level: i32,
     len: u64,
     chunks: Vec<ChunkMeta>,
 }
 
 impl ScratchFile {
-    fn create(path: PathBuf, codec: ChunkCodec, direct: bool) -> io::Result<ScratchFile> {
+    fn create(path: PathBuf, zstd_level: i32, direct: bool) -> io::Result<ScratchFile> {
         let file = File::options()
             .read(true)
             .write(true)
@@ -731,7 +688,7 @@ impl ScratchFile {
             file,
             write_file,
             direct,
-            codec,
+            zstd_level,
             len: 0,
             chunks: Vec::new(),
         })
@@ -769,7 +726,7 @@ impl ScratchFile {
         thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
-                    let mut decompressor = ChunkDecompressor::new(self.codec);
+                    let mut decompressor = ChunkDecompressor::new(self.zstd_level);
                     let mut compressed = AlignedBuf::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -976,16 +933,12 @@ pub fn convert(
     let num_rows = estimate.rows;
 
     let mut sst_opts = Options::default();
-    sst_opts.set_compression_type(DBCompressionType::Zstd);
-    if config.sst_zstd_level != 0 || config.sst_zstd_dict != 0 {
-        // Window bits and strategy as rocksdb defaults, but note that the
-        // default level is a sentinel value for the zstd default.
-        let level = if config.sst_zstd_level != 0 {
-            config.sst_zstd_level
-        } else {
-            32767
-        };
-        sst_opts.set_compression_options(-14, level, 0, config.sst_zstd_dict);
+    if config.sst_zstd_level == 0 {
+        sst_opts.set_compression_type(DBCompressionType::None);
+    } else {
+        sst_opts.set_compression_type(DBCompressionType::Zstd);
+        // Window bits and strategy as rocksdb defaults.
+        sst_opts.set_compression_options(-14, config.sst_zstd_level, 0, config.sst_zstd_dict);
         if config.sst_zstd_dict != 0 {
             sst_opts.set_zstd_max_train_bytes(config.sst_zstd_dict * 100);
         }
@@ -1098,7 +1051,7 @@ pub fn convert(
                 pass,
                 &ScatterConfig {
                     scratch: scratch_dir,
-                    codec: ChunkCodec::from_level(config.scratch_zstd_level),
+                    zstd_level: config.scratch_zstd_level,
                     // The first pass has nothing to wait for.
                     budget: (pass > 0).then_some(config.scratch_budget),
                     layout,
@@ -1163,7 +1116,7 @@ type Resident = Vec<(usize, MemoryPartition)>;
 
 struct ScatterConfig<'a> {
     scratch: &'a Path,
-    codec: ChunkCodec,
+    zstd_level: i32,
     /// Scratch budget to throttle against, if the previous pass is still
     /// freeing scratch space.
     budget: Option<u64>,
@@ -1286,7 +1239,7 @@ fn scatter_pass(
                 config
                     .scratch
                     .join(format!("games_{:05}.chunks", first_memory_partition + i)),
-                config.codec,
+                config.zstd_level,
                 config.direct,
             )?))
         })
@@ -1310,7 +1263,7 @@ fn scatter_pass(
         for _ in 0..config.write_threads {
             let rx = rx.clone();
             s.spawn(move || {
-                let mut compressor = ChunkCompressor::new(config.codec);
+                let mut compressor = ChunkCompressor::new(config.zstd_level);
                 while let Ok((file, raw)) = timed(&times.compress_recv, || rx.recv()) {
                     let compressed = timed(&times.compress, || compressor.compress(&raw));
                     if let Some(budget) = config.budget {

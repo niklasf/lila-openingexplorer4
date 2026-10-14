@@ -4,7 +4,7 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use lila_openingexplorer4::{
     pgn_to_parquet::{Config, convert},
-    util::{ByteSize, total_memory},
+    util::{ByteSize, total_memory, zstd_level},
 };
 use tikv_jemallocator::Jemalloc;
 
@@ -47,14 +47,14 @@ struct Args {
     /// spinning disks shared between readers.
     #[clap(long, default_value = "16m")]
     read_buffer: ByteSize,
-    /// Zstd compression level for meta data columns in the produced parquet
-    /// file, or 0 for uncompressed. Gains for levels above 9 are small.
-    #[clap(long, default_value = "9")]
+    /// Zstd level for meta data columns in the produced parquet file, or 0
+    /// for no compression. Gains for levels above 9 are small.
+    #[clap(long, default_value = "9", value_parser = zstd_level())]
     zstd_level: i32,
-    /// Zstd compression level for the moves column in the produced parquet
-    /// file, or 0 for uncompressed. Stacking compression on the move
-    /// encoding is not very effective (~5%).
-    #[clap(long, default_value = "0")]
+    /// Zstd level for the moves column in the produced parquet file, or 0 for
+    /// no compression. Stacking compression on the move encoding is not very
+    /// effective (~5%).
+    #[clap(long, default_value = "0", value_parser = zstd_level())]
     moves_zstd_level: i32,
 }
 

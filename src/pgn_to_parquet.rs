@@ -45,7 +45,9 @@ pub struct Config {
     pub games_per_chunk: usize,
     pub memory_budget: u64,
     pub read_buffer: usize,
+    /// Zstd level for meta data columns, or 0 for no compression.
     pub zstd_level: i32,
+    /// Zstd level for the moves column, or 0 for no compression.
     pub moves_zstd_level: i32,
 }
 
@@ -235,24 +237,19 @@ fn open_pgn(
     })
 }
 
+fn compression(zstd_level: i32) -> Compression {
+    if zstd_level == 0 {
+        Compression::UNCOMPRESSED
+    } else {
+        Compression::ZSTD(ZstdLevel::try_new(zstd_level).expect("valid zstd level"))
+    }
+}
+
 fn writer_properties(zstd_level: i32, moves_zstd_level: i32) -> Arc<WriterProperties> {
     Arc::new(
         GameColumns::properties()
-            .set_compression(if zstd_level != 0 {
-                Compression::ZSTD(ZstdLevel::try_new(zstd_level).expect("valid zstd level"))
-            } else {
-                Compression::UNCOMPRESSED
-            })
-            .set_column_compression(
-                ColumnPath::from("moves"),
-                if moves_zstd_level != 0 {
-                    Compression::ZSTD(
-                        ZstdLevel::try_new(moves_zstd_level).expect("valid zstd level"),
-                    )
-                } else {
-                    Compression::UNCOMPRESSED
-                },
-            )
+            .set_compression(compression(zstd_level))
+            .set_column_compression(ColumnPath::from("moves"), compression(moves_zstd_level))
             .build(),
     )
 }

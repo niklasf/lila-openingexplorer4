@@ -695,7 +695,6 @@ dependencies = [
  "crossbeam",
  "indicatif",
  "libc",
- "lz4_flex",
  "nohash-hasher",
  "parquet",
  "pgn-reader",

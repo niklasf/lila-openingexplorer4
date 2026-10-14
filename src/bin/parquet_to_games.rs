@@ -4,7 +4,7 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use lila_openingexplorer4::{
     parquet_to_games::{Config, Plan, convert},
-    util::{ByteSize, free_space, total_memory},
+    util::{ByteSize, free_space, total_memory, zstd_level},
 };
 use tikv_jemallocator::Jemalloc;
 
@@ -47,9 +47,8 @@ struct Args {
     /// and writing SST files.
     #[clap(long)]
     no_direct_io: bool,
-    /// Zstd level for scratch chunks, 0 for LZ4, or negative for no
-    /// compression.
-    #[clap(long, default_value = "1", allow_negative_numbers = true)]
+    /// Zstd level for scratch chunks, or 0 for no compression.
+    #[clap(long, default_value = "1", value_parser = zstd_level())]
     scratch_zstd_level: i32,
     /// Directory for the final SST files.
     #[clap(long)]
@@ -71,8 +70,8 @@ struct Args {
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]
     sst_block_size: usize,
-    /// Zstd compression level of the SST files (0 for the default).
-    #[clap(long, default_value = "0")]
+    /// Zstd level of the SST files, or 0 for no compression.
+    #[clap(long, default_value = "3", value_parser = zstd_level())]
     sst_zstd_level: i32,
     /// Maximum size of the zstd dictionary trained for each SST file
     /// (0 to disable dictionary compression).
@@ -104,7 +103,6 @@ fn main() {
     let args = Args::parse();
 
     let config = Config {
-        // Leave one physical core (two hardware threads) idle by default.
         threads: args.threads.unwrap_or_else(|| {
             thread::available_parallelism()
                 .map_or(1, NonZeroUsize::get)
@@ -112,12 +110,12 @@ fn main() {
                 .max(2)
         }),
         memory_budget: args.memory_budget.map_or_else(
-            || total_memory().expect("total memory; pass --memory-budget") / 10 * 6,
+            || total_memory().expect("total memory, pass --memory-budget") / 10 * 6,
             u64::from,
         ),
         scratch_budget: args.scratch_budget.map_or_else(
             || {
-                free_space(&args.scratch).expect("free scratch space; pass --scratch-budget") / 10
+                free_space(&args.scratch).expect("free scratch space, pass --scratch-budget") / 10
                     * 9
             },
             u64::from,
