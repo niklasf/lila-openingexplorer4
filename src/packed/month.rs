@@ -15,6 +15,21 @@ impl Month {
         Self { since_jan_1900 }
     }
 
+    /// From a calendar year and month (1 to 12).
+    pub fn from_year_month(year: i32, month: i32) -> Option<Month> {
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        let since_jan_1900 = (year - 1900).checked_mul(12)? + (month - 1);
+        u16::try_from(since_jan_1900)
+            .ok()
+            .map(Month::from_months_since_jan_1900)
+    }
+
+    pub fn to_bytes(self) -> [u8; 2] {
+        self.since_jan_1900.to_be_bytes()
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         buf.put_u16(self.since_jan_1900);
     }

@@ -1,11 +1,8 @@
 use std::{
-    fmt,
-    fs::{self, File},
-    io, mem,
-    os::unix::fs::{FileExt, OpenOptionsExt},
+    fmt, fs, io, mem,
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex,
+        Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -13,12 +10,17 @@ use std::{
 };
 
 use crossbeam::channel;
-use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
-use rocksdb::{BlockBasedOptions, DBCompressionType, EnvOptions, Options, SstFileWriter};
+use indicatif::{MultiProgress, ProgressBar};
+use rocksdb::SstFileWriter;
 
 use crate::{
     packed::GameId,
-    parquet::{GameBatch, GameReader, GameRow, PositionalFile, RowGroupBytes},
+    parquet::{GameRow, Input, PrefetchTimes, Prefetcher},
+    scatter::{
+        AlignedBuf, ChunkCompressor, ChunkDecompressor, Gauge, Layout, ScratchFile, seconds, timed,
+    },
+    sst::{SST_MAX_SIZE, SST_ROLL_SIZE, SstConfig, SstContext, SstStats},
+    util::{log, rows_style},
 };
 
 /// Memory partitions per pass that are kept in memory while reading the
@@ -35,139 +37,6 @@ const SCRATCH_RATIO: f64 = 1.0;
 
 /// Fixed memory overhead for the parquet reader, rocksdb and allocator slack.
 const BASE_MEMORY: u64 = 4 << 30;
-
-/// How the key space is split: `1 << disk_bits` passes over the input, each
-/// covering `1 << (memory_bits - disk_bits)` memory partitions.
-#[derive(Debug, Copy, Clone)]
-struct Layout {
-    memory_bits: u32,
-    disk_bits: u32,
-}
-
-impl Layout {
-    fn passes(self) -> usize {
-        1 << self.disk_bits
-    }
-
-    fn memory_partitions(self) -> usize {
-        1 << self.memory_bits
-    }
-
-    fn memory_partitions_per_pass(self) -> usize {
-        1 << (self.memory_bits - self.disk_bits)
-    }
-
-    fn scratch_partitions_per_pass(self) -> usize {
-        self.memory_partitions_per_pass() - RESIDENT_PARTITIONS_PER_PASS
-    }
-
-    /// Index of the memory partition within the given pass, or `None` if the
-    /// game belongs to a different pass.
-    fn pass_memory_partition(self, game_id: GameId, pass: usize) -> Option<usize> {
-        let memory_partition = game_id.partition(self.memory_bits);
-        let disk_partition = memory_partition >> (self.memory_bits - self.disk_bits);
-        (disk_partition == pass)
-            .then_some(memory_partition & (self.memory_partitions_per_pass() - 1))
-    }
-}
-
-/// The row groups of all input files, in order.
-struct Input {
-    readers: Vec<GameReader<PositionalFile>>,
-    /// `O_DIRECT` handles of the input files, for fetching row groups
-    /// without the page cache.
-    direct_files: Option<Vec<File>>,
-    /// Pairs of reader index and row group index within that reader.
-    row_groups: Vec<(usize, usize)>,
-}
-
-impl Input {
-    fn open(paths: &[PathBuf], limit: Option<usize>, direct: bool) -> io::Result<Input> {
-        let readers = paths
-            .iter()
-            .map(|path| Ok(GameReader::try_new(PositionalFile::open(path)?)?))
-            .collect::<io::Result<Vec<_>>>()?;
-        let direct_files = direct
-            .then(|| {
-                paths
-                    .iter()
-                    .map(|path| {
-                        File::options()
-                            .read(true)
-                            .custom_flags(libc::O_DIRECT)
-                            .open(path)
-                    })
-                    .collect::<io::Result<Vec<_>>>()
-            })
-            .transpose()?;
-        let mut row_groups: Vec<(usize, usize)> = readers
-            .iter()
-            .enumerate()
-            .flat_map(|(r, reader)| (0..reader.num_row_groups()).map(move |i| (r, i)))
-            .collect();
-        if let Some(limit) = limit {
-            row_groups.truncate(limit);
-        }
-        Ok(Input {
-            readers,
-            direct_files,
-            row_groups,
-        })
-    }
-
-    fn num_row_groups(&self) -> usize {
-        self.row_groups.len()
-    }
-
-    fn num_rows(&self, row_group: usize) -> u64 {
-        let (r, i) = self.row_groups[row_group];
-        self.readers[r].metadata().row_group(i).num_rows() as u64
-    }
-
-    fn read_games(&self, row_group: usize) -> parquet::errors::Result<GameBatch> {
-        let (r, i) = self.row_groups[row_group];
-        self.readers[r].read_games(i)
-    }
-
-    fn fetch(&self, row_group: usize) -> parquet::errors::Result<RowGroupBytes> {
-        let (r, i) = self.row_groups[row_group];
-        let Some(direct_files) = &self.direct_files else {
-            return self.readers[r].fetch_row_group(i);
-        };
-        // One aligned read covering the row group.
-        let reader = &self.readers[r];
-        let (start, end) = reader.row_group_byte_range(i);
-        let file_len = parquet::file::reader::Length::len(reader.input());
-        let aligned_start = start / DIRECT_ALIGN as u64 * DIRECT_ALIGN as u64;
-        let aligned_end = end.next_multiple_of(DIRECT_ALIGN as u64).min(file_len);
-        let mut buf = AlignedBuf::new();
-        let dst = buf.resize((aligned_end - aligned_start) as usize);
-        // Reads past the end of the file are short, so read until the row
-        // group is covered rather than until the aligned length is.
-        let needed = (end - aligned_start) as usize;
-        let mut filled = 0;
-        while filled < needed {
-            match direct_files[r].read_at(&mut dst[filled..], aligned_start + filled as u64)? {
-                0 => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-                n => filled += n,
-            }
-        }
-        let offset = buf.offset;
-        let bytes = bytes::Bytes::from(buf.vec).slice(
-            offset + (start - aligned_start) as usize..offset + (end - aligned_start) as usize,
-        );
-        Ok(RowGroupBytes::new(start, file_len, bytes))
-    }
-
-    fn read_games_from(
-        &self,
-        row_group: usize,
-        bytes: RowGroupBytes,
-    ) -> parquet::errors::Result<GameBatch> {
-        let (r, i) = self.row_groups[row_group];
-        self.readers[r].read_games_from(i, bytes)
-    }
-}
 
 /// Estimated data sizes, from a sample of row groups.
 struct Estimate {
@@ -231,6 +100,7 @@ impl Estimate {
         let mut layout = Layout {
             memory_bits: 0,
             disk_bits: 0,
+            resident: RESIDENT_PARTITIONS_PER_PASS,
         };
         loop {
             let fits_memory = self.memory(layout, read_threads) <= memory_budget;
@@ -238,11 +108,7 @@ impl Estimate {
             if fits_memory && fits_scratch {
                 return layout;
             }
-            if !fits_scratch && layout.disk_bits < layout.memory_bits {
-                layout.disk_bits += 1;
-            } else {
-                layout.memory_bits += 1;
-            }
+            layout = layout.grow(fits_scratch);
             assert!(layout.memory_bits <= 13, "no layout fits the budgets");
         }
     }
@@ -263,13 +129,6 @@ fn new_chunk() -> Vec<u8> {
     Vec::with_capacity(CHUNK_STRIDE as usize)
 }
 
-/// Hard limit for the size of each SST file.
-const SST_MAX_SIZE: u64 = 512 * 1024 * 1024;
-
-/// Start a new SST file once the current one reaches this size. The margin
-/// leaves room for the index and footer written when finishing the file.
-const SST_ROLL_SIZE: u64 = SST_MAX_SIZE - 16 * 1024 * 1024;
-
 /// Initial guess for the ratio of SST bytes to uncompressed value bytes, used
 /// until measured (about 1.1 with `PackedMoves` and 4 KB zstd blocks).
 const INITIAL_SST_RATIO: f64 = 1.1;
@@ -286,36 +145,6 @@ struct Counters {
     scratch_usage: Gauge,
     /// Partitions written to SST files so far.
     written_partitions: Gauge,
-}
-
-/// A counter that threads can wait on.
-#[derive(Default)]
-struct Gauge {
-    value: Mutex<u64>,
-    changed: Condvar,
-}
-
-impl Gauge {
-    fn add(&self, n: u64) {
-        *self.value.lock().expect("lock gauge") += n;
-        self.changed.notify_all();
-    }
-
-    fn sub(&self, n: u64) {
-        *self.value.lock().expect("lock gauge") -= n;
-        self.changed.notify_all();
-    }
-
-    /// Blocks until the value satisfies `ready`, and returns the time
-    /// waited.
-    fn wait_until(&self, ready: impl Fn(u64) -> bool) -> Duration {
-        let timer = Instant::now();
-        let mut value = self.value.lock().expect("lock gauge");
-        while !ready(*value) {
-            value = self.changed.wait(value).expect("wait gauge");
-        }
-        timer.elapsed()
-    }
 }
 
 pub struct Config {
@@ -500,230 +329,29 @@ impl MemoryPartition {
         }
     }
 
-    /// Merges partitions collected by multiple threads, without copying
-    /// records.
-    fn merge(parts: Vec<MemoryPartition>) -> MemoryPartition {
-        let mut merged = MemoryPartition::default();
-        merged
-            .chunks
-            .reserve_exact(parts.iter().map(|p| p.chunks.len()).sum());
-        merged
-            .index
-            .reserve_exact(parts.iter().map(|p| p.index.len()).sum());
-        for part in parts {
-            let base = merged.chunks.len() as u64 * CHUNK_STRIDE;
-            merged.chunks.extend(part.chunks);
-            merged
-                .index
-                .extend(part.index.into_iter().map(|(id, off)| (id, base + off)));
-        }
-        merged
-    }
-}
-
-/// Alignment of buffers, offsets and lengths for `O_DIRECT` scratch writes.
-const DIRECT_ALIGN: usize = 4096;
-
-/// A zero filled buffer aligned to `DIRECT_ALIGN`.
-struct AlignedBuf {
-    vec: Vec<u8>,
-    offset: usize,
-}
-
-impl AlignedBuf {
-    fn new() -> AlignedBuf {
-        AlignedBuf {
-            vec: Vec::new(),
-            offset: 0,
-        }
-    }
-
-    /// Resizes to `len` bytes (rounded up to the alignment) and returns
-    /// them, zero filled.
-    fn resize(&mut self, len: usize) -> &mut [u8] {
-        let len = len.next_multiple_of(DIRECT_ALIGN);
-        if self.vec.capacity() < len + DIRECT_ALIGN {
-            self.vec = Vec::with_capacity(len + DIRECT_ALIGN);
-        }
-        self.offset = self.vec.as_ptr().align_offset(DIRECT_ALIGN);
-        self.vec.clear();
-        self.vec.resize(self.offset + len, 0);
-        &mut self.vec[self.offset..]
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        &self.vec[self.offset..]
-    }
-}
-
-/// A compressed chunk: `len` bytes, followed by zero padding to
-/// `DIRECT_ALIGN`.
-struct Compressed<'a> {
-    len: usize,
-    padded: &'a [u8],
-}
-
-struct ChunkCompressor {
-    /// `None` for no compression.
-    zstd: Option<zstd::bulk::Compressor<'static>>,
-    buf: AlignedBuf,
-}
-
-impl ChunkCompressor {
-    fn new(zstd_level: i32) -> ChunkCompressor {
-        ChunkCompressor {
-            zstd: (zstd_level != 0)
-                .then(|| zstd::bulk::Compressor::new(zstd_level).expect("zstd compressor")),
-            buf: AlignedBuf::new(),
-        }
-    }
-
-    fn compress(&mut self, raw: &[u8]) -> Compressed<'_> {
-        let len = match &mut self.zstd {
-            None => {
-                self.buf.resize(raw.len())[..raw.len()].copy_from_slice(raw);
-                raw.len()
-            }
-            Some(zstd) => {
-                let dst = self.buf.resize(zstd::zstd_safe::compress_bound(raw.len()));
-                zstd.compress_to_buffer(raw, dst).expect("compress")
-            }
-        };
-        // The padding is zero filled by `resize`.
-        let padded = &self.buf.as_slice()[..len.next_multiple_of(DIRECT_ALIGN)];
-        Compressed { len, padded }
-    }
-}
-
-struct ChunkDecompressor {
-    /// `None` for no compression.
-    zstd: Option<zstd::bulk::Decompressor<'static>>,
-}
-
-impl ChunkDecompressor {
-    fn new(zstd_level: i32) -> ChunkDecompressor {
-        ChunkDecompressor {
-            zstd: (zstd_level != 0)
-                .then(|| zstd::bulk::Decompressor::new().expect("zstd decompressor")),
-        }
-    }
-
-    fn decompress(&mut self, compressed: &[u8], dst: &mut [u8]) {
-        let n = match &mut self.zstd {
-            None => {
-                dst.copy_from_slice(compressed);
-                compressed.len()
-            }
-            Some(zstd) => zstd
-                .decompress_to_buffer(compressed, dst)
-                .expect("decompress"),
-        };
-        assert_eq!(n, dst.len(), "chunk length");
-    }
-}
-
-#[derive(Copy, Clone)]
-struct ChunkMeta {
-    offset: u64,
-    raw_len: u32,
-    compressed_len: u32,
-}
-
-/// A scratch file holding compressed chunks of records.
-struct ScratchFile {
-    path: PathBuf,
-    /// Buffered handle for reading.
-    file: File,
-    /// Handle for writing, and for reading back if `direct`: then with
-    /// `O_DIRECT`, and chunks padded to `DIRECT_ALIGN`.
-    write_file: File,
-    direct: bool,
-    zstd_level: i32,
-    len: u64,
-    chunks: Vec<ChunkMeta>,
-}
-
-impl ScratchFile {
-    fn create(path: PathBuf, zstd_level: i32, direct: bool) -> io::Result<ScratchFile> {
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        let write_file = if direct {
-            File::options()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(&path)?
-        } else {
-            file.try_clone()?
-        };
-        Ok(ScratchFile {
-            path,
-            file,
-            write_file,
-            direct,
-            zstd_level,
-            len: 0,
-            chunks: Vec::new(),
-        })
-    }
-
-    fn append(
-        &mut self,
-        raw_len: usize,
-        compressed: Compressed<'_>,
-        usage: &Gauge,
-    ) -> io::Result<()> {
-        let bytes = if self.direct {
-            compressed.padded
-        } else {
-            &compressed.padded[..compressed.len]
-        };
-        self.write_file.write_all_at(bytes, self.len)?;
-        self.chunks.push(ChunkMeta {
-            offset: self.len,
-            raw_len: raw_len as u32,
-            compressed_len: compressed.len as u32,
-        });
-        self.len += bytes.len() as u64;
-        usage.add(bytes.len() as u64);
-        Ok(())
-    }
-
-    /// Loads, decompresses and indexes all chunks in parallel.
-    fn load(&self, threads: usize) -> MemoryPartition {
+    /// Loads, decompresses and indexes all chunks of a scratch file in
+    /// parallel.
+    fn load(scratch: &ScratchFile, threads: usize) -> MemoryPartition {
         type Loaded = (Vec<u8>, Vec<(GameId, u64)>);
+        let chunks = scratch.chunks();
         let next = AtomicUsize::new(0);
-        let mut slots: Vec<Option<Loaded>> = (0..self.chunks.len()).map(|_| None).collect();
+        let mut slots: Vec<Option<Loaded>> = (0..chunks.len()).map(|_| None).collect();
         let slots_ref = Mutex::new(&mut slots);
 
         thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
-                    let mut decompressor = ChunkDecompressor::new(self.zstd_level);
+                    let mut decompressor = ChunkDecompressor::new(scratch.zstd_level());
                     let mut compressed = AlignedBuf::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(chunk) = self.chunks.get(i) else {
+                        let Some(chunk) = chunks.get(i) else {
                             break;
                         };
-                        let len = chunk.compressed_len as usize;
-                        let dst = compressed.resize(len);
-                        if self.direct {
-                            self.write_file
-                                .read_exact_at(dst, chunk.offset)
-                                .expect("read chunk");
-                        } else {
-                            self.file
-                                .read_exact_at(&mut dst[..len], chunk.offset)
-                                .expect("read chunk");
-                        }
+                        let bytes = scratch.read_chunk(i, &mut compressed).expect("read chunk");
                         let mut raw = new_chunk();
                         raw.resize(chunk.raw_len as usize, 0);
-                        decompressor.decompress(&dst[..len], &mut raw);
+                        decompressor.decompress(bytes, &mut raw);
                         let mut index = Vec::new();
                         MemoryPartition::index_records(&raw, i as u64 * CHUNK_STRIDE, &mut index);
                         slots_ref.lock().expect("lock slots")[i] = Some((raw, index));
@@ -748,12 +376,24 @@ impl ScratchFile {
         partition
     }
 
-    fn remove(self, usage: &Gauge) -> io::Result<()> {
-        drop(self.file);
-        drop(self.write_file);
-        fs::remove_file(&self.path)?;
-        usage.sub(self.len);
-        Ok(())
+    /// Merges partitions collected by multiple threads, without copying
+    /// records.
+    fn merge(parts: Vec<MemoryPartition>) -> MemoryPartition {
+        let mut merged = MemoryPartition::default();
+        merged
+            .chunks
+            .reserve_exact(parts.iter().map(|p| p.chunks.len()).sum());
+        merged
+            .index
+            .reserve_exact(parts.iter().map(|p| p.index.len()).sum());
+        for part in parts {
+            let base = merged.chunks.len() as u64 * CHUNK_STRIDE;
+            merged.chunks.extend(part.chunks);
+            merged
+                .index
+                .extend(part.index.into_iter().map(|(id, off)| (id, base + off)));
+        }
+        merged
     }
 }
 
@@ -766,44 +406,6 @@ enum PartitionSource {
 struct PartitionJob {
     memory_partition: usize,
     source: PartitionSource,
-}
-
-struct SstContext<'a> {
-    opts: &'a Options,
-    env_opts: &'a EnvOptions,
-    out: &'a Path,
-    stats: Mutex<Stats>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct Stats {
-    pub games: u64,
-    pub files: u64,
-    pub bytes: u64,
-    /// Uncompressed value bytes of the games in the SST files.
-    pub raw_bytes: u64,
-    pub largest_file: u64,
-    /// Games that could not be represented as `LichessGame`.
-    pub skipped: u64,
-}
-
-impl Stats {
-    fn add_file(&mut self, games: u64, bytes: u64, raw_bytes: u64) {
-        self.games += games;
-        self.files += 1;
-        self.bytes += bytes;
-        self.raw_bytes += raw_bytes;
-        self.largest_file = self.largest_file.max(bytes);
-    }
-
-    /// Ratio of SST bytes to uncompressed value bytes.
-    pub fn ratio(&self) -> f64 {
-        if self.raw_bytes == 0 {
-            INITIAL_SST_RATIO
-        } else {
-            self.bytes as f64 / self.raw_bytes as f64
-        }
-    }
 }
 
 /// The input, its estimated size, and the layout and threads chosen to
@@ -885,6 +487,14 @@ impl fmt::Display for Plan {
     }
 }
 
+/// Result of a conversion.
+#[derive(Debug, Default, Clone)]
+pub struct Stats {
+    pub sst: SstStats,
+    /// Games that could not be represented as `LichessGame`.
+    pub skipped: u64,
+}
+
 /// Sorts the games of the planned input into non-overlapping SST files in
 /// `out`, using `scratch_dir` for temporary partition files.
 pub fn convert(
@@ -916,41 +526,19 @@ pub fn convert(
         ));
     }
 
-    let mut sst_opts = Options::default();
-    if config.sst_zstd_level == 0 {
-        sst_opts.set_compression_type(DBCompressionType::None);
-    } else {
-        sst_opts.set_compression_type(DBCompressionType::Zstd);
-        // Window bits and strategy as rocksdb defaults.
-        sst_opts.set_compression_options(-14, config.sst_zstd_level, 0, config.sst_zstd_dict);
-        if config.sst_zstd_dict != 0 {
-            sst_opts.set_zstd_max_train_bytes(config.sst_zstd_dict * 100);
-        }
-    }
-    let mut table_opts = BlockBasedOptions::default();
-    table_opts.set_block_size(config.sst_block_size);
-    sst_opts.set_block_based_table_factory(&table_opts);
-    let mut sst_env_opts = EnvOptions::default();
-    sst_env_opts.set_use_direct_writes(config.direct_io);
-    let sst = SstContext {
-        opts: &sst_opts,
-        env_opts: &sst_env_opts,
+    let sst = SstContext::new(
+        &SstConfig {
+            block_size: config.sst_block_size,
+            zstd_level: config.sst_zstd_level,
+            zstd_dict: config.sst_zstd_dict,
+            direct_io: config.direct_io,
+        },
         out,
-        stats: Mutex::new(Stats::default()),
-    };
+    );
     let counters = Counters::default();
 
-    let progress = progress.add(
-        ProgressBar::new(num_rows * layout.passes() as u64).with_style(
-            ProgressStyle::with_template(
-                "{spinner} {prefix} {msg} {wide_bar} {human_pos}/{human_len} {rate:>9} {eta:>7}",
-            )
-            .expect("progress template")
-            .with_key("rate", |state: &ProgressState, w: &mut dyn fmt::Write| {
-                let _ = write!(w, "{}/s", SignificantRate(state.per_sec()));
-            }),
-        ),
-    );
+    let progress =
+        progress.add(ProgressBar::new(num_rows * layout.passes() as u64).with_style(rows_style()));
 
     thread::scope(|s| {
         let progress = &progress;
@@ -969,7 +557,7 @@ pub fn convert(
                 let mut partition = match job.source {
                     PartitionSource::Resident(partition) => partition,
                     PartitionSource::Scratch(scratch) => {
-                        let partition = scratch.load(load_threads);
+                        let partition = MemoryPartition::load(&scratch, load_threads);
                         scratch.remove(&counters.scratch_usage).expect("remove scratch");
                         partition
                     }
@@ -1006,14 +594,14 @@ pub fn convert(
                 let timer = Instant::now();
                 write_partition(&partition, memory_partition, sst, sst_threads);
                 counters.written_partitions.add(1);
-                let stats = sst.stats.lock().expect("lock stats");
+                let stats = sst.stats.get();
                 log(
                     progress,
                     format!(
                         "partition {memory_partition}: write {:.1?} ({} files so far, ratio {:.3})",
                         timer.elapsed(),
                         stats.files,
-                        stats.ratio()
+                        stats.ratio(INITIAL_SST_RATIO)
                     ),
                 );
             }
@@ -1051,7 +639,7 @@ pub fn convert(
                 progress,
             )
             .expect("scatter");
-            let scratch_bytes: u64 = scratch.iter().map(|f| f.len).sum();
+            let scratch_bytes: u64 = scratch.iter().map(|f| f.len()).sum();
             log(
                 progress,
                 format!(
@@ -1094,9 +682,10 @@ pub fn convert(
 
     progress.finish();
 
-    let mut stats = sst.stats.into_inner().expect("stats");
-    stats.skipped = counters.skipped_games.load(Ordering::Relaxed);
-    Ok(stats)
+    Ok(Stats {
+        sst: sst.stats.get(),
+        skipped: counters.skipped_games.load(Ordering::Relaxed),
+    })
 }
 
 type Resident = Vec<(usize, MemoryPartition)>;
@@ -1118,8 +707,7 @@ struct ScatterConfig<'a> {
 /// Accumulated time of each scatter stage, summed over its threads.
 #[derive(Default)]
 struct ScatterTimes {
-    fetch: AtomicU64,
-    fetch_send: AtomicU64,
+    prefetch: PrefetchTimes,
     recv: AtomicU64,
     decode: AtomicU64,
     route: AtomicU64,
@@ -1129,20 +717,13 @@ struct ScatterTimes {
     write: AtomicU64,
 }
 
-fn timed<T>(counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
-    let timer = Instant::now();
-    let result = f();
-    counter.fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    result
-}
-
 impl ScatterTimes {
     fn summary(&self) -> String {
-        let s = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e9;
+        let s = seconds;
         format!(
             "prefetch: fetch {:.0}s, send {:.0}s; read: recv {:.0}s, decode {:.0}s, route {:.0}s, send {:.0}s; compress: recv {:.0}s, compress {:.0}s, write {:.0}s",
-            s(&self.fetch),
-            s(&self.fetch_send),
+            s(&self.prefetch.fetch),
+            s(&self.prefetch.send),
             s(&self.recv),
             s(&self.decode),
             s(&self.route),
@@ -1151,58 +732,6 @@ impl ScatterTimes {
             s(&self.compress),
             s(&self.write),
         )
-    }
-}
-
-/// Hands out row groups to decoding threads, prefetching their bytes with
-/// `io_depth` concurrent reads. Cloned into each decoding thread.
-#[derive(Clone)]
-struct Prefetcher<'a> {
-    input: &'a Input,
-    /// Fetched row groups, in flight to the decoding threads.
-    rx: channel::Receiver<(usize, RowGroupBytes)>,
-}
-
-impl<'a> Prefetcher<'a> {
-    /// Spawns `io_depth` prefetch threads in the given scope. They finish
-    /// once the input is exhausted or all decoding threads are done.
-    fn spawn<'s>(
-        input: &'a Input,
-        io_depth: usize,
-        times: &'a ScatterTimes,
-        s: &'s thread::Scope<'s, '_>,
-    ) -> Prefetcher<'a>
-    where
-        'a: 's,
-    {
-        let next_row_group = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = channel::bounded(io_depth);
-        for _ in 0..io_depth {
-            let tx = tx.clone();
-            let next_row_group = Arc::clone(&next_row_group);
-            s.spawn(move || {
-                loop {
-                    let i = next_row_group.fetch_add(1, Ordering::Relaxed);
-                    if i >= input.num_row_groups() {
-                        break;
-                    }
-                    let bytes = timed(&times.fetch, || input.fetch(i)).expect("fetch row group");
-                    if timed(&times.fetch_send, || tx.send((i, bytes))).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        Prefetcher { input, rx }
-    }
-
-    /// The next row group to decode, or `None` at the end of the input.
-    fn recv(&self) -> Option<(usize, RowGroupBytes)> {
-        self.rx.recv().ok()
-    }
-
-    fn decode(&self, (i, bytes): (usize, RowGroupBytes)) -> parquet::errors::Result<GameBatch> {
-        self.input.read_games_from(i, bytes)
     }
 }
 
@@ -1241,7 +770,7 @@ fn scatter_pass(
         let resident = &resident;
         let throttled_nanos = &throttled_nanos;
         let times = &times;
-        let prefetcher = Prefetcher::spawn(input, config.io_depth, times, s);
+        let prefetcher = Prefetcher::spawn(input, config.io_depth, &times.prefetch, s);
 
         // Write threads compress full chunks and append them to scratch
         // files, throttled by the scratch budget.
@@ -1290,7 +819,9 @@ fn scatter_pass(
                 let mut route = |row: GameRow<'_>,
                                  local_resident: &mut Vec<MemoryPartition>,
                                  chunks: &mut Vec<Vec<u8>>| {
-                    let Some(j) = layout.pass_memory_partition(row.game_id, pass) else {
+                    let Some(j) = layout
+                        .pass_memory_partition(row.game_id.partition(layout.memory_bits), pass)
+                    else {
                         return;
                     };
                     let pack = |buf: &mut Vec<u8>| row.pack_lichess_game(buf);
@@ -1389,14 +920,14 @@ fn scatter_pass(
 fn write_partition(
     partition: &MemoryPartition,
     memory_partition: usize,
-    sst: &SstContext<'_>,
+    sst: &SstContext,
     threads: usize,
 ) {
     if partition.index.is_empty() {
         return;
     }
 
-    let ratio = sst.stats.lock().expect("lock stats").ratio();
+    let ratio = sst.stats.get().ratio(INITIAL_SST_RATIO);
     let raw_per_range = (SST_ROLL_SIZE as f64 * 0.97 / ratio) as usize;
     let raw_per_game = partition.record_bytes() / partition.index.len();
     let games_per_range = (raw_per_range / raw_per_game.max(1))
@@ -1430,7 +961,7 @@ fn write_partition(
 fn write_sst_range(
     partition: &MemoryPartition,
     index: &[(GameId, u64)],
-    sst: &SstContext<'_>,
+    sst: &SstContext,
     prefix: &str,
 ) -> Result<(), rocksdb::Error> {
     let mut seq = 0;
@@ -1443,10 +974,7 @@ fn write_sst_range(
             w.finish()?;
             let bytes = w.file_size();
             assert!(bytes <= SST_MAX_SIZE, "sst file too large: {bytes}");
-            sst.stats
-                .lock()
-                .expect("lock stats")
-                .add_file(*games, bytes, *raw);
+            sst.stats.add_file(*games, bytes, *raw);
             *games = 0;
             *raw = 0;
         }
@@ -1457,8 +985,7 @@ fn write_sst_range(
         let w = match &mut writer {
             Some(w) => w,
             None => {
-                let w = SstFileWriter::create_with_env_options(sst.opts, sst.env_opts);
-                w.open(sst.out.join(format!("{prefix}_{seq}.sst")))?;
+                let w = sst.create_writer(&format!("{prefix}_{seq}.sst"))?;
                 seq += 1;
                 writer.insert(w)
             }
@@ -1475,29 +1002,4 @@ fn write_sst_range(
     }
 
     finish(&mut writer, &mut games_in_file, &mut raw_in_file)
-}
-
-/// Formats a rate with 3 significant digits and an SI suffix, so that the
-/// progress bar does not jitter with every update.
-struct SignificantRate(f64);
-
-impl fmt::Display for SignificantRate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (value, suffix) = match self.0 {
-            r if r >= 1e9 => (r / 1e9, "G"),
-            r if r >= 1e6 => (r / 1e6, "M"),
-            r if r >= 1e3 => (r / 1e3, "k"),
-            r => (r, ""),
-        };
-        let decimals = match value {
-            v if v >= 100.0 => 0,
-            v if v >= 10.0 => 1,
-            _ => 2,
-        };
-        write!(f, "{value:.decimals$}{suffix}")
-    }
-}
-
-fn log(progress: &ProgressBar, msg: String) {
-    progress.println(format!("[{:>8.1?}] {msg}", progress.elapsed()));
 }

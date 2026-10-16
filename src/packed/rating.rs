@@ -15,6 +15,15 @@ pub struct Rating {
 impl Rating {
     const BASE: i32 = 1500;
 
+    /// Offset from the base rating of 1500.
+    pub fn offset(self) -> i16 {
+        self.offset
+    }
+
+    pub fn from_offset(offset: i16) -> Rating {
+        Rating { offset }
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         pack_int(buf, self.offset as i64);
     }
