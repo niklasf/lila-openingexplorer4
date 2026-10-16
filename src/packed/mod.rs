@@ -9,7 +9,7 @@ mod moves;
 mod rating;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
-pub use entry::{GroupHeader, LichessEntry, RatingGroup};
+pub use entry::{GroupHeader, LichessEntry, RatingGroup, SubStats};
 pub use game::{
     GamePlayer, InvalidRatingMode, InvalidSpeed, LichessGame, RatingMode, Speed, outcome_bits,
     outcome_from_bits, pack_speed_and_rating_mode, unpack_uci_move,

@@ -52,6 +52,8 @@ impl RatingGroup {
     }
 }
 
+/// Used to preserve chronological order across the sub-entries of a
+/// `LichessEntry`.
 #[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GameIdx(pub usize);
 
@@ -61,7 +63,7 @@ impl GameIdx {
     }
 }
 
-#[derive(Arbitrary, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct GroupHeader {
     pub speed: Speed,
     pub rating_group: RatingGroup,
@@ -125,33 +127,63 @@ impl GroupHeader {
     }
 }
 
-#[derive(Arbitrary, Debug, Default, Clone, PartialEq, Eq)]
-struct SubEntry {
-    rating_offset_sum: i64,
-    white: u64,
-    black: u64,
-    draws: u64,
-    games: Vec<(GameIdx, GameId)>,
+#[derive(Arbitrary, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SubStats {
+    pub rating_offset_sum: i64,
+    pub white: u64,
+    pub black: u64,
+    pub draws: u64,
 }
 
-impl SubEntry {
+impl SubStats {
+    pub fn add(&mut self, rating: Rating, outcome: KnownOutcome) {
+        self.rating_offset_sum += i64::from(rating.offset());
+        match outcome {
+            KnownOutcome::Decisive {
+                winner: Color::White,
+            } => self.white += 1,
+            KnownOutcome::Decisive {
+                winner: Color::Black,
+            } => self.black += 1,
+            KnownOutcome::Draw => self.draws += 1,
+        }
+    }
+
+    pub fn merge(&mut self, other: &SubStats) {
+        self.rating_offset_sum += other.rating_offset_sum;
+        self.white += other.white;
+        self.black += other.black;
+        self.draws += other.draws;
+    }
+
+    pub fn games(&self) -> u64 {
+        self.white + self.black + self.draws
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         pack_int(buf, self.rating_offset_sum);
         pack_uint(buf, self.white);
         pack_uint(buf, self.black);
         pack_uint(buf, self.draws);
-        pack_uint(buf, self.games.len() as u64);
-        for (GameIdx(idx), game_id) in &self.games {
-            pack_uint(buf, *idx as u64);
-            game_id.pack(buf);
-        }
     }
 
-    pub fn merge_unpack<B: Buf>(&mut self, buf: &mut B, base_game_idx: GameIdx) -> GameIdx {
+    pub fn merge_unpack<B: Buf>(&mut self, buf: &mut B) {
         self.rating_offset_sum += unpack_int(buf);
         self.white += unpack_uint(buf);
         self.black += unpack_uint(buf);
         self.draws += unpack_uint(buf);
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SubEntry {
+    stats: SubStats,
+    games: Vec<(GameIdx, GameId)>,
+}
+
+impl SubEntry {
+    pub fn merge_unpack<B: Buf>(&mut self, buf: &mut B, base_game_idx: GameIdx) -> GameIdx {
+        self.stats.merge_unpack(buf);
 
         let mut next_game_idx = base_game_idx;
 
@@ -180,8 +212,8 @@ impl Arbitrary<'_> for LichessEntry {
     fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
         let mut entry = LichessEntry::new();
         for part in u.arbitrary_iter()? {
-            let (m, speed, rating_group, outcome, game) = part?;
-            entry.add_game(PackedUciMove::pack(m), speed, rating_group, outcome, game);
+            let (m, speed, rating, outcome, game) = part?;
+            entry.add_game(PackedUciMove::pack(m), speed, rating, outcome, game);
         }
         Ok(entry)
     }
@@ -196,7 +228,7 @@ impl LichessEntry {
         &mut self,
         m: PackedUciMove,
         speed: Speed,
-        rating_group: RatingGroup,
+        rating: Rating,
         outcome: KnownOutcome,
         game: GameId,
     ) {
@@ -206,35 +238,24 @@ impl LichessEntry {
             .or_default()
             .entry(GroupHeader {
                 speed,
-                rating_group,
+                rating_group: RatingGroup::select(rating),
             })
             .or_default();
 
-        match outcome {
-            KnownOutcome::Decisive {
-                winner: Color::White,
-            } => sub_entry.white += 1,
-            KnownOutcome::Decisive {
-                winner: Color::Black,
-            } => sub_entry.black += 1,
-            KnownOutcome::Draw => sub_entry.draws += 1,
-        }
-
+        sub_entry.stats.add(rating, outcome);
         sub_entry.games.push((self.next_game_idx, game));
         self.next_game_idx = self.next_game_idx.add(1);
     }
 
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
-        for (i, (m, move_entries)) in self.moves.iter().enumerate() {
-            if i > 0 {
-                buf.put_u8(0);
-            }
-            buf.put_slice(&m.to_bytes());
-            for (header, sub_entry) in move_entries {
-                buf.put_u8(header.to_byte());
-                sub_entry.pack(buf);
-            }
-        }
+        Self::pack_entire_external(
+            buf,
+            self.moves.iter().flat_map(|(m, move_entries)| {
+                move_entries.iter().map(|(header, sub_entry)| {
+                    (*m, *header, &sub_entry.stats, &sub_entry.games[..])
+                })
+            }),
+        );
     }
 
     pub fn merge_unpack_entire<B: Buf>(&mut self, buf: &mut B) {
@@ -288,6 +309,40 @@ impl LichessEntry {
 
         self.next_game_idx.0 -= deleted_indexes.len();
     }
+
+    /// Packs an entry from sub-entries, which need to be already grouped
+    /// like `LichessEntry` does.
+    ///
+    /// `K` is used to maintain the chronological order of games across
+    /// sub-entries (`GameIdx` or `GlobalGameIdx`).
+    pub fn pack_entire_external<'a, B: BufMut, K: Ord + Copy + 'a, I>(buf: &mut B, subs: I)
+    where
+        I: Iterator<Item = (PackedUciMove, GroupHeader, &'a SubStats, &'a [(K, GameId)])> + Clone,
+    {
+        let mut keys: Vec<K> = subs
+            .clone()
+            .flat_map(|(_, _, _, games)| games.iter().map(|(key, _)| *key))
+            .collect();
+        keys.sort_unstable();
+
+        let mut current_move: Option<PackedUciMove> = None;
+        for (m, header, stats, games) in subs {
+            if current_move != Some(m) {
+                if current_move.is_some() {
+                    buf.put_u8(0);
+                }
+                buf.put_slice(&m.to_bytes());
+                current_move = Some(m);
+            }
+            buf.put_u8(header.to_byte());
+            stats.pack(buf);
+            pack_uint(buf, games.len() as u64);
+            for (key, game_id) in games {
+                pack_uint(buf, keys.partition_point(|k| k < key) as u64);
+                game_id.pack(buf);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -295,20 +350,6 @@ mod tests {
     use arbtest::arbtest;
 
     use super::*;
-
-    #[test]
-    fn test_pack_sub_entry_roundtrip() {
-        arbtest(|u| {
-            let sub_entry: SubEntry = u.arbitrary()?;
-
-            let mut buf = Vec::new();
-            sub_entry.pack(&mut buf);
-            let mut unpacked = SubEntry::default();
-            unpacked.merge_unpack(&mut &buf[..], GameIdx(0));
-            assert_eq!(sub_entry, unpacked);
-            Ok(())
-        });
-    }
 
     #[test]
     fn test_lichess_entry_roundtrip() {
