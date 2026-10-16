@@ -15,6 +15,14 @@ pub struct Rating {
 impl Rating {
     const BASE: i32 = 1500;
 
+    pub fn offset(self) -> i16 {
+        self.offset
+    }
+
+    pub fn from_offset(offset: i16) -> Self {
+        Rating { offset }
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         pack_int(buf, self.offset as i64);
     }
@@ -24,15 +32,11 @@ impl Rating {
     }
 
     pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        Rating {
-            offset: unpack_int(buf) as i16,
-        }
+        Rating::from_offset(unpack_int(buf) as i16)
     }
 
     pub fn unpack_fixed<B: Buf>(buf: &mut B) -> Self {
-        Rating {
-            offset: buf.get_i16(),
-        }
+        Rating::from_offset(buf.get_i16())
     }
 
     pub fn from_ascii(bytes: &[u8]) -> Result<Self, InvalidRating> {
