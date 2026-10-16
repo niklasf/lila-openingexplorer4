@@ -55,11 +55,11 @@ impl RatingGroup {
 /// Used to preserve chronological order across the sub-entries of a
 /// `LichessEntry`.
 #[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct GameIdx(pub usize);
+struct GameSeq(pub usize);
 
-impl GameIdx {
-    pub fn add(self, offset: usize) -> GameIdx {
-        GameIdx(self.0 + offset)
+impl GameSeq {
+    pub fn add(self, offset: usize) -> GameSeq {
+        GameSeq(self.0 + offset)
     }
 }
 
@@ -178,34 +178,34 @@ impl SubStats {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct SubEntry {
     stats: SubStats,
-    games: Vec<(GameIdx, GameId)>,
+    games: Vec<(GameSeq, GameId)>,
 }
 
 impl SubEntry {
-    pub fn merge_unpack<B: Buf>(&mut self, buf: &mut B, base_game_idx: GameIdx) -> GameIdx {
+    pub fn merge_unpack<B: Buf>(&mut self, buf: &mut B, base_game_seq: GameSeq) -> GameSeq {
         self.stats.merge_unpack(buf);
 
-        let mut next_game_idx = base_game_idx;
+        let mut next_game_seq = base_game_seq;
 
         let game_count = unpack_uint(buf) as usize;
         self.games.extend(
             iter::repeat_with(|| {
-                let idx = base_game_idx.add(unpack_uint(buf) as usize);
-                next_game_idx = max(next_game_idx, idx.add(1));
+                let seq = base_game_seq.add(unpack_uint(buf) as usize);
+                next_game_seq = max(next_game_seq, seq.add(1));
                 let game_id = GameId::unpack(buf);
-                (idx, game_id)
+                (seq, game_id)
             })
             .take(game_count),
         );
 
-        next_game_idx
+        next_game_seq
     }
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct LichessEntry {
     moves: FxHashMap<PackedUciMove, FxHashMap<GroupHeader, SubEntry>>,
-    next_game_idx: GameIdx,
+    next_game_seq: GameSeq,
 }
 
 impl Arbitrary<'_> for LichessEntry {
@@ -243,8 +243,8 @@ impl LichessEntry {
             .or_default();
 
         sub_entry.stats.add(rating, outcome);
-        sub_entry.games.push((self.next_game_idx, game));
-        self.next_game_idx = self.next_game_idx.add(1);
+        sub_entry.games.push((self.next_game_seq, game));
+        self.next_game_seq = self.next_game_seq.add(1);
     }
 
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
@@ -259,7 +259,7 @@ impl LichessEntry {
     }
 
     pub fn merge_unpack_entire<B: Buf>(&mut self, buf: &mut B) {
-        let base_game_idx = self.next_game_idx;
+        let base_game_seq = self.next_game_seq;
 
         while buf.has_remaining() {
             let mut packed_bytes = [0; 2];
@@ -272,12 +272,12 @@ impl LichessEntry {
                 match GroupHeader::from_byte(buf.get_u8()) {
                     None => break,
                     Some(header) => {
-                        self.next_game_idx = max(
-                            self.next_game_idx,
+                        self.next_game_seq = max(
+                            self.next_game_seq,
                             sub_entries
                                 .entry(header)
                                 .or_default()
-                                .merge_unpack(buf, base_game_idx),
+                                .merge_unpack(buf, base_game_seq),
                         );
                     }
                 }
@@ -293,7 +293,7 @@ impl LichessEntry {
                     sub_entry
                         .games
                         .drain(..sub_entry.games.len().saturating_sub(limit))
-                        .map(|(idx, _)| idx),
+                        .map(|(seq, _)| seq),
                 )
             }
         }
@@ -301,20 +301,20 @@ impl LichessEntry {
         deleted_indexes.sort_unstable();
         for move_entries in self.moves.values_mut() {
             for sub_entry in move_entries.values_mut() {
-                for (idx, _) in &mut sub_entry.games {
-                    idx.0 -= deleted_indexes.partition_point(|deleted| deleted < idx);
+                for (seq, _) in &mut sub_entry.games {
+                    seq.0 -= deleted_indexes.partition_point(|deleted| deleted < seq);
                 }
             }
         }
 
-        self.next_game_idx.0 -= deleted_indexes.len();
+        self.next_game_seq.0 -= deleted_indexes.len();
     }
 
     /// Packs an entry from sub-entries, which need to be already grouped
     /// like `LichessEntry` does.
     ///
     /// `K` is used to maintain the chronological order of games across
-    /// sub-entries (`GameIdx` or `GlobalGameIdx`).
+    /// sub-entries (`GameSeq` or `GlobalGameSeq`).
     pub fn pack_entire_external<'a, B: BufMut, K: Ord + Copy + 'a, I>(buf: &mut B, subs: I)
     where
         I: Iterator<Item = (PackedUciMove, GroupHeader, &'a SubStats, &'a [(K, GameId)])> + Clone,
@@ -374,23 +374,23 @@ mod tests {
                 let merge_entry: LichessEntry = merge_entry?;
 
                 // Merge
-                let total_games = lichess_entry.next_game_idx.0 + merge_entry.next_game_idx.0;
+                let total_games = lichess_entry.next_game_seq.0 + merge_entry.next_game_seq.0;
                 let mut buf = Vec::new();
                 merge_entry.pack_entire(&mut buf);
                 lichess_entry.merge_unpack_entire(&mut &buf[..]);
-                assert_eq!(lichess_entry.next_game_idx.0, total_games);
+                assert_eq!(lichess_entry.next_game_seq.0, total_games);
 
                 // Check invariants
                 lichess_entry.truncate_games(2);
-                let mut indexes: Vec<GameIdx> = Vec::new();
+                let mut indexes: Vec<GameSeq> = Vec::new();
                 for move_entries in lichess_entry.moves.values() {
                     for sub_entry in move_entries.values() {
                         assert!(sub_entry.games.is_sorted());
-                        indexes.extend(sub_entry.games.iter().map(|(idx, _)| idx));
+                        indexes.extend(sub_entry.games.iter().map(|(seq, _)| seq));
                     }
                 }
                 indexes.sort_unstable();
-                assert_eq!(indexes, (0..indexes.len()).map(GameIdx).collect::<Vec<_>>());
+                assert_eq!(indexes, (0..indexes.len()).map(GameSeq).collect::<Vec<_>>());
             }
 
             Ok(())
