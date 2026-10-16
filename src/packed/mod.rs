@@ -7,6 +7,7 @@ mod lax_date;
 mod month;
 mod moves;
 mod rating;
+mod zobrist;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
 pub use entry::{GroupHeader, LichessEntry, RatingGroup, SubStats};
@@ -20,3 +21,4 @@ pub use lax_date::{InvalidLaxDate, LaxDate};
 pub use month::{InvalidMonth, Month};
 pub use moves::{InvalidPackedMoves, PackedMoves, PackedMovesDecoder, PackedMovesEncoder};
 pub use rating::{InvalidRating, Rating};
+pub use zobrist::Zobrist96;

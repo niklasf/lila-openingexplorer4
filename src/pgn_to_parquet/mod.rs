@@ -18,6 +18,7 @@ use std::{
 
 use bytes::Bytes;
 use crossbeam::channel;
+pub use dedup::RecentGameIds;
 use indicatif::{
     HumanBytes, HumanCount, MultiProgress, MultiProgressAlignment, ProgressBar, ProgressStyle,
 };
@@ -32,12 +33,10 @@ use parquet::{
     },
     schema::types::ColumnPath,
 };
+pub use pgn::{FlatGame, FlatPlayer, GameVisitor};
 use pgn_reader::Reader as PgnReader;
 
 use crate::{packed::GameId, parquet::GameColumns};
-
-pub use dedup::RecentGameIds;
-pub use pgn::{FlatGame, GameVisitor};
 
 const TYPICAL_GAME_BYTES: usize = 2500;
 

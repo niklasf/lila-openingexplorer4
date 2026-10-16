@@ -7,48 +7,11 @@ use std::{
 
 use arbitrary::Arbitrary;
 use bytes::{Buf, BufMut};
-use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove, zobrist::Zobrist128};
+use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove};
 
 use crate::packed::{
-    GameId, Month, Rating, Speed, outcome_bits, outcome_from_bits, unpack_uci_move,
+    GameId, Month, Rating, Speed, Zobrist96, outcome_bits, outcome_from_bits, unpack_uci_move,
 };
-
-#[derive(Arbitrary, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Zobrist96 {
-    inner: [u8; 12],
-}
-
-impl Zobrist96 {
-    pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        buf.put_slice(&self.inner);
-    }
-
-    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        let mut hash = Zobrist96 { inner: [0; 12] };
-        buf.copy_to_slice(&mut hash.inner);
-        hash
-    }
-
-    pub fn partition(&self) -> usize {
-        usize::from(u16::from_be_bytes([self.inner[0], self.inner[1]]) >> (16 - 10))
-    }
-
-    pub fn bitmap_index(&self) -> usize {
-        let zobrist64 = u64::from_be_bytes(self.inner[..8].try_into().expect("8 bytes"));
-        let index = zobrist64 >> (64 - 42); // Select 42 top bits
-        (index & ((1 << (42 - 10)) - 1)) as usize // Remove 10 partitions bits
-    }
-}
-
-impl From<Zobrist128> for Zobrist96 {
-    fn from(zobrist: Zobrist128) -> Self {
-        Zobrist96 {
-            inner: u128::from(zobrist).to_be_bytes()[..12]
-                .try_into()
-                .expect("96 bits"),
-        }
-    }
-}
 
 #[derive(Arbitrary, Debug, Clone, Eq, PartialEq)]
 pub struct IntermediateEntry {
@@ -99,7 +62,7 @@ impl IntermediateEntry {
     }
 
     pub fn partition(&self) -> usize {
-        self.hash.partition()
+        (self.hash.prefix() >> (64 - 10)) as usize
     }
 }
 
