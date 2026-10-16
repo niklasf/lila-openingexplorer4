@@ -15,12 +15,12 @@ use shakmaty::{ByColor, Outcome};
 use thiserror::Error;
 
 use crate::{
-    indexing::{FlatGame, FlatPlayer},
     packed::{
         GameId, LaxDate, Rating, RatingMode, Speed, outcome_bits, pack_bytes,
         pack_speed_and_rating_mode,
     },
     parquet::{OptionalColumn, RequiredColumn},
+    pgn_to_parquet::{FlatGame, FlatPlayer},
 };
 
 #[derive(Default)]

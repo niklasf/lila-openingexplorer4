@@ -1,3 +1,6 @@
+mod dedup;
+mod pgn;
+
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsStr,
@@ -31,11 +34,10 @@ use parquet::{
 };
 use pgn_reader::Reader as PgnReader;
 
-use crate::{
-    indexing::{FlatGame, GameVisitor, RecentGameIds},
-    packed::GameId,
-    parquet::GameColumns,
-};
+use crate::{packed::GameId, parquet::GameColumns};
+
+pub use dedup::RecentGameIds;
+pub use pgn::{FlatGame, GameVisitor};
 
 const TYPICAL_GAME_BYTES: usize = 2500;
 

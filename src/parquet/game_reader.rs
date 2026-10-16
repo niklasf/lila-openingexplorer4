@@ -358,9 +358,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        indexing::{FlatGame, FlatPlayer},
         packed::{LaxDate, PackedMoves, Rating, RatingMode, Speed},
         parquet::GameColumns,
+        pgn_to_parquet::{FlatGame, FlatPlayer},
     };
 
     fn game(game_id: &[u8], title: Option<&str>, speed: Option<Speed>) -> FlatGame {
