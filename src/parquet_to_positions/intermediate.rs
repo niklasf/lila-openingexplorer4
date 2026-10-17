@@ -1,98 +1,156 @@
-use std::{
-    fs::File,
-    io,
-    io::{BufWriter, Write},
-    path::Path,
-};
+use std::cmp::Ordering;
+use std::fmt;
 
-use arbitrary::Arbitrary;
 use bytes::{Buf, BufMut};
 use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove};
 
-use crate::packed::{
-    GameId, Month, Rating, Speed, Zobrist96, outcome_bits, outcome_from_bits, unpack_uci_move,
+use crate::{
+    packed::{
+        GameId, GroupHeader, Month, Rating, RatingGroup, Speed, Zobrist96, outcome_bits,
+        outcome_from_bits,
+    },
+    parquet_to_positions::GlobalGameSeq,
 };
 
-#[derive(Arbitrary, Debug, Clone, Eq, PartialEq)]
-pub struct IntermediateEntry {
-    pub hash: Zobrist96,
-    pub month: Month,
-    pub m: PackedUciMove,
-    pub game_id: GameId,
-    pub speed: Speed,
-    pub rating: Rating,
-    pub outcome: KnownOutcome,
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub struct IntermediateEntry(pub [u8; IntermediateEntry::SIZE]);
+
+impl Ord for IntermediateEntry {
+    #[inline]
+    fn cmp(&self, other: &IntermediateEntry) -> Ordering {
+        self.0[..IntermediateEntry::KEY_SIZE].cmp(&other.0[..IntermediateEntry::KEY_SIZE])
+    }
+}
+
+impl PartialOrd for IntermediateEntry {
+    #[inline]
+    fn partial_cmp(&self, other: &IntermediateEntry) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl IntermediateEntry {
-    pub const KEY_SIZE: usize = 12 + 2;
-    pub const SIZE: usize = Self::KEY_SIZE + 2 + 6 + 1 + 2;
+    pub const SIZE: usize = 30;
+    pub const KEY_SIZE: usize = Zobrist96::SIZE + 2;
 
-    pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        self.hash.pack(buf); // 12 bytes
-        self.month.pack(buf); // 2 bytes
-        buf.put_slice(&self.m.to_bytes()); // 2 bytes
-        self.game_id.pack(buf); // 6 bytes
-        buf.put_u8(self.speed.bits() | outcome_bits(Outcome::Known(self.outcome)) << 3); // 1 byte
-        self.rating.pack_fixed(buf); // 2 bytes
-    }
-
-    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        let hash = Zobrist96::unpack(buf);
-        let month = Month::unpack(buf);
-        let m = unpack_uci_move(buf);
-        let game_id = GameId::unpack(buf);
-        let speed_and_outcome = buf.get_u8();
-        let speed = Speed::from_bits(speed_and_outcome & 0b111).expect("valid speed");
-        let outcome = outcome_from_bits(speed_and_outcome >> 3)
-            .expect("valid outcome")
-            .known()
-            .expect("known outcome");
-        let rating = Rating::unpack_fixed(buf);
-
-        IntermediateEntry {
-            hash,
-            month,
-            m,
-            game_id,
+    pub fn new(
+        hash: Zobrist96,
+        month: Month,
+        m: PackedUciMove,
+        speed: Speed,
+        rating: Rating,
+        outcome: KnownOutcome,
+        seq: GlobalGameSeq,
+        game_id: GameId,
+    ) -> IntermediateEntry {
+        let header = GroupHeader {
             speed,
-            rating,
-            outcome,
+            rating_group: RatingGroup::select(rating),
+        };
+        let mut bytes = [0; Self::SIZE];
+        let mut buf = &mut bytes[..];
+        hash.pack(&mut buf);
+        month.pack(&mut buf);
+        buf.put_slice(&m.to_bytes());
+        buf.put_u8(header.to_byte());
+        buf.put_uint(
+            seq.get() << 2 | u64::from(outcome_bits(Outcome::Known(outcome))),
+            5,
+        );
+        rating.pack_fixed(&mut buf);
+        game_id.pack(&mut buf);
+        debug_assert!(buf.is_empty());
+        IntermediateEntry(bytes)
+    }
+
+    #[inline]
+    pub fn hash(&self) -> Zobrist96 {
+        Zobrist96::unpack(&mut &self.0[..Zobrist96::SIZE])
+    }
+
+    #[inline]
+    pub fn hash_prefix(&self) -> u64 {
+        u64::from_be_bytes(self.0[..8].try_into().expect("8 bytes"))
+    }
+
+    #[inline]
+    pub fn key(&self) -> &[u8; Self::KEY_SIZE] {
+        self.0[..Self::KEY_SIZE].try_into().expect("key")
+    }
+
+    #[inline]
+    pub fn month(&self) -> Month {
+        Month::unpack(&mut &self.0[12..14])
+    }
+
+    #[inline]
+    pub fn sub_key(&self) -> IntermediateSubKey {
+        IntermediateSubKey(self.0[14..17].try_into().expect("3 bytes"))
+    }
+
+    #[inline]
+    pub fn uci_move(&self) -> PackedUciMove {
+        self.sub_key().uci_move()
+    }
+
+    #[inline]
+    pub fn group_header(&self) -> GroupHeader {
+        self.sub_key().group_header()
+    }
+
+    #[inline]
+    fn seq_and_outcome(&self) -> u64 {
+        (&self.0[17..22]).get_uint(5)
+    }
+
+    #[inline]
+    pub fn seq(&self) -> GlobalGameSeq {
+        GlobalGameSeq::new(self.seq_and_outcome() >> 2).expect("38 bits")
+    }
+
+    #[inline]
+    pub fn outcome(&self) -> KnownOutcome {
+        match outcome_from_bits((self.seq_and_outcome() & 0b11) as u8) {
+            Some(Outcome::Known(outcome)) => outcome,
+            _ => unreachable!("invalid outcome"),
         }
     }
 
-    pub fn partition(&self) -> usize {
-        (self.hash.prefix() >> (64 - 10)) as usize
+    #[inline]
+    pub fn rating(&self) -> Rating {
+        Rating::unpack_fixed(&mut &self.0[22..24])
+    }
+
+    #[inline]
+    pub fn game_id(&self) -> GameId {
+        GameId::unpack(&mut &self.0[24..30])
     }
 }
 
-pub struct IntermediateSink {
-    partitions: Vec<BufWriter<File>>,
+impl fmt::Debug for IntermediateEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Record")
+            .field("hash", &self.hash())
+            .field("month", &self.month())
+            .field("sub_key", &self.sub_key())
+            .field("seq", &self.seq())
+            .field("outcome", &self.outcome())
+            .field("rating", &self.rating())
+            .field("game_id", &&self.0[24..30])
+            .finish()
+    }
 }
 
-impl IntermediateSink {
-    pub fn new(workspace: &Path) -> io::Result<Self> {
-        Ok(IntermediateSink {
-            partitions: (0..1024)
-                .map(|i| {
-                    File::create(workspace.join(format!("expanded_{:04}.bin", i)))
-                        .map(BufWriter::new)
-                })
-                .collect::<Result<_, _>>()?,
-        })
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IntermediateSubKey(pub [u8; 3]);
+
+impl IntermediateSubKey {
+    pub fn uci_move(&self) -> PackedUciMove {
+        PackedUciMove::from_bytes([self.0[0], self.0[1]])
     }
 
-    pub fn write(&mut self, entry: &IntermediateEntry) -> io::Result<()> {
-        let mut bytes = [0; IntermediateEntry::SIZE];
-        entry.pack(&mut &mut bytes[..]);
-        self.partitions[entry.partition()].write_all(&bytes)
-    }
-
-    pub fn flush(&mut self) -> io::Result<()> {
-        for partition in &mut self.partitions {
-            partition.flush()?;
-        }
-        Ok(())
+    pub fn group_header(&self) -> GroupHeader {
+        GroupHeader::from_byte(self.0[2]).expect("valid group header")
     }
 }
 
@@ -103,37 +161,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_packed_ord() {
+    fn test_intermediate_entry_roundtrip() {
         arbtest(|u| {
-            let left: IntermediateEntry = u.arbitrary()?;
-            let mut left_buf = [0; IntermediateEntry::SIZE];
-            left.pack(&mut &mut left_buf[..]);
+            let hash: Zobrist96 = u.arbitrary()?;
+            let month: Month = u.arbitrary()?;
+            let m = PackedUciMove::pack(u.arbitrary()?);
+            let speed: Speed = u.arbitrary()?;
+            let rating: Rating = u.arbitrary()?;
+            let outcome: KnownOutcome = u.arbitrary()?;
+            let seq: GlobalGameSeq = u.arbitrary()?;
+            let game_id: GameId = u.arbitrary()?;
 
-            let right: IntermediateEntry = u.arbitrary()?;
-            let mut right_buf = [0; IntermediateEntry::SIZE];
-            right.pack(&mut &mut right_buf[..]);
+            let entry =
+                IntermediateEntry::new(hash, month, m, speed, rating, outcome, seq, game_id);
 
-            if left.partition() < right.partition() {
-                assert!(left_buf < right_buf);
-            }
-
-            if (left.hash, left.month) < (right.hash, right.month) {
-                assert!(left_buf < right_buf);
-            }
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_pack_roundtrip() {
-        arbtest(|u| {
-            let entry: IntermediateEntry = u.arbitrary()?;
-
-            let mut buf = [0; IntermediateEntry::SIZE];
-            entry.pack(&mut &mut buf[..]);
-            let unpacked = IntermediateEntry::unpack(&mut &buf[..]);
-            assert_eq!(entry, unpacked);
+            assert_eq!(entry.hash(), hash);
+            assert_eq!(entry.month(), month);
+            assert_eq!(entry.uci_move(), m);
+            assert_eq!(entry.group_header().speed, speed);
+            assert_eq!(
+                entry.group_header().rating_group,
+                RatingGroup::select(rating)
+            );
+            assert_eq!(entry.seq(), seq);
+            assert_eq!(entry.outcome(), outcome);
+            assert_eq!(entry.rating(), rating);
+            assert_eq!(entry.game_id(), game_id);
             Ok(())
         });
     }

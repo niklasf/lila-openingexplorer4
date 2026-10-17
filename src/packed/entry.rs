@@ -55,7 +55,7 @@ impl RatingGroup {
 /// Used to preserve chronological order across the sub-entries of a
 /// `LichessEntry`.
 #[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct GameSeq(pub usize);
+pub struct GameSeq(pub usize);
 
 impl GameSeq {
     pub fn add(self, offset: usize) -> GameSeq {
