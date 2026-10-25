@@ -1,8 +1,9 @@
+use nohash_hasher::IntMap;
 use shakmaty::{
     ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Move, Position,
     packed::PackedUciMove,
     variant::{Variant, VariantPosition},
-    zobrist::{Zobrist64, Zobrist128},
+    zobrist::Zobrist128,
 };
 use thiserror::Error;
 
@@ -24,7 +25,8 @@ pub enum InvalidGame {
 /// from it.
 #[derive(Copy, Clone)]
 struct Visit {
-    hash: Zobrist128,
+    /// Ply at which the position was first reached.
+    ply: usize,
     m: Move,
     turn: Color,
 }
@@ -44,9 +46,7 @@ pub struct GameInfo {
 /// Replays games, with buffers reused across games.
 #[derive(Default)]
 pub struct Replayer {
-    visits: Vec<Visit>,
-    /// Low bits of the hashes in `visits`, for a fast scan.
-    short_hashes: Vec<Zobrist64>,
+    visits: IntMap<Zobrist128, Visit>,
 }
 
 impl Replayer {
@@ -76,32 +76,23 @@ impl Replayer {
     /// times. The final position is not recorded.
     fn replay(&mut self, mut pos: VariantPosition, moves: &[u8]) -> Result<(), InvalidGame> {
         self.visits.clear();
-        self.short_hashes.clear();
 
         let mut decoder = PackedMovesDecoder::new(moves).map_err(|_| InvalidGame::InvalidMoves)?;
         let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
+        let mut ply = 0;
         while let Some(m) = decoder
             .decode_next(&pos)
             .map_err(|_| InvalidGame::InvalidMoves)?
         {
-            let visit = Visit {
-                hash,
-                m,
-                turn: pos.turn(),
-            };
-            let short = Zobrist64::from(hash);
-            match self
-                .short_hashes
-                .iter()
-                .rposition(|&s| s == short)
-                .filter(|&i| self.visits[i].hash == hash)
-            {
-                Some(i) => self.visits[i] = visit,
-                None => {
-                    self.visits.push(visit);
-                    self.short_hashes.push(short);
-                }
-            }
+            self.visits
+                .entry(hash)
+                .and_modify(|visit| visit.m = m)
+                .or_insert(Visit {
+                    ply,
+                    m,
+                    turn: pos.turn(),
+                });
+            ply += 1;
 
             let updated = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
             pos.play_unchecked(m);
@@ -119,9 +110,9 @@ impl Replayer {
     /// The records of the last replayed game.
     pub fn entries(&self, info: &GameInfo) -> impl Iterator<Item = IntermediateEntry> + '_ {
         let info = *info;
-        self.visits.iter().map(move |visit| {
+        self.visits.iter().map(move |(&hash, visit)| {
             IntermediateEntry::new(
-                Zobrist96::new(visit.hash, info.variant),
+                Zobrist96::new(hash, info.variant),
                 info.month,
                 PackedUciMove::pack(visit.m.to_uci(CastlingMode::Chess960)),
                 info.speed,
@@ -133,10 +124,13 @@ impl Replayer {
         })
     }
 
-    /// Recorded hashes of the last replayed game, in order of first
-    /// occurrence.
-    pub fn hashes(&self) -> impl Iterator<Item = Zobrist128> + '_ {
-        self.visits.iter().map(|visit| visit.hash)
+    /// Recorded hashes of the last replayed game, of the positions first
+    /// reached before the given ply.
+    pub fn hashes_before(&self, ply: usize) -> impl Iterator<Item = Zobrist128> + '_ {
+        self.visits
+            .iter()
+            .filter(move |(_, visit)| visit.ply < ply)
+            .map(|(&hash, _)| hash)
     }
 }
 
@@ -160,15 +154,11 @@ mod tests {
 
         let mut replayer = Replayer::default();
         replayer.replay(initial, &moves.0).unwrap();
-        replayer
-            .visits
-            .iter()
-            .map(|visit| {
-                (
-                    visit.hash,
-                    visit.m.to_uci(CastlingMode::Chess960).to_string(),
-                )
-            })
+        let mut visits: Vec<_> = replayer.visits.into_iter().collect();
+        visits.sort_by_key(|(_, visit)| visit.ply);
+        visits
+            .into_iter()
+            .map(|(hash, visit)| (hash, visit.m.to_uci(CastlingMode::Chess960).to_string()))
             .collect()
     }
 

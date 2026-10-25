@@ -73,7 +73,7 @@ impl Sample {
                             };
                             months.insert(info.month);
                             records += replayer.len() as u64;
-                            for hash in replayer.hashes().take(SAMPLE_PLIES) {
+                            for hash in replayer.hashes_before(SAMPLE_PLIES) {
                                 *counts
                                     .entry(Zobrist96::new(hash, info.variant))
                                     .or_default() += 1;
