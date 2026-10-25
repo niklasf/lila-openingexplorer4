@@ -13,7 +13,7 @@ use crate::{
     intermediate::{EntryPacker, IntermediateEntry},
     packed::Zobrist96,
     parquet_to_positions::{
-        hot::HotEntries,
+        hot::HotEntry,
         partition::{BUCKETS, Partition, bucket},
     },
     sst::{RollingSstWriter, SstStats},
@@ -93,7 +93,7 @@ enum Family {
 /// in parallel. File names sort in key order.
 pub fn write_partition(
     partition: &Partition,
-    hot: &HotEntries,
+    hot: &[HotEntry],
     memory_partition: usize,
     memory_bits: u32,
     sst: &SstContext<'_>,
@@ -155,7 +155,7 @@ fn hash_bytes(entry: &IntermediateEntry) -> &[u8] {
 fn write_range(
     family: Family,
     buckets: &[Vec<IntermediateEntry>],
-    hot: &[([u8; IntermediateEntry::KEY_SIZE], Vec<u8>)],
+    hot: &[HotEntry],
     sst: &SstContext<'_>,
     name: &str,
     packer: &mut EntryPacker,

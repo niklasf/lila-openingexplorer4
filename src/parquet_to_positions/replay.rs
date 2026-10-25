@@ -9,16 +9,16 @@ use thiserror::Error;
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::{GameId, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
+    packed::{GameId, InvalidPackedMoves, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
     parquet::{GameRow, InvalidGameRow},
 };
 
-#[derive(Debug, Error, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum InvalidGame {
     #[error("{0}")]
     Row(#[from] InvalidGameRow),
-    #[error("invalid moves")]
-    InvalidMoves,
+    #[error("{0}")]
+    Moves(#[from] InvalidPackedMoves),
 }
 
 /// A position reached in a game, and the move that was eventually played
@@ -77,13 +77,10 @@ impl Replayer {
     fn replay(&mut self, mut pos: VariantPosition, moves: &[u8]) -> Result<(), InvalidGame> {
         self.visits.clear();
 
-        let mut decoder = PackedMovesDecoder::new(moves).map_err(|_| InvalidGame::InvalidMoves)?;
+        let mut decoder = PackedMovesDecoder::new(moves)?;
         let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
         let mut ply = 0;
-        while let Some(m) = decoder
-            .decode_next(&pos)
-            .map_err(|_| InvalidGame::InvalidMoves)?
-        {
+        while let Some(m) = decoder.decode_next(&pos)? {
             self.visits
                 .entry(hash)
                 .and_modify(|visit| visit.m = m)

@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::HashSet,
     sync::{
         Mutex,
@@ -89,40 +90,35 @@ impl Sample {
             }
         });
 
-        let mut sample = Sample {
-            sampled_rows: 0,
-            records: 0,
-            months: 0,
-            counts: Vec::new(),
-        };
+        let (mut sampled_rows, mut records) = (0, 0);
         let mut months = HashSet::new();
         let mut counts: IntMap<Zobrist96, u64> = IntMap::default();
-        for (rows, records, thread_months, thread_counts) in results.into_inner().expect("results")
+        for (thread_rows, thread_records, thread_months, thread_counts) in
+            results.into_inner().expect("results")
         {
-            sample.sampled_rows += rows;
-            sample.records += records;
+            sampled_rows += thread_rows;
+            records += thread_records;
             months.extend(thread_months);
             for (hash, count) in thread_counts {
                 *counts.entry(hash).or_default() += count;
             }
         }
-        sample.months = months.len() as u64;
-        sample.counts = counts
+        let mut counts: Vec<(Zobrist96, u64)> = counts
             .into_iter()
             .filter(|&(_, count)| count >= MIN_SAMPLE_COUNT)
             .collect();
-        sample
-            .counts
-            .sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        sample
+        counts.sort_unstable_by_key(|&(hash, count)| (Reverse(count), hash));
+        Sample {
+            sampled_rows,
+            records,
+            months: months.len() as u64,
+            counts,
+        }
     }
 
     /// Hashes with at least `threshold` estimated records in an input of
     /// `rows` rows, most frequent first, and their estimated records.
     pub fn hot(&self, rows: u64, threshold: u64) -> Vec<(Zobrist96, u64)> {
-        if self.sampled_rows == 0 {
-            return Vec::new();
-        }
         let scale = rows as f64 / self.sampled_rows as f64;
         self.counts
             .iter()
@@ -140,8 +136,11 @@ const SHARDS: usize = 64;
 /// map.
 pub const HOT_BATCH: usize = 1 << 16;
 
-/// Packed entries of hot positions, sorted by `IntermediateEntry::key()`.
-pub type HotEntries = Vec<([u8; IntermediateEntry::KEY_SIZE], Vec<u8>)>;
+/// A packed entry of a hot position, with its `IntermediateEntry::key()`.
+pub type HotEntry = ([u8; IntermediateEntry::KEY_SIZE], Vec<u8>);
+
+/// Packed entries of hot positions, sorted by key.
+pub type HotEntries = Vec<HotEntry>;
 
 /// Aggregated entries of hot positions, keyed by `IntermediateEntry::key()`.
 pub struct HotMap {

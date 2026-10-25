@@ -150,7 +150,6 @@ struct Counters {
     skipped_games: AtomicU64,
     /// Records routed to memory partitions.
     records: AtomicU64,
-    /// Records of hot positions.
     hot_records: AtomicU64,
     /// Bytes currently occupied by scratch files.
     scratch_usage: Gauge,
@@ -406,7 +405,6 @@ pub fn convert(
             }
         });
 
-        // Writer: writes sorted partitions to SST files.
         s.spawn(move || {
             for (memory_partition, partition, hot) in sorted_rx {
                 let sst_threads = if scanned.load(Ordering::Relaxed) {
