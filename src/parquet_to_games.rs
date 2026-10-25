@@ -130,7 +130,7 @@ const SST_ROLL_SIZE: u64 = SST_MAX_SIZE - 16 * 1024 * 1024;
 const INITIAL_SST_RATIO: f64 = 1.1;
 
 /// Sub-buckets for the parallel sort of a partition.
-const SORT_BUCKET_BITS: u32 = 3;
+const SORT_BUCKETS: usize = 8;
 
 /// Counters shared by the threads of one run.
 #[derive(Default)]
@@ -285,11 +285,11 @@ impl MemoryPartition {
     /// Sorts the index by game id, in parallel over sub-buckets of the key
     /// range. All entries must belong to one memory partition of `layout`.
     fn sort(&mut self, layout: Layout, threads: usize) {
-        let buckets = 1 << SORT_BUCKET_BITS;
-        let bits = layout.memory_bits + SORT_BUCKET_BITS;
+        let buckets = SORT_BUCKETS;
+        let sub_partitions = layout.memory_partitions() * buckets;
         let mut bucketed: Vec<Vec<(GameId, u64)>> = (0..buckets).map(|_| Vec::new()).collect();
         for entry in self.index.drain(..) {
-            bucketed[entry.0.partition(bits) & (buckets - 1)].push(entry);
+            bucketed[entry.0.partition(sub_partitions) % buckets].push(entry);
         }
         let next = AtomicUsize::new(0);
         let slots: Vec<Mutex<&mut Vec<(GameId, u64)>>> =
@@ -678,8 +678,7 @@ pub fn convert(
             for (memory_partition, file) in scratch.into_iter().enumerate() {
                 job_tx
                     .send(PartitionJob {
-                        memory_partition: pass * layout.memory_partitions_per_pass()
-                            + memory_partition,
+                        memory_partition: layout.first_memory_partition(pass) + memory_partition,
                         source: PartitionSource::Scratch(file),
                     })
                     .expect("send job");
@@ -750,7 +749,7 @@ fn scatter_pass(
 ) -> io::Result<(Resident, Vec<ScratchFile>, Duration)> {
     let layout = config.layout;
     let scratch_partitions = layout.scratch_partitions_per_pass();
-    let first_memory_partition = pass * layout.memory_partitions_per_pass();
+    let first_memory_partition = layout.first_memory_partition(pass);
 
     let files: Vec<Mutex<ScratchFile>> = (0..scratch_partitions)
         .map(|i| {
@@ -801,9 +800,10 @@ fn scatter_pass(
                 let mut route = |row: GameRow<'_>,
                                  local_resident: &mut Vec<MemoryPartition>,
                                  chunks: &mut Vec<Vec<u8>>| {
-                    let Some(j) = layout
-                        .pass_memory_partition(row.game_id.partition(layout.memory_bits), pass)
-                    else {
+                    let Some(j) = layout.pass_memory_partition(
+                        row.game_id.partition(layout.memory_partitions()),
+                        pass,
+                    ) else {
                         return;
                     };
                     let pack = |buf: &mut Vec<u8>| row.pack_lichess_game(buf);

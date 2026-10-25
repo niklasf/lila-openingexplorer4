@@ -17,60 +17,70 @@ use crate::util::{Gauge, timed, timed_seconds};
 /// input, rather than being written to scratch space and read back.
 pub const RESIDENT_PARTITIONS_PER_PASS: usize = 1;
 
-/// How the key space is split: `1 << disk_bits` passes over the input, each
-/// covering `1 << (memory_bits - disk_bits)` memory partitions.
+/// How the key space is split: `passes` passes over the input, each
+/// covering `memory_partitions_per_pass` memory partitions. Keys are mapped
+/// to memory partitions by multiply-shift, so neither count needs to be a
+/// power of two.
 #[derive(Debug, Copy, Clone)]
 pub struct Layout {
-    pub memory_bits: u32,
-    pub disk_bits: u32,
+    passes: usize,
+    memory_partitions_per_pass: usize,
 }
 
 impl Layout {
+    /// Upper bound for the memory partitions of a layout.
+    const MAX_MEMORY_PARTITIONS: usize = 1 << 16;
+
     pub fn passes(self) -> usize {
-        1 << self.disk_bits
+        self.passes
     }
 
     pub fn memory_partitions(self) -> usize {
-        1 << self.memory_bits
+        self.passes * self.memory_partitions_per_pass
     }
 
     pub fn memory_partitions_per_pass(self) -> usize {
-        1 << (self.memory_bits - self.disk_bits)
+        self.memory_partitions_per_pass
     }
 
     pub fn scratch_partitions_per_pass(self) -> usize {
-        self.memory_partitions_per_pass() - RESIDENT_PARTITIONS_PER_PASS
+        self.memory_partitions_per_pass - RESIDENT_PARTITIONS_PER_PASS
+    }
+
+    /// The first memory partition of a pass.
+    pub fn first_memory_partition(self, pass: usize) -> usize {
+        pass * self.memory_partitions_per_pass
     }
 
     /// Index of the given memory partition within the given pass, or `None`
     /// if it belongs to a different pass.
     #[inline]
     pub fn pass_memory_partition(self, memory_partition: usize, pass: usize) -> Option<usize> {
-        let disk_partition = memory_partition >> (self.memory_bits - self.disk_bits);
-        (disk_partition == pass)
-            .then_some(memory_partition & (self.memory_partitions_per_pass() - 1))
+        memory_partition
+            .checked_sub(self.first_memory_partition(pass))
+            .filter(|j| *j < self.memory_partitions_per_pass)
     }
 
     /// Picks the fewest passes that fit the scratch budget, and the fewest
-    /// memory partitions that fit the memory budget. `fits` returns whether
-    /// a layout fits the memory and the scratch budget, respectively.
+    /// memory partitions per pass that fit the memory budget. `fits` returns
+    /// whether a layout fits the memory and the scratch budget, respectively.
     pub fn choose(fits: impl Fn(Layout) -> (bool, bool)) -> Layout {
-        let mut layout = Layout {
-            memory_bits: 0,
-            disk_bits: 0,
-        };
-        loop {
-            let (fits_memory, fits_scratch) = fits(layout);
-            if fits_memory && fits_scratch {
-                return layout;
+        for passes in 1..=Self::MAX_MEMORY_PARTITIONS {
+            for memory_partitions_per_pass in 1..=Self::MAX_MEMORY_PARTITIONS / passes {
+                let layout = Layout {
+                    passes,
+                    memory_partitions_per_pass,
+                };
+                match fits(layout) {
+                    (true, true) => return layout,
+                    // More partitions per pass only add scratch. Try more
+                    // passes instead.
+                    (true, false) => break,
+                    (false, _) => (),
+                }
             }
-            if !fits_scratch && layout.disk_bits < layout.memory_bits {
-                layout.disk_bits += 1;
-            } else {
-                layout.memory_bits += 1;
-            }
-            assert!(layout.memory_bits <= 16, "no layout fits the budgets");
         }
+        panic!("no layout fits the budgets");
     }
 }
 

@@ -95,7 +95,7 @@ pub fn write_partition(
     partition: &Partition,
     hot: &[HotEntry],
     memory_partition: usize,
-    memory_bits: u32,
+    memory_partitions: usize,
     sst: &SstContext<'_>,
     threads: usize,
 ) {
@@ -125,10 +125,10 @@ pub fn write_partition(
                     tasks.get(next_task.fetch_add(1, Ordering::Relaxed))
                 {
                     let buckets = range * BUCKETS / ranges..(range + 1) * BUCKETS / ranges;
-                    let hot_start =
-                        hot.partition_point(|(key, _)| bucket(key, memory_bits) < buckets.start);
-                    let hot_end =
-                        hot.partition_point(|(key, _)| bucket(key, memory_bits) < buckets.end);
+                    let hot_start = hot
+                        .partition_point(|(key, _)| bucket(key, memory_partitions) < buckets.start);
+                    let hot_end = hot
+                        .partition_point(|(key, _)| bucket(key, memory_partitions) < buckets.end);
                     let stats = write_range(
                         family,
                         &partition.buckets[buckets],

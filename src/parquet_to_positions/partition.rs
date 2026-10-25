@@ -15,16 +15,28 @@ fn hash_prefix(key: &[u8; IntermediateEntry::KEY_SIZE]) -> u64 {
     u64::from_be_bytes(key[..8].try_into().expect("8 bytes"))
 }
 
+/// The memory partition of a key, and the position of the key within the
+/// partition (multiply-shift: the integer and the fractional part of the
+/// scaled hash prefix). Together they are in key order.
+#[inline]
+fn split(key: &[u8; IntermediateEntry::KEY_SIZE], memory_partitions: usize) -> (usize, u64) {
+    let scaled = u128::from(hash_prefix(key)) * memory_partitions as u128;
+    ((scaled >> 64) as usize, scaled as u64)
+}
+
 /// The memory partition of a key.
 #[inline]
-pub fn memory_partition(key: &[u8; IntermediateEntry::KEY_SIZE], memory_bits: u32) -> usize {
-    (hash_prefix(key).checked_shr(64 - memory_bits).unwrap_or(0)) as usize
+pub fn memory_partition(
+    key: &[u8; IntermediateEntry::KEY_SIZE],
+    memory_partitions: usize,
+) -> usize {
+    split(key, memory_partitions).0
 }
 
 /// The bucket of a key within its memory partition.
 #[inline]
-pub fn bucket(key: &[u8; IntermediateEntry::KEY_SIZE], memory_bits: u32) -> usize {
-    ((hash_prefix(key) << memory_bits) >> (64 - BUCKET_BITS)) as usize
+pub fn bucket(key: &[u8; IntermediateEntry::KEY_SIZE], memory_partitions: usize) -> usize {
+    (split(key, memory_partitions).1 >> (64 - BUCKET_BITS)) as usize
 }
 
 fn entries(raw: &[u8]) -> impl Iterator<Item = IntermediateEntry> + '_ {
@@ -64,15 +76,15 @@ impl Partition {
 
 /// Distributes records to shared buckets, staging them per thread.
 struct Bucketer<'a> {
-    memory_bits: u32,
+    memory_partitions: usize,
     buckets: &'a [Mutex<Vec<IntermediateEntry>>],
     staged: Vec<Vec<IntermediateEntry>>,
 }
 
 impl<'a> Bucketer<'a> {
-    fn new(memory_bits: u32, buckets: &'a [Mutex<Vec<IntermediateEntry>>]) -> Bucketer<'a> {
+    fn new(memory_partitions: usize, buckets: &'a [Mutex<Vec<IntermediateEntry>>]) -> Bucketer<'a> {
         Bucketer {
-            memory_bits,
+            memory_partitions,
             buckets,
             staged: (0..BUCKETS).map(|_| Vec::with_capacity(STAGE)).collect(),
         }
@@ -80,7 +92,7 @@ impl<'a> Bucketer<'a> {
 
     #[inline]
     fn push(&mut self, entry: IntermediateEntry) {
-        let b = bucket(entry.key(), self.memory_bits);
+        let b = bucket(entry.key(), self.memory_partitions);
         let staged = &mut self.staged[b];
         staged.push(entry);
         if staged.len() >= STAGE {
@@ -116,12 +128,12 @@ fn into_partition(buckets: Vec<Mutex<Vec<IntermediateEntry>>>) -> Partition {
 }
 
 /// Loads a scratch file in parallel, distributing its records to buckets.
-pub fn load(scratch: &ScratchFile, memory_bits: u32, threads: usize) -> Partition {
+pub fn load(scratch: &ScratchFile, memory_partitions: usize, threads: usize) -> Partition {
     let records = scratch.raw_len() as usize / IntermediateEntry::SIZE;
     let buckets = shared_buckets(records);
     let bucketers = scratch.load(
         threads,
-        || Bucketer::new(memory_bits, &buckets),
+        || Bucketer::new(memory_partitions, &buckets),
         |bucketer, _, raw| {
             for entry in entries(raw) {
                 bucketer.push(entry);
@@ -138,7 +150,7 @@ pub fn load(scratch: &ScratchFile, memory_bits: u32, threads: usize) -> Partitio
 /// parallel. Each part is freed as soon as it is distributed.
 pub fn from_parts(
     parts: Vec<Vec<IntermediateEntry>>,
-    memory_bits: u32,
+    memory_partitions: usize,
     threads: usize,
 ) -> Partition {
     let records = parts.iter().map(Vec::len).sum();
@@ -147,7 +159,7 @@ pub fn from_parts(
     thread::scope(|s| {
         for _ in 0..threads.max(1) {
             s.spawn(|| {
-                let mut bucketer = Bucketer::new(memory_bits, &buckets);
+                let mut bucketer = Bucketer::new(memory_partitions, &buckets);
                 loop {
                     let Some(part) = parts.lock().expect("lock parts").pop() else {
                         break;
@@ -172,20 +184,24 @@ mod tests {
     #[test]
     fn test_buckets_in_key_order() {
         arbtest(|u| {
-            let memory_bits = u.int_in_range(0..=12)?;
+            let memory_partitions: usize = u.int_in_range(1..=5000)?;
+            let p = u.int_in_range(0..=memory_partitions - 1)?;
+            // Prefixes mapped to memory partition p.
+            let lo = ((p as u128) << 64).div_ceil(memory_partitions as u128);
+            let hi = (((p + 1) as u128) << 64).div_ceil(memory_partitions as u128);
             let mut records: Vec<IntermediateEntry> = Vec::new();
-            let partition_bits: u64 = u.arbitrary()?;
             for _ in 0..u.int_in_range(0..=2000)? {
                 let mut bytes: [u8; IntermediateEntry::SIZE] = u.arbitrary()?;
-                // All records of one memory partition.
-                let prefix = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-                let mask = u64::MAX.checked_shr(memory_bits).unwrap_or(0);
-                let prefix = (partition_bits & !mask) | (prefix & mask);
+                let prefix = (lo + u.int_in_range(0..=hi - lo - 1)?) as u64;
                 bytes[..8].copy_from_slice(&prefix.to_be_bytes());
+                assert_eq!(
+                    memory_partition(IntermediateEntry(bytes).key(), memory_partitions),
+                    p
+                );
                 records.push(IntermediateEntry(bytes));
             }
             let parts = records.chunks(7).map(<[_]>::to_vec).collect();
-            let mut partition = from_parts(parts, memory_bits, 3);
+            let mut partition = from_parts(parts, memory_partitions, 3);
             partition.sort(3);
             let mut actual: Vec<IntermediateEntry> = partition.buckets.concat();
             assert!(actual.is_sorted_by_key(IntermediateEntry::sort_key));

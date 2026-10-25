@@ -378,11 +378,11 @@ pub fn convert(
                 let timer = Instant::now();
                 let mut partition = match job.source {
                     PartitionSource::Resident(parts) => {
-                        partition::from_parts(parts, layout.memory_bits, load_threads)
+                        partition::from_parts(parts, layout.memory_partitions(), load_threads)
                     }
                     PartitionSource::Scratch(scratch) => {
                         let partition =
-                            partition::load(&scratch, layout.memory_bits, load_threads);
+                            partition::load(&scratch, layout.memory_partitions(), load_threads);
                         scratch
                             .remove(&counters.scratch_usage)
                             .expect("remove scratch");
@@ -420,7 +420,7 @@ pub fn convert(
                     &partition,
                     &hot,
                     memory_partition,
-                    layout.memory_bits,
+                    layout.memory_partitions(),
                     sst,
                     sst_threads,
                 );
@@ -498,12 +498,12 @@ pub fn convert(
             }
 
             // Hot entries of each memory partition of this pass.
-            let first_memory_partition = pass * layout.memory_partitions_per_pass();
+            let first_memory_partition = layout.first_memory_partition(pass);
             let mut hot_by_partition: Vec<HotEntries> = (0..layout.memory_partitions_per_pass())
                 .map(|_| Vec::new())
                 .collect();
             for (key, value) in scattered.hot {
-                let entry_partition = memory_partition(&key, layout.memory_bits);
+                let entry_partition = memory_partition(&key, layout.memory_partitions());
                 hot_by_partition[entry_partition - first_memory_partition].push((key, value));
             }
 
@@ -608,7 +608,7 @@ fn scatter_pass(
 ) -> io::Result<Scattered> {
     let layout = config.layout;
     let scratch_partitions = layout.scratch_partitions_per_pass();
-    let first_memory_partition = pass * layout.memory_partitions_per_pass();
+    let first_memory_partition = layout.first_memory_partition(pass);
     let counters = config.counters;
 
     let files: Vec<Mutex<ScratchFile>> = (0..scratch_partitions)
@@ -680,7 +680,7 @@ fn scatter_pass(
 
                         for entry in replayer.entries(&info) {
                             let Some(j) = layout.pass_memory_partition(
-                                memory_partition(entry.key(), layout.memory_bits),
+                                memory_partition(entry.key(), layout.memory_partitions()),
                                 pass,
                             ) else {
                                 continue;

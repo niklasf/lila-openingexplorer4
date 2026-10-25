@@ -16,8 +16,10 @@ impl GameId {
         bytes
     }
 
-    pub fn partition(self, bits: u32) -> usize {
-        ((u128::from(self.0) << bits) / 62_u128.pow(8)) as usize
+    /// The partition of the game id when the id space is split into
+    /// `partitions` equal ranges.
+    pub fn partition(self, partitions: usize) -> usize {
+        (u128::from(self.0) * partitions as u128 / 62_u128.pow(8)) as usize
     }
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
@@ -141,9 +143,9 @@ mod tests {
         arbtest(|u| {
             let left: GameId = u.arbitrary()?;
             let right: GameId = u.arbitrary()?;
-            let bits = u.int_in_range(0..=47)?;
+            let partitions = u.int_in_range(1..=1 << 20)?;
             if left <= right {
-                assert!(left.partition(bits) <= right.partition(bits));
+                assert!(left.partition(partitions) <= right.partition(partitions));
             }
             Ok(())
         });
@@ -153,11 +155,11 @@ mod tests {
     fn test_subpartition() {
         arbtest(|u| {
             let game_id: GameId = u.arbitrary()?;
-            let coarse_bits = u.int_in_range(0..=47)?;
-            let fine_bits = u.int_in_range(coarse_bits..=47)?;
+            let coarse = u.int_in_range(1..=1 << 20)?;
+            let sub = u.int_in_range(1..=1 << 10)?;
             assert_eq!(
-                game_id.partition(fine_bits) >> (fine_bits - coarse_bits),
-                game_id.partition(coarse_bits)
+                game_id.partition(coarse * sub) / sub,
+                game_id.partition(coarse)
             );
             Ok(())
         });
