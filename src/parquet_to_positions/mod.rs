@@ -348,10 +348,9 @@ pub fn convert(
     create_out_dir(&out.join(POSITIONS_DIR))?;
 
     let hot_set: FxHashSet<Zobrist96> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
-    let (sst_opts, sst_env_opts) = config.sst.options();
     let sst = SstContext {
-        opts: &sst_opts,
-        env_opts: &sst_env_opts,
+        opts: &config.sst.options(),
+        env_opts: &config.sst.env_options(),
         out,
         target_size: config.sst_target_size,
         stats: Mutex::new(OutputStats::default()),

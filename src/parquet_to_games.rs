@@ -533,16 +533,15 @@ pub fn convert(
         ));
     }
 
-    let (sst_opts, sst_env_opts) = SstConfig {
+    let sst_config = SstConfig {
         block_size: config.sst_block_size,
         zstd_level: config.sst_zstd_level,
         zstd_dict: config.sst_zstd_dict,
         direct_io: config.direct_io,
-    }
-    .options();
+    };
     let sst = SstContext {
-        opts: &sst_opts,
-        env_opts: &sst_env_opts,
+        opts: &sst_config.options(),
+        env_opts: &sst_config.env_options(),
         out,
         stats: Mutex::new(Stats::default()),
     };

@@ -4,25 +4,22 @@ use rocksdb::{BlockBasedOptions, DBCompressionType, EnvOptions, Options, SstFile
 
 #[derive(Debug, Copy, Clone)]
 pub struct SstConfig {
-    /// Block size of the SST files.
     pub block_size: usize,
     /// Zstd level of the SST files, or 0 for no compression.
     pub zstd_level: i32,
     /// Maximum size of the zstd dictionary trained for each SST file (0 to
     /// disable dictionary compression).
     pub zstd_dict: i32,
-    /// Use O_DIRECT for writing.
     pub direct_io: bool,
 }
 
 impl SstConfig {
-    pub fn options(&self) -> (Options, EnvOptions) {
+    pub fn options(&self) -> Options {
         let mut opts = Options::default();
         if self.zstd_level == 0 {
             opts.set_compression_type(DBCompressionType::None);
         } else {
             opts.set_compression_type(DBCompressionType::Zstd);
-            // Window bits and strategy as rocksdb defaults.
             opts.set_compression_options(-14, self.zstd_level, 0, self.zstd_dict);
             if self.zstd_dict != 0 {
                 opts.set_zstd_max_train_bytes(self.zstd_dict * 100);
@@ -31,13 +28,16 @@ impl SstConfig {
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_size(self.block_size);
         opts.set_block_based_table_factory(&table_opts);
+        opts
+    }
+
+    pub fn env_options(&self) -> EnvOptions {
         let mut env_opts = EnvOptions::default();
         env_opts.set_use_direct_writes(self.direct_io);
-        (opts, env_opts)
+        env_opts
     }
 }
 
-/// Size statistics of written SST files.
 #[derive(Debug, Default, Clone)]
 pub struct SstStats {
     pub keys: u64,
@@ -65,7 +65,6 @@ impl SstStats {
         self.largest_file = self.largest_file.max(other.largest_file);
     }
 
-    /// Ratio of SST bytes to uncompressed key and value bytes.
     pub fn ratio(&self) -> f64 {
         if self.raw_bytes == 0 {
             0.0
@@ -74,7 +73,6 @@ impl SstStats {
         }
     }
 
-    /// SST bytes per key.
     pub fn bytes_per_key(&self) -> f64 {
         if self.keys == 0 {
             0.0
@@ -84,10 +82,6 @@ impl SstStats {
     }
 }
 
-/// Writes keys in ascending order to a sequence of SST files, starting a new
-/// file once the current one reaches the target size, like compactions do
-/// with `target_file_size_base`. Files are named `{prefix}_{seq:04}.sst`, so
-/// that they sort in key order.
 pub struct RollingSstWriter<'a> {
     opts: &'a Options,
     env_opts: &'a EnvOptions,
@@ -152,7 +146,6 @@ impl<'a> RollingSstWriter<'a> {
         Ok(())
     }
 
-    /// Finishes the last file and returns the statistics of all files.
     pub fn finish(mut self) -> Result<SstStats, rocksdb::Error> {
         self.finish_file()?;
         Ok(self.stats)
