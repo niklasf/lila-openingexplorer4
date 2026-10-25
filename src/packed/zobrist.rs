@@ -15,6 +15,8 @@ impl Hash for Zobrist96 {
     }
 }
 
+impl nohash_hasher::IsEnabled for Zobrist96 {}
+
 impl Zobrist96 {
     pub const SIZE: usize = 12;
 

@@ -16,7 +16,7 @@ use std::{
 
 use crossbeam::channel;
 use indicatif::{MultiProgress, ProgressBar};
-use rustc_hash::FxHashSet;
+use nohash_hasher::IntSet;
 pub use write::{COLD_DIR, OutputStats, POSITIONS_DIR};
 
 use crate::{
@@ -339,7 +339,7 @@ pub fn convert(
     create_out_dir(&out.join(COLD_DIR))?;
     create_out_dir(&out.join(POSITIONS_DIR))?;
 
-    let hot_set: FxHashSet<Zobrist96> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
+    let hot_set: IntSet<Zobrist96> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
     let sst = SstContext {
         opts: &config.sst.options(),
         env_opts: &config.sst.env_options(),
@@ -558,7 +558,7 @@ struct ScatterConfig<'a> {
     io_depth: usize,
     direct: bool,
     counters: &'a Counters,
-    hot_set: &'a FxHashSet<Zobrist96>,
+    hot_set: &'a IntSet<Zobrist96>,
 }
 
 /// Accumulated time of each scatter stage, summed over its threads.

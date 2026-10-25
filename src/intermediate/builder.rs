@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry, IntermediateSubKey},
@@ -81,7 +81,7 @@ impl SubBuilder {
 
 #[derive(Default)]
 pub struct EntryBuilder {
-    subs: FxHashMap<IntermediateSubKey, SubBuilder>,
+    subs: BTreeMap<IntermediateSubKey, SubBuilder>,
 }
 
 impl EntryBuilder {
@@ -90,11 +90,9 @@ impl EntryBuilder {
     }
 
     pub fn pack(self, packer: &mut EntryPacker, buf: &mut Vec<u8>) {
-        let mut subs: Vec<(IntermediateSubKey, SubBuilder)> = self.subs.into_iter().collect();
-        subs.sort_unstable_by_key(|(key, _)| *key);
         packer.subs.clear();
         packer.games.clear();
-        for (key, mut sub) in subs {
+        for (key, mut sub) in self.subs {
             sub.gc();
             let start = packer.games.len();
             packer.games.extend(sub.games);

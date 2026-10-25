@@ -7,6 +7,7 @@ use std::{
     thread,
 };
 
+use nohash_hasher::IntMap;
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -54,7 +55,7 @@ impl Sample {
             for _ in 0..threads.clamp(1, samples.max(1)) {
                 s.spawn(|| {
                     let mut replayer = Replayer::default();
-                    let mut counts: FxHashMap<Zobrist96, u64> = FxHashMap::default();
+                    let mut counts: IntMap<Zobrist96, u64> = IntMap::default();
                     let mut months: HashSet<Month> = HashSet::new();
                     let (mut rows, mut records) = (0, 0);
                     // Sequence numbers do not matter for the sample.
@@ -95,7 +96,7 @@ impl Sample {
             counts: Vec::new(),
         };
         let mut months = HashSet::new();
-        let mut counts: FxHashMap<Zobrist96, u64> = FxHashMap::default();
+        let mut counts: IntMap<Zobrist96, u64> = IntMap::default();
         for (rows, records, thread_months, thread_counts) in results.into_inner().expect("results")
         {
             sample.sampled_rows += rows;
