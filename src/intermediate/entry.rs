@@ -5,11 +5,11 @@ use bytes::{Buf, BufMut};
 use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove};
 
 use crate::{
+    intermediate::GlobalGameSeq,
     packed::{
         GameId, GroupHeader, Month, Rating, RatingGroup, Speed, Zobrist96, outcome_bits,
         outcome_from_bits,
     },
-    parquet_to_positions::GlobalGameSeq,
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -129,7 +129,7 @@ impl IntermediateEntry {
 
 impl fmt::Debug for IntermediateEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Record")
+        f.debug_struct("IntermediateEntry")
             .field("hash", &self.hash())
             .field("month", &self.month())
             .field("sub_key", &self.sub_key())
