@@ -2,7 +2,7 @@ use shakmaty::{
     ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Move, Position,
     packed::PackedUciMove,
     variant::{Variant, VariantPosition},
-    zobrist::Zobrist128,
+    zobrist::{Zobrist64, Zobrist128},
 };
 use thiserror::Error;
 
@@ -46,7 +46,7 @@ pub struct GameInfo {
 pub struct Replayer {
     visits: Vec<Visit>,
     /// Low bits of the hashes in `visits`, for a fast scan.
-    short_hashes: Vec<u64>,
+    short_hashes: Vec<Zobrist64>,
 }
 
 impl Replayer {
@@ -89,7 +89,7 @@ impl Replayer {
                 m,
                 turn: pos.turn(),
             };
-            let short = hash.0 as u64;
+            let short = Zobrist64::from(hash);
             match self
                 .short_hashes
                 .iter()
