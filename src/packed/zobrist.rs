@@ -1,10 +1,18 @@
+use std::hash::{Hash, Hasher};
+
 use arbitrary::Arbitrary;
 use bytes::{Buf, BufMut};
 use shakmaty::{variant::Variant, zobrist::Zobrist128};
 
-#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Zobrist96 {
     inner: [u8; Zobrist96::SIZE],
+}
+
+impl Hash for Zobrist96 {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.prefix());
+    }
 }
 
 impl Zobrist96 {

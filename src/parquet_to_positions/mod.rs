@@ -16,6 +16,7 @@ use std::{
 
 use crossbeam::channel;
 use indicatif::{MultiProgress, ProgressBar};
+use rustc_hash::FxHashSet;
 pub use write::{COLD_DIR, OutputStats, POSITIONS_DIR};
 
 use crate::{
@@ -23,7 +24,7 @@ use crate::{
     packed::Zobrist96,
     parquet::{Input, PrefetchTimes, Prefetcher},
     parquet_to_positions::{
-        hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotMap, HotSet, Sample},
+        hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotMap, Sample},
         partition::{Partition, memory_partition},
         replay::{GameInfo, Replayer},
         write::{HotEntries, SstContext, write_partition},
@@ -346,7 +347,7 @@ pub fn convert(
     create_out_dir(&out.join(COLD_DIR))?;
     create_out_dir(&out.join(POSITIONS_DIR))?;
 
-    let hot_set = HotSet::new(estimate.hot.iter().map(|(hash, _)| *hash));
+    let hot_set: FxHashSet<Zobrist96> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
     let (sst_opts, sst_env_opts) = config.sst.options();
     let sst = SstContext {
         opts: &sst_opts,
@@ -575,7 +576,7 @@ struct ScatterConfig<'a> {
     io_depth: usize,
     direct: bool,
     counters: &'a Counters,
-    hot_set: &'a HotSet,
+    hot_set: &'a FxHashSet<Zobrist96>,
 }
 
 /// Accumulated time of each scatter stage, summed over its threads.
@@ -711,7 +712,7 @@ fn scatter_pass(
                                 ) else {
                                     continue;
                                 };
-                                if config.hot_set.contains(&entry) {
+                                if config.hot_set.contains(&entry.hash()) {
                                     hot.push(entry);
                                     hot_records += 1;
                                 } else if j >= scratch_partitions {

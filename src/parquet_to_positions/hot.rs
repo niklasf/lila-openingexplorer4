@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -7,7 +7,6 @@ use std::{
     thread,
 };
 
-use nohash_hasher::BuildNoHashHasher;
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -140,41 +139,6 @@ impl Sample {
             .take_while(|&(_, estimated)| estimated >= threshold)
             .take(MAX_HOT)
             .collect()
-    }
-}
-
-/// The fixed set of hot positions.
-///
-/// Reached by so many games that they would overload their
-/// memory partition. Their records bypass the partitions and are aggregated
-/// in memory while scanning the input.
-#[derive(Default)]
-pub struct HotSet {
-    /// Full hashes by prefix (which is already uniformly distributed).
-    hashes: HashMap<u64, Zobrist96, BuildNoHashHasher<u64>>,
-}
-
-impl HotSet {
-    pub fn new(hashes: impl IntoIterator<Item = Zobrist96>) -> HotSet {
-        let mut set = HotSet::default();
-        for hash in hashes {
-            let previous = set.hashes.insert(hash.prefix(), hash);
-            assert!(previous.is_none(), "hot hash prefix collision");
-        }
-        set
-    }
-
-    pub fn len(&self) -> usize {
-        self.hashes.len()
-    }
-
-    #[inline]
-    pub fn contains(&self, entry: &IntermediateEntry) -> bool {
-        !self.hashes.is_empty()
-            && self
-                .hashes
-                .get(&entry.hash_prefix())
-                .is_some_and(|hash| hash.as_bytes()[..] == entry.0[..Zobrist96::SIZE])
     }
 }
 
