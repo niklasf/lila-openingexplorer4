@@ -21,10 +21,6 @@ impl Gauge {
         self.changed.notify_all();
     }
 
-    pub fn get(&self) -> u64 {
-        *self.value.lock().expect("lock gauge")
-    }
-
     /// Blocks until the value satisfies `ready`, and returns the time
     /// waited.
     pub fn wait_until(&self, ready: impl Fn(u64) -> bool) -> Duration {

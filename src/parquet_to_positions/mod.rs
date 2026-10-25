@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use crossbeam::channel;
@@ -24,10 +24,10 @@ use crate::{
     packed::Zobrist96,
     parquet::{Input, PrefetchTimes, Prefetcher},
     parquet_to_positions::{
-        hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotMap, Sample},
+        hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotEntries, HotMap, Sample},
         partition::{Partition, memory_partition},
-        replay::{GameInfo, Replayer},
-        write::{HotEntries, SstContext, write_partition},
+        replay::Replayer,
+        write::{SstContext, write_partition},
     },
     scatter::{
         ChunkWriterConfig, ChunkWriterTimes, Layout, RESIDENT_PARTITIONS_PER_PASS, ScratchFile,
@@ -53,7 +53,6 @@ const BASE_MEMORY: u64 = 4 << 30;
 /// the records of a memory partition.
 const HOT_FRACTION: u64 = 32;
 
-/// Records per scratch chunk.
 const CHUNK_RECORDS: usize = 32 * 1024;
 
 const CHUNK_BYTES: usize = CHUNK_RECORDS * IntermediateEntry::SIZE;
@@ -93,8 +92,7 @@ impl Estimate {
         let layout = estimate.layout(config, read_threads);
         let threshold = estimate.records / layout.memory_partitions() as u64 / HOT_FRACTION;
         estimate.hot = sample.hot(rows, threshold.max(1));
-        let hot_records: u64 = estimate.hot.iter().map(|(_, records)| records).sum();
-        estimate.records = estimate.records.saturating_sub(hot_records);
+        estimate.records = estimate.records.saturating_sub(estimate.hot_records());
         estimate
     }
 
@@ -193,7 +191,6 @@ pub struct Config {
     /// Scan the input for the next pass while partitions of the previous
     /// pass are still being written.
     pub overlap: bool,
-    /// Options of the SST files.
     pub sst: SstConfig,
     /// Start a new SST file once the current one reaches this size.
     pub sst_target_size: u64,
@@ -489,11 +486,10 @@ pub fn convert(
             log_above(
                 progress,
                 format!(
-                    "pass {pass}: scatter {:.1?} ({} MB scratch, ratio {:.3}, throttled {:.1?}, {} hot entries)",
+                    "pass {pass}: scatter {:.1?} ({} MB scratch, ratio {:.3}, {} hot entries)",
                     timer.elapsed(),
                     scratch_bytes >> 20,
                     scratch_bytes as f64 / scratch_raw.max(1) as f64,
-                    scattered.throttled,
                     scattered.hot.len(),
                 ),
             );
@@ -511,7 +507,7 @@ pub fn convert(
                 .map(|_| Vec::new())
                 .collect();
             for (key, value) in scattered.hot {
-                let entry_partition = memory_partition(&key_entry(&key), layout.memory_bits);
+                let entry_partition = memory_partition(&key, layout.memory_bits);
                 hot_by_partition[entry_partition - first_memory_partition].push((key, value));
             }
 
@@ -554,13 +550,6 @@ pub fn convert(
         hot_records,
         output: sst.stats.into_inner().expect("stats"),
     })
-}
-
-/// An entry with the given key, for computing its partition.
-fn key_entry(key: &[u8; IntermediateEntry::KEY_SIZE]) -> IntermediateEntry {
-    let mut bytes = [0; IntermediateEntry::SIZE];
-    bytes[..IntermediateEntry::KEY_SIZE].copy_from_slice(key);
-    IntermediateEntry(bytes)
 }
 
 struct ScatterConfig<'a> {
@@ -608,9 +597,8 @@ struct Scattered {
     /// Parts of the resident partitions collected by each thread.
     resident: Vec<Vec<Vec<IntermediateEntry>>>,
     scratch: Vec<ScratchFile>,
-    /// Packed entries of the hot positions of this pass, sorted by key.
+    /// Packed entries of the hot positions of this pass.
     hot: HotEntries,
-    throttled: Duration,
 }
 
 /// Replays the entire input and distributes the records of the given disk
@@ -688,25 +676,17 @@ fn scatter_pass(
                     timed(&times.replay, || {
                         for (k, row) in batch.rows().enumerate() {
                             let seq = GlobalGameSeq::new(first_row + k as u64).expect("seq");
-                            let Ok(info) = GameInfo::from_row(&row, seq) else {
-                                skipped += 1;
-                                continue;
-                            };
-                            let Ok(pos) = row.initial_position() else {
-                                skipped += 1;
-                                continue;
-                            };
-                            let variant = pos.variant();
-                            let Ok(replayed) = replayer.replay(pos, row.moves) else {
+                            let Ok((info, game_repetitions)) = replayer.replay_row(&row, seq)
+                            else {
                                 skipped += 1;
                                 continue;
                             };
                             games += 1;
-                            repetitions += replayed.repetitions as u64;
+                            repetitions += game_repetitions as u64;
 
-                            for entry in replayer.entries(variant, &info) {
+                            for entry in replayer.entries(&info) {
                                 let Some(j) = layout.pass_memory_partition(
-                                    memory_partition(&entry, layout.memory_bits),
+                                    memory_partition(entry.key(), layout.memory_bits),
                                     pass,
                                 ) else {
                                     continue;
@@ -780,6 +760,5 @@ fn scatter_pass(
         resident: merged,
         scratch: files,
         hot: hot_map.pack(),
-        throttled: Duration::from_nanos(times.writer.throttled.load(Ordering::Relaxed)),
     })
 }

@@ -55,7 +55,7 @@ impl EntryPacker {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct SubBuilder {
     stats: SubStats,
     /// Kept games, truncated to the last `GAMES_PER_SUB_ENTRY` by sequence
@@ -77,12 +77,6 @@ impl SubBuilder {
         self.games
             .drain(..self.games.len().saturating_sub(GAMES_PER_SUB_ENTRY));
     }
-
-    fn merge(&mut self, other: SubBuilder) {
-        self.stats.merge(&other.stats);
-        self.games.extend(other.games);
-        self.gc();
-    }
 }
 
 #[derive(Default)]
@@ -93,16 +87,6 @@ pub struct EntryBuilder {
 impl EntryBuilder {
     pub fn add(&mut self, record: &IntermediateEntry) {
         self.subs.entry(record.sub_key()).or_default().add(record);
-    }
-
-    pub fn merge(&mut self, other: EntryBuilder) {
-        for (key, sub) in other.subs {
-            self.subs.entry(key).or_default().merge(sub);
-        }
-    }
-
-    pub fn games(&self) -> u64 {
-        self.subs.values().map(|sub| sub.stats.games()).sum()
     }
 
     pub fn pack(self, packer: &mut EntryPacker, buf: &mut Vec<u8>) {
@@ -173,22 +157,15 @@ mod tests {
                 entry
             };
 
-            // Builder, in any order, split into merged parts.
+            // Builder, in any order.
             let mut shuffled = records.clone();
             for i in (1..shuffled.len()).rev() {
                 shuffled.swap(i, u.int_in_range(0..=i)?);
             }
-            let split = u.int_in_range(0..=shuffled.len())?;
             let mut builder = EntryBuilder::default();
-            let mut other = EntryBuilder::default();
-            for record in &shuffled[..split] {
+            for record in &shuffled {
                 builder.add(record);
             }
-            for record in &shuffled[split..] {
-                other.add(record);
-            }
-            builder.merge(other);
-            assert_eq!(builder.games(), records.len() as u64);
             let mut packer = EntryPacker::default();
             let mut buf = Vec::new();
             builder.pack(&mut packer, &mut buf);

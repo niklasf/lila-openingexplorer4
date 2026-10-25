@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-    thread,
-};
+use std::{sync::Mutex, thread};
 
 use crate::{intermediate::IntermediateEntry, scatter::ScratchFile};
 
@@ -17,22 +11,23 @@ pub const BUCKETS: usize = 1 << BUCKET_BITS;
 /// shared bucket.
 const STAGE: usize = 1024;
 
-/// The memory partition of an entry.
-#[inline]
-pub fn memory_partition(entry: &IntermediateEntry, memory_bits: u32) -> usize {
-    (entry
-        .hash_prefix()
-        .checked_shr(64 - memory_bits)
-        .unwrap_or(0)) as usize
+fn hash_prefix(key: &[u8; IntermediateEntry::KEY_SIZE]) -> u64 {
+    u64::from_be_bytes(key[..8].try_into().expect("8 bytes"))
 }
 
+/// The memory partition of a key.
 #[inline]
-fn bucket(entry: &IntermediateEntry, memory_bits: u32) -> usize {
-    ((entry.hash_prefix() << memory_bits) >> (64 - BUCKET_BITS)) as usize
+pub fn memory_partition(key: &[u8; IntermediateEntry::KEY_SIZE], memory_bits: u32) -> usize {
+    (hash_prefix(key).checked_shr(64 - memory_bits).unwrap_or(0)) as usize
 }
 
-/// Converts raw chunk bytes to entries.
-pub fn entries(raw: &[u8]) -> impl Iterator<Item = IntermediateEntry> + '_ {
+/// The bucket of a key within its memory partition.
+#[inline]
+pub fn bucket(key: &[u8; IntermediateEntry::KEY_SIZE], memory_bits: u32) -> usize {
+    ((hash_prefix(key) << memory_bits) >> (64 - BUCKET_BITS)) as usize
+}
+
+fn entries(raw: &[u8]) -> impl Iterator<Item = IntermediateEntry> + '_ {
     let (records, rest) = raw.as_chunks::<{ IntermediateEntry::SIZE }>();
     assert!(rest.is_empty(), "records truncated");
     records.iter().map(|record| IntermediateEntry(*record))
@@ -51,20 +46,15 @@ impl Partition {
     /// Sorts the buckets in parallel. Afterwards all records of the
     /// partition are in order.
     pub fn sort(&mut self, threads: usize) {
-        let next = AtomicUsize::new(0);
-        let slots: Vec<Mutex<&mut Vec<IntermediateEntry>>> =
-            self.buckets.iter_mut().map(Mutex::new).collect();
+        let buckets = Mutex::new(self.buckets.iter_mut());
         thread::scope(|s| {
             for _ in 0..threads.clamp(1, BUCKETS) {
                 s.spawn(|| {
                     loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(slot) = slots.get(i) else {
+                        let Some(bucket) = buckets.lock().expect("lock buckets").next() else {
                             break;
                         };
-                        slot.lock()
-                            .expect("lock bucket")
-                            .sort_unstable_by_key(IntermediateEntry::sort_key);
+                        bucket.sort_unstable_by_key(IntermediateEntry::sort_key);
                     }
                 });
             }
@@ -90,7 +80,7 @@ impl<'a> Bucketer<'a> {
 
     #[inline]
     fn push(&mut self, entry: IntermediateEntry) {
-        let b = bucket(&entry, self.memory_bits);
+        let b = bucket(entry.key(), self.memory_bits);
         let staged = &mut self.staged[b];
         staged.push(entry);
         if staged.len() >= STAGE {

@@ -13,7 +13,7 @@ use crate::{
     intermediate::{EntryBuilder, EntryPacker, GlobalGameSeq, IntermediateEntry},
     packed::{Month, Zobrist96},
     parquet::Input,
-    parquet_to_positions::replay::{GameInfo, Replayer},
+    parquet_to_positions::replay::Replayer,
 };
 
 /// Only positions within the first plies of the sampled games are
@@ -27,8 +27,7 @@ const SAMPLE_ROW_GROUPS: usize = 32;
 /// A position is never considered hot with fewer sampled records.
 const MIN_SAMPLE_COUNT: u64 = 64;
 
-/// Maximum number of hot positions.
-pub const MAX_HOT: usize = 256;
+const MAX_HOT: usize = 256;
 
 /// Estimated memory per hot key (hash and month).
 pub const HOT_KEY_MEMORY: u64 = 64 << 10;
@@ -69,20 +68,15 @@ impl Sample {
                         let batch = input.read_games(i).expect("read row group");
                         for row in batch.rows() {
                             rows += 1;
-                            let Ok(info) = GameInfo::from_row(&row, seq) else {
+                            let Ok((info, _)) = replayer.replay_row(&row, seq) else {
                                 continue;
                             };
-                            let Ok(pos) = row.initial_position() else {
-                                continue;
-                            };
-                            let variant = pos.variant();
-                            if replayer.replay(pos, row.moves).is_err() {
-                                continue;
-                            }
                             months.insert(info.month);
                             records += replayer.len() as u64;
                             for hash in replayer.hashes().take(SAMPLE_PLIES) {
-                                *counts.entry(Zobrist96::new(hash, variant)).or_default() += 1;
+                                *counts
+                                    .entry(Zobrist96::new(hash, info.variant))
+                                    .or_default() += 1;
                             }
                         }
                     }
@@ -107,12 +101,8 @@ impl Sample {
             sample.sampled_rows += rows;
             sample.records += records;
             months.extend(thread_months);
-            if counts.is_empty() {
-                counts = thread_counts;
-            } else {
-                for (hash, count) in thread_counts {
-                    *counts.entry(hash).or_default() += count;
-                }
+            for (hash, count) in thread_counts {
+                *counts.entry(hash).or_default() += count;
             }
         }
         sample.months = months.len() as u64;
@@ -148,6 +138,9 @@ const SHARDS: usize = 64;
 /// Hot records buffered by each thread before they are added to the shared
 /// map.
 pub const HOT_BATCH: usize = 1 << 16;
+
+/// Packed entries of hot positions, sorted by `IntermediateEntry::key()`.
+pub type HotEntries = Vec<([u8; IntermediateEntry::KEY_SIZE], Vec<u8>)>;
 
 /// Aggregated entries of hot positions, keyed by `IntermediateEntry::key()`.
 pub struct HotMap {
@@ -185,10 +178,9 @@ impl HotMap {
         batch.clear();
     }
 
-    /// Packs all entries, sorted by key.
-    pub fn pack(self) -> Vec<([u8; IntermediateEntry::KEY_SIZE], Vec<u8>)> {
+    pub fn pack(self) -> HotEntries {
         let mut packer = EntryPacker::default();
-        let mut packed: Vec<_> = self
+        let mut packed: HotEntries = self
             .shards
             .into_iter()
             .flat_map(|shard| shard.into_inner().expect("hot shard"))

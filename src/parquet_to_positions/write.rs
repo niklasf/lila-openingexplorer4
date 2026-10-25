@@ -12,7 +12,10 @@ use rocksdb::{EnvOptions, Options};
 use crate::{
     intermediate::{EntryPacker, IntermediateEntry},
     packed::Zobrist96,
-    parquet_to_positions::partition::{BUCKET_BITS, BUCKETS, Partition},
+    parquet_to_positions::{
+        hot::HotEntries,
+        partition::{BUCKETS, Partition, bucket},
+    },
     sst::{RollingSstWriter, SstStats},
 };
 
@@ -33,8 +36,6 @@ const MIN_FILES_PER_RANGE: u64 = 4;
 /// Initial guesses for SST bytes per record, used until measured.
 const INITIAL_COLD_BYTES_PER_RECORD: f64 = 20.0;
 const INITIAL_POSITIONS_BYTES_PER_RECORD: f64 = 2.0;
-
-pub type HotEntries = Vec<([u8; IntermediateEntry::KEY_SIZE], Vec<u8>)>;
 
 pub struct SstContext<'a> {
     pub opts: &'a Options,
@@ -115,11 +116,6 @@ pub fn write_partition(
         .collect();
     let next_task = AtomicUsize::new(0);
 
-    let hot_bucket = |key: &[u8; IntermediateEntry::KEY_SIZE]| {
-        let prefix = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
-        ((prefix << memory_bits) >> (64 - BUCKET_BITS)) as usize
-    };
-
     thread::scope(|s| {
         for _ in 0..threads.clamp(1, tasks.len()) {
             s.spawn(|| {
@@ -129,10 +125,10 @@ pub fn write_partition(
                     tasks.get(next_task.fetch_add(1, Ordering::Relaxed))
                 {
                     let buckets = range * BUCKETS / ranges..(range + 1) * BUCKETS / ranges;
-                    // Hot entries whose hash falls into the buckets of this
-                    // range.
-                    let hot_start = hot.partition_point(|(key, _)| hot_bucket(key) < buckets.start);
-                    let hot_end = hot.partition_point(|(key, _)| hot_bucket(key) < buckets.end);
+                    let hot_start =
+                        hot.partition_point(|(key, _)| bucket(key, memory_bits) < buckets.start);
+                    let hot_end =
+                        hot.partition_point(|(key, _)| bucket(key, memory_bits) < buckets.end);
                     let stats = write_range(
                         family,
                         &partition.buckets[buckets],
