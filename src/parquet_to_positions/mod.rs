@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crossbeam::channel;
@@ -57,8 +57,11 @@ const CHUNK_RECORDS: usize = 32 * 1024;
 
 const CHUNK_BYTES: usize = CHUNK_RECORDS * IntermediateEntry::SIZE;
 
-fn new_chunk() -> Vec<u8> {
-    Vec::with_capacity(CHUNK_BYTES)
+/// Records of one memory partition, buffered before they are compressed.
+type Chunk = Vec<[u8; IntermediateEntry::SIZE]>;
+
+fn new_chunk() -> Chunk {
+    Vec::with_capacity(CHUNK_RECORDS)
 }
 
 /// Estimated data sizes, from replaying a sample of row groups.
@@ -641,7 +644,7 @@ fn scatter_pass(
 
         // Write threads compress full chunks and append them to scratch
         // files, throttled by the scratch budget.
-        let (tx, rx) = channel::bounded::<(usize, Vec<u8>)>(config.write_threads * 2);
+        let (tx, rx) = channel::bounded::<(usize, Chunk)>(config.write_threads * 2);
         spawn_chunk_writers(s, writer_config, files, rx, &times.writer);
 
         // Read threads replay the games and route the records of this pass
@@ -656,8 +659,7 @@ fn scatter_pass(
                     ..RESIDENT_PARTITIONS_PER_PASS)
                     .map(|_| Vec::new())
                     .collect();
-                let mut chunks: Vec<Vec<u8>> =
-                    (0..scratch_partitions).map(|_| new_chunk()).collect();
+                let mut chunks: Vec<Chunk> = (0..scratch_partitions).map(|_| new_chunk()).collect();
                 let (mut games, mut skipped) = (0, 0);
                 let (mut records, mut hot_records) = (0, 0);
 
@@ -665,41 +667,50 @@ fn scatter_pass(
                     let first_row = input.first_row(fetched.0);
                     let batch = timed(&times.decode, || prefetcher.decode(fetched))
                         .expect("read row group");
-                    timed(&times.replay, || {
-                        for (k, row) in batch.rows().enumerate() {
-                            let seq = GlobalGameSeq::new(first_row + k as u64).expect("seq");
-                            let Ok(info) = replayer.replay_row(&row, seq) else {
-                                skipped += 1;
+                    // Time spent blocked on the chunk writers is not replay.
+                    let timer = Instant::now();
+                    let mut sending = Duration::ZERO;
+                    for (k, row) in batch.rows().enumerate() {
+                        let seq = GlobalGameSeq::new(first_row + k as u64).expect("seq");
+                        let Ok(info) = replayer.replay_row(&row, seq) else {
+                            skipped += 1;
+                            continue;
+                        };
+                        games += 1;
+
+                        for entry in replayer.entries(&info) {
+                            let Some(j) = layout.pass_memory_partition(
+                                memory_partition(entry.key(), layout.memory_bits),
+                                pass,
+                            ) else {
                                 continue;
                             };
-                            games += 1;
-
-                            for entry in replayer.entries(&info) {
-                                let Some(j) = layout.pass_memory_partition(
-                                    memory_partition(entry.key(), layout.memory_bits),
-                                    pass,
-                                ) else {
-                                    continue;
-                                };
-                                if config.hot_set.contains(&entry.hash()) {
-                                    hot.push(entry);
-                                    hot_records += 1;
-                                } else if j >= scratch_partitions {
-                                    local_resident[j - scratch_partitions].push(entry);
-                                    records += 1;
-                                } else {
-                                    let chunk = &mut chunks[j];
-                                    chunk.extend_from_slice(&entry.0);
-                                    records += 1;
-                                    if chunk.len() >= CHUNK_BYTES {
-                                        let full = mem::replace(chunk, new_chunk());
-                                        timed(&times.send, || tx.send((j, full)))
-                                            .expect("send chunk");
-                                    }
+                            if config.hot_set.contains(&entry.hash()) {
+                                hot.push(entry);
+                                hot_records += 1;
+                            } else if j >= scratch_partitions {
+                                local_resident[j - scratch_partitions].push(entry);
+                                records += 1;
+                            } else {
+                                let chunk = &mut chunks[j];
+                                chunk.push(entry.0);
+                                records += 1;
+                                if chunk.len() >= CHUNK_RECORDS {
+                                    let full = mem::replace(chunk, new_chunk());
+                                    let send_timer = Instant::now();
+                                    tx.send((j, full)).expect("send chunk");
+                                    sending += send_timer.elapsed();
                                 }
                             }
                         }
-                    });
+                    }
+                    times
+                        .send
+                        .fetch_add(sending.as_nanos() as u64, Ordering::Relaxed);
+                    times.replay.fetch_add(
+                        (timer.elapsed() - sending).as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
 
                     progress.inc(batch.len() as u64);
                 }

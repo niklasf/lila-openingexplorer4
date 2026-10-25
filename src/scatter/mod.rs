@@ -95,6 +95,23 @@ impl ChunkWriterTimes {
     }
 }
 
+/// A chunk of records that can be compressed as raw bytes.
+pub trait Chunk: Send {
+    fn as_bytes(&self) -> &[u8];
+}
+
+impl Chunk for Vec<u8> {
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl<const N: usize> Chunk for Vec<[u8; N]> {
+    fn as_bytes(&self) -> &[u8] {
+        self.as_flattened()
+    }
+}
+
 pub struct ChunkWriterConfig<'a> {
     pub threads: usize,
     pub zstd_level: i32,
@@ -108,19 +125,20 @@ pub struct ChunkWriterConfig<'a> {
 /// Spawns threads that compress chunks received as `(file, raw)` and append
 /// them to the scratch files, throttled by the scratch budget. They finish
 /// once all senders are dropped.
-pub fn spawn_chunk_writers<'s>(
+pub fn spawn_chunk_writers<'s, C: Chunk + 's>(
     s: &'s thread::Scope<'s, '_>,
     config: &'s ChunkWriterConfig<'s>,
     files: &'s [Mutex<ScratchFile>],
-    rx: channel::Receiver<(usize, Vec<u8>)>,
+    rx: channel::Receiver<(usize, C)>,
     times: &'s ChunkWriterTimes,
 ) {
     for _ in 0..config.threads {
         let rx = rx.clone();
         s.spawn(move || {
             let mut compressor = ChunkCompressor::new(config.zstd_level);
-            while let Ok((file, raw)) = timed(&times.recv, || rx.recv()) {
-                let compressed = timed(&times.compress, || compressor.compress(&raw));
+            while let Ok((file, chunk)) = timed(&times.recv, || rx.recv()) {
+                let raw = chunk.as_bytes();
+                let compressed = timed(&times.compress, || compressor.compress(raw));
                 if let Some(budget) = config.budget {
                     let waited = config
                         .usage

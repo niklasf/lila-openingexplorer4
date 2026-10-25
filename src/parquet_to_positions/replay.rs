@@ -1,6 +1,6 @@
 use nohash_hasher::IntMap;
 use shakmaty::{
-    ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Move, Position,
+    ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Position,
     packed::PackedUciMove,
     variant::{Variant, VariantPosition},
     zobrist::Zobrist128,
@@ -27,8 +27,7 @@ pub enum InvalidGame {
 struct Visit {
     /// Ply at which the position was first reached.
     ply: usize,
-    m: Move,
-    turn: Color,
+    m: PackedUciMove,
 }
 
 /// The metadata shared by all records of one game.
@@ -44,9 +43,19 @@ pub struct GameInfo {
 }
 
 /// Replays games, with buffers reused across games.
-#[derive(Default)]
 pub struct Replayer {
     visits: IntMap<Zobrist128, Visit>,
+    /// Side to move at ply 0 of the last replayed game.
+    initial_turn: Color,
+}
+
+impl Default for Replayer {
+    fn default() -> Replayer {
+        Replayer {
+            visits: IntMap::default(),
+            initial_turn: Color::White,
+        }
+    }
 }
 
 impl Replayer {
@@ -76,19 +85,17 @@ impl Replayer {
     /// times. The final position is not recorded.
     fn replay(&mut self, mut pos: VariantPosition, moves: &[u8]) -> Result<(), InvalidGame> {
         self.visits.clear();
+        self.initial_turn = pos.turn();
 
         let mut decoder = PackedMovesDecoder::new(moves)?;
         let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
         let mut ply = 0;
         while let Some(m) = decoder.decode_next(&pos)? {
+            let packed = PackedUciMove::pack(m.to_uci(CastlingMode::Chess960));
             self.visits
                 .entry(hash)
-                .and_modify(|visit| visit.m = m)
-                .or_insert(Visit {
-                    ply,
-                    m,
-                    turn: pos.turn(),
-                });
+                .and_modify(|visit| visit.m = packed)
+                .or_insert(Visit { ply, m: packed });
             ply += 1;
 
             let updated = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
@@ -104,6 +111,12 @@ impl Replayer {
         self.visits.len()
     }
 
+    /// Side to move at the given ply of the last replayed game (there are
+    /// no null moves).
+    fn turn_at(&self, ply: usize) -> Color {
+        self.initial_turn ^ !ply.is_multiple_of(2)
+    }
+
     /// The records of the last replayed game.
     pub fn entries(&self, info: &GameInfo) -> impl Iterator<Item = IntermediateEntry> + '_ {
         let info = *info;
@@ -111,9 +124,9 @@ impl Replayer {
             IntermediateEntry::new(
                 Zobrist96::new(hash, info.variant),
                 info.month,
-                PackedUciMove::pack(visit.m.to_uci(CastlingMode::Chess960)),
+                visit.m,
                 info.speed,
-                info.ratings[visit.turn],
+                info.ratings[self.turn_at(visit.ply)],
                 info.outcome,
                 info.seq,
                 info.game_id,
@@ -155,7 +168,7 @@ mod tests {
         visits.sort_by_key(|(_, visit)| visit.ply);
         visits
             .into_iter()
-            .map(|(hash, visit)| (hash, visit.m.to_uci(CastlingMode::Chess960).to_string()))
+            .map(|(hash, visit)| (hash, visit.m.unpack().to_string()))
             .collect()
     }
 
