@@ -17,6 +17,10 @@ impl<T: DataType> Default for RequiredColumn<T> {
 }
 
 impl<T: DataType> RequiredColumn<T> {
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.values.len()
     }

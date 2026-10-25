@@ -250,6 +250,10 @@ pub struct GameColumns {
 }
 
 impl GameColumns {
+    pub fn is_empty(&self) -> bool {
+        self.game_id.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.game_id.len()
     }

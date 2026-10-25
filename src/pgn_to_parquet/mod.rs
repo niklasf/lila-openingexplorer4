@@ -298,7 +298,7 @@ fn encode_chunk(
 
     let mut writer =
         SerializedFileWriter::new(Vec::new(), GameColumns::schema(), Arc::clone(properties))?;
-    if columns.len() > 0 {
+    if !columns.is_empty() {
         columns.write_row_group(&mut writer)?;
     }
     let parquet = Bytes::from(writer.into_inner()?);

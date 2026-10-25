@@ -18,6 +18,7 @@ impl IntermediateEntry {
     pub const SIZE: usize = 30;
     pub const KEY_SIZE: usize = Zobrist96::SIZE + 2;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         hash: Zobrist96,
         month: Month,

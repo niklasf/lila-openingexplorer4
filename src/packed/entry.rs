@@ -1,4 +1,4 @@
-use std::{cmp::max, iter};
+use std::{cmp::max, iter, ops::Add};
 
 use arbitrary::{Arbitrary, Unstructured};
 use bytes::{Buf, BufMut};
@@ -57,9 +57,11 @@ impl RatingGroup {
 #[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GameSeq(pub usize);
 
-impl GameSeq {
-    pub fn add(self, offset: usize) -> GameSeq {
-        GameSeq(self.0 + offset)
+impl Add<usize> for GameSeq {
+    type Output = GameSeq;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        GameSeq(self.0 + rhs)
     }
 }
 

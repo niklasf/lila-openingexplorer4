@@ -21,6 +21,10 @@ impl<T: DataType> Default for OptionalColumn<T> {
 }
 
 impl<T: DataType> OptionalColumn<T> {
+    pub fn is_empty(&self) -> bool {
+        self.def_levels.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.def_levels.len()
     }
