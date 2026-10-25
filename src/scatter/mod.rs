@@ -130,6 +130,11 @@ pub struct ChunkWriterConfig<'a> {
     pub budget: Option<u64>,
     /// Bytes currently occupied by scratch files.
     pub usage: &'a Gauge,
+    /// Bytes of scratch files of previous passes that are still to be
+    /// loaded and removed. Once nothing is left to reclaim, waiting for the
+    /// budget could never succeed, so the writers continue and exceed the
+    /// budget by the error of the scratch estimate instead of deadlocking.
+    pub reclaimable: &'a AtomicU64,
 }
 
 /// Spawns threads that compress chunks received as `(file, raw)` and append
@@ -150,9 +155,10 @@ pub fn spawn_chunk_writers<'s, C: Chunk + 's>(
                 let raw = chunk.as_bytes();
                 let compressed = timed(&times.compress, || compressor.compress(raw));
                 if let Some(budget) = config.budget {
-                    let waited = config
-                        .usage
-                        .wait_until(|usage| usage + compressed.padded_len() as u64 <= budget);
+                    let waited = config.usage.wait_until(|usage| {
+                        usage + compressed.padded_len() as u64 <= budget
+                            || config.reclaimable.load(Ordering::Acquire) == 0
+                    });
                     times
                         .throttled
                         .fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);

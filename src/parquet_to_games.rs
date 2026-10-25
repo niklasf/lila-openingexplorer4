@@ -139,8 +139,21 @@ struct Counters {
     skipped_games: AtomicU64,
     /// Bytes currently occupied by scratch files.
     scratch_usage: Gauge,
+    /// Bytes of scratch files of previous passes that are still to be
+    /// loaded and removed.
+    reclaimable_scratch: AtomicU64,
     /// Partitions written to SST files so far.
     written_partitions: Gauge,
+}
+
+impl Counters {
+    /// Removes a scratch file of a previous pass.
+    fn remove_scratch(&self, file: ScratchFile) -> io::Result<()> {
+        // Before the usage changes, so that throttled chunk writers see both.
+        self.reclaimable_scratch
+            .fetch_sub(file.len(), Ordering::Release);
+        file.remove(&self.scratch_usage)
+    }
 }
 
 pub struct Config {
@@ -567,7 +580,7 @@ pub fn convert(
                     PartitionSource::Resident(partition) => partition,
                     PartitionSource::Scratch(scratch) => {
                         let partition = load_partition(&scratch, load_threads);
-                        scratch.remove(&counters.scratch_usage).expect("remove scratch");
+                        counters.remove_scratch(scratch).expect("remove scratch");
                         partition
                     }
                 };
@@ -649,6 +662,9 @@ pub fn convert(
             )
             .expect("scatter");
             let scratch_bytes: u64 = scratch.iter().map(ScratchFile::len).sum();
+            counters
+                .reclaimable_scratch
+                .fetch_add(scratch_bytes, Ordering::Release);
             log_above(
                 progress,
                 format!(
@@ -660,8 +676,7 @@ pub fn convert(
             );
             if config.scatter_only {
                 for file in scratch {
-                    file.remove(&counters.scratch_usage)
-                        .expect("remove scratch");
+                    counters.remove_scratch(file).expect("remove scratch");
                 }
                 break;
             }
@@ -770,6 +785,7 @@ fn scatter_pass(
         zstd_level: config.zstd_level,
         budget: config.budget,
         usage: &config.counters.scratch_usage,
+        reclaimable: &config.counters.reclaimable_scratch,
     };
 
     thread::scope(|s| {

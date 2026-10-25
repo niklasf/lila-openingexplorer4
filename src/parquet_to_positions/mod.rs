@@ -42,9 +42,18 @@ use crate::{
 /// which is temporarily held twice while it is distributed to buckets.
 const PARTITIONS_IN_MEMORY: u64 = 4;
 
-/// Assumed ratio of compressed scratch chunks to record bytes (measured
-/// about 0.59 with zstd level 1).
-const SCRATCH_RATIO: f64 = 0.7;
+/// Assumed ratio of zstd compressed scratch chunks to record bytes. The ratio
+/// depends on how many records of a game land in the same chunk, so it grows
+/// with the number of memory partitions per pass: measured with zstd level 1
+/// about 0.61 at 8, 0.66 at 16 and 0.78 at 64 partitions per pass. The
+/// estimate has to stay safe for the first pass, which is not throttled by
+/// the scratch budget.
+const SCRATCH_RATIO: f64 = 0.85;
+
+/// Ratio of scratch chunks to record bytes for the given zstd level.
+fn scratch_ratio(zstd_level: i32) -> f64 {
+    if zstd_level == 0 { 1.0 } else { SCRATCH_RATIO }
+}
 
 /// Fixed memory overhead for the parquet reader, rocksdb and allocator slack.
 const BASE_MEMORY: u64 = 4 << 30;
@@ -72,6 +81,8 @@ struct Estimate {
     /// Hot positions and their estimated records.
     hot: Vec<(Zobrist96, u64)>,
     months: u64,
+    /// Ratio of scratch chunks to record bytes.
+    scratch_ratio: f64,
 }
 
 impl Estimate {
@@ -89,6 +100,7 @@ impl Estimate {
             records: (per_row * rows as f64 * 1.05) as u64,
             hot: Vec::new(),
             months: sample.months,
+            scratch_ratio: scratch_ratio(config.scratch_zstd_level),
         };
         // Choose hot positions for the layout without them. Then the
         // remaining records may fit into fewer partitions.
@@ -130,7 +142,7 @@ impl Estimate {
     /// Scratch space needed by one pass.
     fn scratch(&self, layout: Layout) -> u64 {
         let per_partition =
-            self.record_bytes() as f64 * SCRATCH_RATIO / layout.memory_partitions() as f64;
+            self.record_bytes() as f64 * self.scratch_ratio / layout.memory_partitions() as f64;
         (per_partition * layout.scratch_partitions_per_pass() as f64) as u64
     }
 
@@ -156,8 +168,21 @@ struct Counters {
     hot_records: AtomicU64,
     /// Bytes currently occupied by scratch files.
     scratch_usage: Gauge,
+    /// Bytes of scratch files of previous passes that are still to be
+    /// loaded and removed.
+    reclaimable_scratch: AtomicU64,
     /// Partitions written to SST files so far.
     written_partitions: Gauge,
+}
+
+impl Counters {
+    /// Removes a scratch file of a previous pass.
+    fn remove_scratch(&self, file: ScratchFile) -> io::Result<()> {
+        // Before the usage changes, so that throttled chunk writers see both.
+        self.reclaimable_scratch
+            .fetch_sub(file.len(), Ordering::Release);
+        file.remove(&self.scratch_usage)
+    }
 }
 
 pub struct Config {
@@ -383,9 +408,7 @@ pub fn convert(
                     PartitionSource::Scratch(scratch) => {
                         let partition =
                             partition::load(&scratch, layout.memory_partitions(), load_threads);
-                        scratch
-                            .remove(&counters.scratch_usage)
-                            .expect("remove scratch");
+                        counters.remove_scratch(scratch).expect("remove scratch");
                         partition
                     }
                 };
@@ -479,6 +502,9 @@ pub fn convert(
             }
             let scratch_bytes: u64 = scattered.scratch.iter().map(ScratchFile::len).sum();
             let scratch_raw: u64 = scattered.scratch.iter().map(ScratchFile::raw_len).sum();
+            counters
+                .reclaimable_scratch
+                .fetch_add(scratch_bytes, Ordering::Release);
             log_above(
                 progress,
                 format!(
@@ -491,8 +517,7 @@ pub fn convert(
             );
             if config.scatter_only {
                 for file in scattered.scratch {
-                    file.remove(&counters.scratch_usage)
-                        .expect("remove scratch");
+                    counters.remove_scratch(file).expect("remove scratch");
                 }
                 break;
             }
@@ -632,6 +657,7 @@ fn scatter_pass(
         zstd_level: config.zstd_level,
         budget: config.budget,
         usage: &counters.scratch_usage,
+        reclaimable: &counters.reclaimable_scratch,
     };
 
     thread::scope(|s| {
