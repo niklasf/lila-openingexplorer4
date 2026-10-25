@@ -50,14 +50,12 @@ pub struct Replayer {
 }
 
 impl Replayer {
-    /// Replays the game of a row. Returns its metadata and the number of
-    /// plies that reached a position that was already reached before in the
-    /// same game.
+    /// Replays the game of a row, and returns its metadata.
     pub fn replay_row(
         &mut self,
         row: &GameRow<'_>,
         seq: GlobalGameSeq,
-    ) -> Result<(GameInfo, usize), InvalidGame> {
+    ) -> Result<GameInfo, InvalidGame> {
         let pos = row.initial_position()?;
         let info = GameInfo {
             game_id: row.game_id,
@@ -68,18 +66,17 @@ impl Replayer {
             ratings: row.ratings()?,
             outcome: row.known_outcome()?,
         };
-        let repetitions = self.replay(pos, row.moves)?;
-        Ok((info, repetitions))
+        self.replay(pos, row.moves)?;
+        Ok(info)
     }
 
     /// Replays the moves of a game from its initial position. Each position
     /// that a move was played from is recorded once, with the move that was
     /// played from it last: loops within the game are not counted multiple
     /// times. The final position is not recorded.
-    fn replay(&mut self, mut pos: VariantPosition, moves: &[u8]) -> Result<usize, InvalidGame> {
+    fn replay(&mut self, mut pos: VariantPosition, moves: &[u8]) -> Result<(), InvalidGame> {
         self.visits.clear();
         self.short_hashes.clear();
-        let mut repetitions = 0;
 
         let mut decoder = PackedMovesDecoder::new(moves).map_err(|_| InvalidGame::InvalidMoves)?;
         let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
@@ -99,10 +96,7 @@ impl Replayer {
                 .rposition(|&s| s == short)
                 .filter(|&i| self.visits[i].hash == hash)
             {
-                Some(i) => {
-                    repetitions += 1;
-                    self.visits[i] = visit;
-                }
+                Some(i) => self.visits[i] = visit,
                 None => {
                     self.visits.push(visit);
                     self.short_hashes.push(short);
@@ -114,7 +108,7 @@ impl Replayer {
             hash = updated.unwrap_or_else(|| pos.zobrist_hash(EnPassantMode::Legal));
         }
 
-        Ok(repetitions)
+        Ok(())
     }
 
     /// Number of positions recorded by the last replay.
@@ -153,7 +147,7 @@ mod tests {
     use super::*;
     use crate::packed::PackedMoves;
 
-    fn replay_san(sans: &str) -> (Vec<(Zobrist128, String)>, usize) {
+    fn replay_san(sans: &str) -> Vec<(Zobrist128, String)> {
         let mut pos = VariantPosition::Chess(Chess::default());
         let initial = pos.clone();
         let mut encoder = PackedMoves::encoder();
@@ -165,8 +159,8 @@ mod tests {
         let moves = encoder.finish();
 
         let mut replayer = Replayer::default();
-        let repetitions = replayer.replay(initial, &moves.0).unwrap();
-        let records = replayer
+        replayer.replay(initial, &moves.0).unwrap();
+        replayer
             .visits
             .iter()
             .map(|visit| {
@@ -175,8 +169,7 @@ mod tests {
                     visit.m.to_uci(CastlingMode::Chess960).to_string(),
                 )
             })
-            .collect();
-        (records, repetitions)
+            .collect()
     }
 
     fn hash_after(sans: &str) -> Zobrist128 {
@@ -190,8 +183,7 @@ mod tests {
 
     #[test]
     fn test_no_loops() {
-        let (records, repetitions) = replay_san("e4 e5 Nf3 Nc6");
-        assert_eq!(repetitions, 0);
+        let records = replay_san("e4 e5 Nf3 Nc6");
         let moves: Vec<&str> = records.iter().map(|(_, m)| m.as_str()).collect();
         assert_eq!(moves, ["e2e4", "e7e5", "g1f3", "b8c6"]);
         assert_eq!(records[0].0, hash_after(""));
@@ -201,8 +193,7 @@ mod tests {
     #[test]
     fn test_loop_keeps_last_move() {
         // P -Nf3-> Q -Nf6-> . -Ng1-> . -Ng8-> P -e4-> ...
-        let (records, repetitions) = replay_san("Nf3 Nf6 Ng1 Ng8 e4 e5");
-        assert_eq!(repetitions, 1);
+        let records = replay_san("Nf3 Nf6 Ng1 Ng8 e4 e5");
         let moves: Vec<&str> = records.iter().map(|(_, m)| m.as_str()).collect();
         // The starting position keeps the move eventually played (e4), the
         // positions inside the loop are still recorded.
@@ -215,8 +206,7 @@ mod tests {
     fn test_repetition_at_end() {
         // Threefold repetition: the final position is never recorded, but
         // the positions of the cycle keep their last moves.
-        let (records, repetitions) = replay_san("Nf3 Nf6 Ng1 Ng8 Nf3 Nf6 Ng1 Ng8");
-        assert_eq!(repetitions, 4);
+        let records = replay_san("Nf3 Nf6 Ng1 Ng8 Nf3 Nf6 Ng1 Ng8");
         let moves: Vec<&str> = records.iter().map(|(_, m)| m.as_str()).collect();
         assert_eq!(moves, ["g1f3", "g8f6", "f3g1", "f6g8"]);
     }
@@ -225,8 +215,7 @@ mod tests {
     fn test_nested_loops() {
         // The inner loop returns to the position after Nf3 Nf6, the outer
         // loop to the starting position.
-        let (records, repetitions) = replay_san("Nf3 Nf6 Nc3 Nc6 Nb1 Nb8 Ng1 Ng8 d4");
-        assert_eq!(repetitions, 2);
+        let records = replay_san("Nf3 Nf6 Nc3 Nc6 Nb1 Nb8 Ng1 Ng8 d4");
         let moves: Vec<&str> = records.iter().map(|(_, m)| m.as_str()).collect();
         assert_eq!(
             moves,
@@ -236,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_castling_uci() {
-        let (records, _) = replay_san("e4 e5 Nf3 Nc6 Bc4 Bc5 O-O");
+        let records = replay_san("e4 e5 Nf3 Nc6 Bc4 Bc5 O-O");
         assert_eq!(
             records.last().unwrap().1.parse::<UciMove>().unwrap(),
             "e1h1".parse::<UciMove>().unwrap()

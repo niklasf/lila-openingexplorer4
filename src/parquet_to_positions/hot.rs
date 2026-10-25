@@ -68,7 +68,7 @@ impl Sample {
                         let batch = input.read_games(i).expect("read row group");
                         for row in batch.rows() {
                             rows += 1;
-                            let Ok((info, _)) = replayer.replay_row(&row, seq) else {
+                            let Ok(info) = replayer.replay_row(&row, seq) else {
                                 continue;
                             };
                             months.insert(info.month);

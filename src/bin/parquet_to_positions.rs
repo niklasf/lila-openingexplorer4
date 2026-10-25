@@ -165,11 +165,10 @@ fn main() {
 
     let output = &stats.output;
     println!(
-        "done in {:.1?}: {} games ({} skipped, {} repetitions), {} records ({} in {} hot positions)",
+        "done in {:.1?}: {} games ({} skipped), {} records ({} in {} hot positions)",
         started.elapsed(),
         stats.games,
         stats.skipped,
-        stats.repetitions,
         stats.records,
         stats.hot_records,
         stats.hot_positions,

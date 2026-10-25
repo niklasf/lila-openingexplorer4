@@ -148,9 +148,6 @@ struct Counters {
     games: AtomicU64,
     /// Games that could not be indexed (counted in the first pass).
     skipped_games: AtomicU64,
-    /// Plies that repeated a position of the same game (counted in the first
-    /// pass).
-    repetitions: AtomicU64,
     /// Records routed to memory partitions.
     records: AtomicU64,
     /// Records of hot positions.
@@ -201,8 +198,6 @@ pub struct Stats {
     pub games: u64,
     /// Games that could not be indexed.
     pub skipped: u64,
-    /// Plies that repeated a position of the same game.
-    pub repetitions: u64,
     /// Records of all games, including hot records.
     pub records: u64,
     pub hot_positions: usize,
@@ -544,7 +539,6 @@ pub fn convert(
     Ok(Stats {
         games: counters.games.load(Ordering::Relaxed),
         skipped: counters.skipped_games.load(Ordering::Relaxed),
-        repetitions: counters.repetitions.load(Ordering::Relaxed),
         records: records + hot_records,
         hot_positions: hot_set.len(),
         hot_records,
@@ -666,7 +660,7 @@ fn scatter_pass(
                     .collect();
                 let mut chunks: Vec<Vec<u8>> =
                     (0..scratch_partitions).map(|_| new_chunk()).collect();
-                let (mut games, mut skipped, mut repetitions) = (0, 0, 0);
+                let (mut games, mut skipped) = (0, 0);
                 let (mut records, mut hot_records) = (0, 0);
 
                 while let Some(fetched) = timed(&times.recv, || prefetcher.recv()) {
@@ -676,13 +670,11 @@ fn scatter_pass(
                     timed(&times.replay, || {
                         for (k, row) in batch.rows().enumerate() {
                             let seq = GlobalGameSeq::new(first_row + k as u64).expect("seq");
-                            let Ok((info, game_repetitions)) = replayer.replay_row(&row, seq)
-                            else {
+                            let Ok(info) = replayer.replay_row(&row, seq) else {
                                 skipped += 1;
                                 continue;
                             };
                             games += 1;
-                            repetitions += game_repetitions as u64;
 
                             for entry in replayer.entries(&info) {
                                 let Some(j) = layout.pass_memory_partition(
@@ -723,9 +715,6 @@ fn scatter_pass(
                 if pass == 0 {
                     counters.games.fetch_add(games, Ordering::Relaxed);
                     counters.skipped_games.fetch_add(skipped, Ordering::Relaxed);
-                    counters
-                        .repetitions
-                        .fetch_add(repetitions, Ordering::Relaxed);
                 }
                 counters.records.fetch_add(records, Ordering::Relaxed);
                 counters
