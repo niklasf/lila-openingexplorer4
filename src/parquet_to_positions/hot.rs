@@ -1,0 +1,269 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+};
+
+use nohash_hasher::BuildNoHashHasher;
+use rustc_hash::FxHashMap;
+
+use crate::{
+    intermediate::{EntryBuilder, EntryPacker, GlobalGameSeq, IntermediateEntry},
+    packed::{Month, Zobrist96},
+    parquet::Input,
+    parquet_to_positions::replay::{GameInfo, Replayer},
+};
+
+/// Only positions within the first plies of the sampled games are
+/// considered as candidates for hot positions. This limits the cost of
+/// sampling, not correctness: hot positions are routed by hash at any ply.
+const SAMPLE_PLIES: usize = 16;
+
+/// Row groups to replay for the estimate.
+const SAMPLE_ROW_GROUPS: usize = 32;
+
+/// A position is never considered hot with fewer sampled records.
+const MIN_SAMPLE_COUNT: u64 = 64;
+
+/// Maximum number of hot positions.
+pub const MAX_HOT: usize = 256;
+
+/// Estimated memory per hot key (hash and month).
+pub const HOT_KEY_MEMORY: u64 = 64 << 10;
+
+/// Statistics from replaying a sample of the input.
+pub struct Sample {
+    pub sampled_rows: u64,
+    /// Records of the valid sampled games.
+    pub records: u64,
+    /// Distinct months of the valid sampled games.
+    pub months: u64,
+    /// Records per hash, within the first `SAMPLE_PLIES` of each game.
+    counts: Vec<(Zobrist96, u64)>,
+}
+
+impl Sample {
+    pub fn replay(input: &Input, threads: usize) -> Sample {
+        let num_row_groups = input.num_row_groups();
+        let samples = SAMPLE_ROW_GROUPS.min(num_row_groups);
+        let next = AtomicUsize::new(0);
+        let results = Mutex::new(Vec::new());
+
+        thread::scope(|s| {
+            for _ in 0..threads.clamp(1, samples.max(1)) {
+                s.spawn(|| {
+                    let mut replayer = Replayer::default();
+                    let mut counts: FxHashMap<Zobrist96, u64> = FxHashMap::default();
+                    let mut months: HashSet<Month> = HashSet::new();
+                    let (mut rows, mut records) = (0, 0);
+                    // Sequence numbers do not matter for the sample.
+                    let seq = GlobalGameSeq::new(0).expect("seq");
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= samples {
+                            break;
+                        }
+                        let i = k * num_row_groups / samples;
+                        let batch = input.read_games(i).expect("read row group");
+                        for row in batch.rows() {
+                            rows += 1;
+                            let Ok(info) = GameInfo::from_row(&row, seq) else {
+                                continue;
+                            };
+                            let Ok(pos) = row.initial_position() else {
+                                continue;
+                            };
+                            let variant = pos.variant();
+                            if replayer.replay(pos, row.moves).is_err() {
+                                continue;
+                            }
+                            months.insert(info.month);
+                            records += replayer.len() as u64;
+                            for hash in replayer.hashes().take(SAMPLE_PLIES) {
+                                *counts.entry(Zobrist96::new(hash, variant)).or_default() += 1;
+                            }
+                        }
+                    }
+                    results
+                        .lock()
+                        .expect("lock results")
+                        .push((rows, records, months, counts));
+                });
+            }
+        });
+
+        let mut sample = Sample {
+            sampled_rows: 0,
+            records: 0,
+            months: 0,
+            counts: Vec::new(),
+        };
+        let mut months = HashSet::new();
+        let mut counts: FxHashMap<Zobrist96, u64> = FxHashMap::default();
+        for (rows, records, thread_months, thread_counts) in results.into_inner().expect("results")
+        {
+            sample.sampled_rows += rows;
+            sample.records += records;
+            months.extend(thread_months);
+            if counts.is_empty() {
+                counts = thread_counts;
+            } else {
+                for (hash, count) in thread_counts {
+                    *counts.entry(hash).or_default() += count;
+                }
+            }
+        }
+        sample.months = months.len() as u64;
+        sample.counts = counts
+            .into_iter()
+            .filter(|&(_, count)| count >= MIN_SAMPLE_COUNT)
+            .collect();
+        sample
+            .counts
+            .sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        sample
+    }
+
+    /// Hashes with at least `threshold` estimated records in an input of
+    /// `rows` rows, most frequent first, and their estimated records.
+    pub fn hot(&self, rows: u64, threshold: u64) -> Vec<(Zobrist96, u64)> {
+        if self.sampled_rows == 0 {
+            return Vec::new();
+        }
+        let scale = rows as f64 / self.sampled_rows as f64;
+        self.counts
+            .iter()
+            .map(|&(hash, count)| (hash, (count as f64 * scale) as u64))
+            .take_while(|&(_, estimated)| estimated >= threshold)
+            .take(MAX_HOT)
+            .collect()
+    }
+}
+
+/// The fixed set of hot positions.
+///
+/// Reached by so many games that they would overload their
+/// memory partition. Their records bypass the partitions and are aggregated
+/// in memory while scanning the input.
+#[derive(Default)]
+pub struct HotSet {
+    /// Full hashes by prefix (which is already uniformly distributed).
+    hashes: HashMap<u64, Zobrist96, BuildNoHashHasher<u64>>,
+}
+
+impl HotSet {
+    pub fn new(hashes: impl IntoIterator<Item = Zobrist96>) -> HotSet {
+        let mut set = HotSet::default();
+        for hash in hashes {
+            let previous = set.hashes.insert(hash.prefix(), hash);
+            assert!(previous.is_none(), "hot hash prefix collision");
+        }
+        set
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    #[inline]
+    pub fn contains(&self, entry: &IntermediateEntry) -> bool {
+        !self.hashes.is_empty()
+            && self
+                .hashes
+                .get(&entry.hash_prefix())
+                .is_some_and(|hash| hash.as_bytes()[..] == entry.0[..Zobrist96::SIZE])
+    }
+}
+
+/// Shards of the shared hot map, to reduce lock contention.
+const SHARDS: usize = 64;
+
+/// Hot records buffered by each thread before they are added to the shared
+/// map.
+pub const HOT_BATCH: usize = 1 << 16;
+
+/// Aggregated entries of hot positions, keyed by `IntermediateEntry::key()`.
+pub struct HotMap {
+    shards: Vec<Mutex<FxHashMap<[u8; IntermediateEntry::KEY_SIZE], EntryBuilder>>>,
+}
+
+impl Default for HotMap {
+    fn default() -> HotMap {
+        HotMap {
+            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
+        }
+    }
+}
+
+impl HotMap {
+    fn shard(entry: &IntermediateEntry) -> usize {
+        // The prefix also selects the memory partition, so take low bits.
+        (entry.hash_prefix() as usize) % SHARDS
+    }
+
+    /// Adds a batch of records. Leaves the batch empty.
+    fn add(&self, batch: &mut Vec<IntermediateEntry>) {
+        batch.sort_unstable_by_key(|entry| (Self::shard(entry), *entry.key()));
+        for shard_run in batch.chunk_by(|a, b| Self::shard(a) == Self::shard(b)) {
+            let mut shard = self.shards[Self::shard(&shard_run[0])]
+                .lock()
+                .expect("lock hot shard");
+            for key_run in shard_run.chunk_by(|a, b| a.key() == b.key()) {
+                let builder = shard.entry(*key_run[0].key()).or_default();
+                for entry in key_run {
+                    builder.add(entry);
+                }
+            }
+        }
+        batch.clear();
+    }
+
+    /// Packs all entries, sorted by key.
+    pub fn pack(self) -> Vec<([u8; IntermediateEntry::KEY_SIZE], Vec<u8>)> {
+        let mut packer = EntryPacker::default();
+        let mut packed: Vec<_> = self
+            .shards
+            .into_iter()
+            .flat_map(|shard| shard.into_inner().expect("hot shard"))
+            .map(|(key, builder)| {
+                let mut buf = Vec::new();
+                builder.pack(&mut packer, &mut buf);
+                (key, buf)
+            })
+            .collect();
+        packed.sort_unstable_by_key(|(key, _)| *key);
+        packed
+    }
+}
+
+/// Buffers hot records of one thread for a `HotMap`.
+pub struct HotBuffer<'a> {
+    map: &'a HotMap,
+    batch: Vec<IntermediateEntry>,
+}
+
+impl<'a> HotBuffer<'a> {
+    pub fn new(map: &'a HotMap) -> HotBuffer<'a> {
+        HotBuffer {
+            map,
+            batch: Vec::with_capacity(HOT_BATCH),
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, entry: IntermediateEntry) {
+        self.batch.push(entry);
+        if self.batch.len() >= HOT_BATCH {
+            self.map.add(&mut self.batch);
+        }
+    }
+}
+
+impl Drop for HotBuffer<'_> {
+    fn drop(&mut self) {
+        self.map.add(&mut self.batch);
+    }
+}

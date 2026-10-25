@@ -1,5 +1,3 @@
-//! Writing SST files for later ingestion.
-
 use std::path::PathBuf;
 
 use rocksdb::{BlockBasedOptions, DBCompressionType, EnvOptions, Options, SstFileWriter};
