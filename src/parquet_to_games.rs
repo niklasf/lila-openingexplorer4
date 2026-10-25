@@ -21,7 +21,7 @@ use crate::{
         spawn_chunk_writers,
     },
     sst::SstConfig,
-    util::{Gauge, log, progress_bar, seconds, timed},
+    util::{Gauge, log_above, progress_bar, timed, timed_seconds},
 };
 
 /// Partitions in memory at the same time: one being written to SST files,
@@ -583,7 +583,7 @@ pub fn convert(
                     eprintln!("duplicate game id {game_id} in partition {memory_partition}");
                     std::process::exit(1);
                 }
-                log(
+                log_above(
                     progress,
                     format!(
                         "partition {memory_partition}: load {load:.1?}, sort {:.1?} ({} games, {} record bytes)",
@@ -605,7 +605,7 @@ pub fn convert(
                 write_partition(&partition, memory_partition, sst, sst_threads);
                 counters.written_partitions.add(1);
                 let stats = sst.stats.lock().expect("lock stats");
-                log(
+                log_above(
                     progress,
                     format!(
                         "partition {memory_partition}: write {:.1?} ({} files so far, ratio {:.3})",
@@ -624,7 +624,7 @@ pub fn convert(
                 let waited = counters
                     .written_partitions
                     .wait_until(|n| n >= (pass * layout.memory_partitions_per_pass()) as u64);
-                log(
+                log_above(
                     progress,
                     format!("pass {pass}: waited {waited:.1?} for previous pass"),
                 );
@@ -650,7 +650,7 @@ pub fn convert(
             )
             .expect("scatter");
             let scratch_bytes: u64 = scratch.iter().map(ScratchFile::len).sum();
-            log(
+            log_above(
                 progress,
                 format!(
                     "pass {pass}: scatter {:.1?} ({} GB scratch, throttled {:.1?})",
@@ -728,12 +728,12 @@ impl ScatterTimes {
     fn summary(&self) -> String {
         format!(
             "prefetch: fetch {:.0}s, send {:.0}s; read: recv {:.0}s, decode {:.0}s, route {:.0}s, send {:.0}s; compress: {}",
-            seconds(&self.prefetch.fetch),
-            seconds(&self.prefetch.send),
-            seconds(&self.recv),
-            seconds(&self.decode),
-            seconds(&self.route),
-            seconds(&self.send),
+            timed_seconds(&self.prefetch.fetch),
+            timed_seconds(&self.prefetch.send),
+            timed_seconds(&self.recv),
+            timed_seconds(&self.decode),
+            timed_seconds(&self.route),
+            timed_seconds(&self.send),
             self.writer.summary(),
         )
     }
@@ -860,7 +860,7 @@ fn scatter_pass(
         drop(tx);
     });
 
-    log(progress, format!("pass {pass}: {}", times.summary()));
+    log_above(progress, format!("pass {pass}: {}", times.summary()));
 
     let files: Vec<ScratchFile> = files
         .into_iter()

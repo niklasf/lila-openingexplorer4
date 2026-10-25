@@ -11,7 +11,7 @@ use std::{
 use crossbeam::channel;
 pub use scratch::{ChunkCompressor, Compressed, ScratchFile};
 
-use crate::util::{Gauge, seconds, timed};
+use crate::util::{Gauge, timed, timed_seconds};
 
 /// Memory partitions per pass that are kept in memory while reading the
 /// input, rather than being written to scratch space and read back.
@@ -87,10 +87,10 @@ impl ChunkWriterTimes {
     pub fn summary(&self) -> String {
         format!(
             "recv {:.0}s, compress {:.0}s, write {:.0}s, throttled {:.0}s",
-            seconds(&self.recv),
-            seconds(&self.compress),
-            seconds(&self.write),
-            seconds(&self.throttled),
+            timed_seconds(&self.recv),
+            timed_seconds(&self.compress),
+            timed_seconds(&self.write),
+            timed_seconds(&self.throttled),
         )
     }
 }

@@ -163,10 +163,10 @@ impl Replayer {
 
 #[cfg(test)]
 mod tests {
-    use crate::packed::PackedMoves;
     use shakmaty::{Chess, san::San, uci::UciMove};
 
     use super::*;
+    use crate::packed::PackedMoves;
 
     fn replay_san(sans: &str) -> (Vec<(Zobrist128, String)>, Replayed) {
         let mut pos = VariantPosition::Chess(Chess::default());
