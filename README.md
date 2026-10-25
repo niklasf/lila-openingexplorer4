@@ -7,5 +7,5 @@ chess games (currently ~10 B rated games across all variants, growing fast).
 
 * [x] `pgn_to_parquet`: Convert `.pgn` or `.pgn.zst` files to a single
   `.parquet` file optimized for the following stages.
-* [ ] `parquet_to_games`: Produce RocksDB SST files for games.
-* [ ] `parquet_to_positions`: Produce RocksDB SST files for positions.
+* [x] `parquet_to_games`: Produce RocksDB SST files for games.
+* [x] `parquet_to_positions`: Produce RocksDB SST files for positions.

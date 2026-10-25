@@ -121,3 +121,84 @@ impl EntryBuilder {
         packer.pack(buf);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use arbtest::arbtest;
+    use shakmaty::{KnownOutcome, Square, packed::PackedUciMove, uci::UciMove};
+
+    use super::*;
+    use crate::packed::{Month, Rating, Speed, Zobrist96};
+
+    #[test]
+    fn test_packers_agree() {
+        arbtest(|u| {
+            let hash: Zobrist96 = u.arbitrary()?;
+            let month: Month = u.arbitrary()?;
+            let moves = [
+                UciMove::Normal {
+                    from: Square::E2,
+                    to: Square::E4,
+                    promotion: None,
+                },
+                UciMove::Normal {
+                    from: Square::D2,
+                    to: Square::D4,
+                    promotion: None,
+                },
+            ];
+
+            let mut records = Vec::new();
+            let mut lichess_entry = LichessEntry::new();
+            let mut seq = 0;
+            for _ in 0..u.int_in_range(1..=200)? {
+                seq += u.int_in_range(1..=3)?;
+                let m = PackedUciMove::pack(*u.choose(&moves)?);
+                let speed = *u.choose(&[Speed::Blitz, Speed::Rapid])?;
+                let rating = Rating::try_from(u.int_in_range(900..=1300)?).unwrap();
+                let outcome: KnownOutcome = u.arbitrary()?;
+                let game_id: GameId = u.arbitrary()?;
+                let seq = GlobalGameSeq::new(seq).unwrap();
+                records.push(IntermediateEntry::new(
+                    hash, month, m, speed, rating, outcome, seq, game_id,
+                ));
+                lichess_entry.add_game(m, speed, rating, outcome, game_id);
+            }
+            lichess_entry.truncate_games(GAMES_PER_SUB_ENTRY);
+            let mut expected = Vec::new();
+            lichess_entry.pack_entire(&mut expected);
+            let unpack = |buf: &[u8]| {
+                let mut entry = LichessEntry::new();
+                entry.merge_unpack_entire(&mut &buf[..]);
+                entry
+            };
+
+            // Builder, in any order, split into merged parts.
+            let mut shuffled = records.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, u.int_in_range(0..=i)?);
+            }
+            let split = u.int_in_range(0..=shuffled.len())?;
+            let mut builder = EntryBuilder::default();
+            let mut other = EntryBuilder::default();
+            for record in &shuffled[..split] {
+                builder.add(record);
+            }
+            for record in &shuffled[split..] {
+                other.add(record);
+            }
+            builder.merge(other);
+            assert_eq!(builder.games(), records.len() as u64);
+            let mut packer = EntryPacker::default();
+            let mut buf = Vec::new();
+            builder.pack(&mut packer, &mut buf);
+            assert_eq!(unpack(&buf), unpack(&expected));
+
+            // Packer, from sorted records.
+            shuffled.sort_unstable_by_key(IntermediateEntry::sort_key);
+            packer.pack_sorted(&shuffled, &mut buf);
+            assert_eq!(unpack(&buf), unpack(&expected));
+            Ok(())
+        });
+    }
+}

@@ -5,7 +5,7 @@ use btoi::btou;
 use bytes::{Buf, BufMut};
 use thiserror::Error;
 
-#[derive(Arbitrary, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Arbitrary, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Month {
     since_jan_1900: u16,
 }
@@ -34,8 +34,14 @@ impl Month {
         let month = parts
             .next()
             .and_then(|part| btou::<u16>(part).ok())
-            .filter(|&month| 1 <= month && month <= 12)
             .ok_or(InvalidMonth)?;
+        Month::from_year_and_month(year, month)
+    }
+
+    pub fn from_year_and_month(year: u16, month: u16) -> Result<Self, InvalidMonth> {
+        if !(1..=12).contains(&month) {
+            return Err(InvalidMonth);
+        }
         Ok(Month {
             since_jan_1900: year
                 .checked_sub(1900)

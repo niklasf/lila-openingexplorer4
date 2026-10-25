@@ -11,13 +11,13 @@ use parquet::{
     },
     schema::types::{ColumnPath, Type, TypePtr},
 };
-use shakmaty::{ByColor, Outcome};
+use shakmaty::{ByColor, KnownOutcome, Outcome, packed::PackedSetup, variant::VariantPosition};
 use thiserror::Error;
 
 use crate::{
     packed::{
-        GameId, LaxDate, Rating, RatingMode, Speed, outcome_bits, pack_bytes,
-        pack_speed_and_rating_mode,
+        GameId, LaxDate, Month, Rating, RatingMode, Speed, initial_position, outcome_bits,
+        pack_bytes, pack_speed_and_rating_mode,
     },
     parquet::{OptionalColumn, RequiredColumn},
     pgn_to_parquet::{FlatGame, FlatPlayer},
@@ -143,14 +143,60 @@ pub enum InvalidGameRow {
     InvalidSpeed,
     #[error("invalid rating mode")]
     InvalidRatingMode,
+    #[error("unknown outcome")]
+    UnknownOutcome,
+    #[error("invalid setup")]
+    InvalidSetup,
 }
 
 impl GameRow<'_> {
+    pub fn ratings(&self) -> Result<ByColor<Rating>, InvalidGameRow> {
+        self.players.as_ref().try_map(|player| {
+            Rating::try_from(player.rating.ok_or(InvalidGameRow::MissingRating)?)
+                .map_err(|_| InvalidGameRow::InvalidRating)
+        })
+    }
+
+    pub fn month(&self) -> Result<Month, InvalidGameRow> {
+        let year = self.date_year.ok_or(InvalidGameRow::MissingDate)?;
+        let month = self.date_month.ok_or(InvalidGameRow::MissingDate)?;
+        Month::from_year_and_month(
+            u16::try_from(year).map_err(|_| InvalidGameRow::InvalidDate)?,
+            u16::try_from(month).map_err(|_| InvalidGameRow::InvalidDate)?,
+        )
+        .map_err(|_| InvalidGameRow::InvalidDate)
+    }
+
+    pub fn outcome(&self) -> Result<Outcome, InvalidGameRow> {
+        Outcome::from_ascii(self.outcome).map_err(|_| InvalidGameRow::InvalidOutcome)
+    }
+
+    pub fn known_outcome(&self) -> Result<KnownOutcome, InvalidGameRow> {
+        match self.outcome()? {
+            Outcome::Known(outcome) => Ok(outcome),
+            Outcome::Unknown => Err(InvalidGameRow::UnknownOutcome),
+        }
+    }
+
+    pub fn speed(&self) -> Result<Speed, InvalidGameRow> {
+        Speed::from_ascii(self.speed.ok_or(InvalidGameRow::MissingSpeed)?)
+            .map_err(|_| InvalidGameRow::InvalidSpeed)
+    }
+
+    fn initial_setup(&self) -> Result<Option<PackedSetup>, InvalidGameRow> {
+        self.setup
+            .filter(|bytes| !bytes.is_empty())
+            .map(PackedSetup::try_from_bytes)
+            .transpose()
+            .map_err(|_| InvalidGameRow::InvalidSetup)
+    }
+
+    pub fn initial_position(&self) -> Result<VariantPosition, InvalidGameRow> {
+        initial_position(self.initial_setup()?.as_ref()).map_err(|_| InvalidGameRow::InvalidSetup)
+    }
+
     pub fn pack_lichess_game<B: BufMut>(&self, buf: &mut B) -> Result<(), InvalidGameRow> {
-        let ratings = ByColor {
-            white: rating_from_row(self.players.white.rating)?,
-            black: rating_from_row(self.players.black.rating)?,
-        };
+        let ratings = self.ratings()?;
 
         let date = LaxDate::from_ymd(
             u32::try_from(self.date_year.ok_or(InvalidGameRow::MissingDate)?)
@@ -160,11 +206,9 @@ impl GameRow<'_> {
         )
         .map_err(|_| InvalidGameRow::InvalidDate)?;
 
-        let outcome =
-            Outcome::from_ascii(self.outcome).map_err(|_| InvalidGameRow::InvalidOutcome)?;
+        let outcome = self.outcome()?;
 
-        let speed = Speed::from_ascii(self.speed.ok_or(InvalidGameRow::MissingSpeed)?)
-            .map_err(|_| InvalidGameRow::InvalidSpeed)?;
+        let speed = self.speed()?;
 
         let rating_mode = RatingMode::from_ascii(self.rating_mode)
             .map_err(|_| InvalidGameRow::InvalidRatingMode)?;
@@ -184,11 +228,6 @@ impl GameRow<'_> {
         buf.put_slice(self.moves);
         Ok(())
     }
-}
-
-fn rating_from_row(rating: Option<i32>) -> Result<Rating, InvalidGameRow> {
-    Rating::try_from(rating.ok_or(InvalidGameRow::MissingRating)?)
-        .map_err(|_| InvalidGameRow::InvalidRating)
 }
 
 fn optional_u8(n: Option<i32>) -> Result<Option<u8>, InvalidGameRow> {

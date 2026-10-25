@@ -45,8 +45,7 @@ impl PackedMoves {
     }
 
     pub fn decode(&self) -> Result<PackedMovesDecoder<'_>, InvalidPackedMoves> {
-        let reader = BitReader::new(&self.0)?;
-        Ok(PackedMovesDecoder { reader })
+        PackedMovesDecoder::new(&self.0)
     }
 }
 
@@ -88,6 +87,11 @@ pub struct PackedMovesDecoder<'a> {
 }
 
 impl PackedMovesDecoder<'_> {
+    pub fn new(bytes: &[u8]) -> Result<PackedMovesDecoder<'_>, InvalidPackedMoves> {
+        let reader = BitReader::new(bytes)?;
+        Ok(PackedMovesDecoder { reader })
+    }
+
     #[inline]
     pub fn decode_next(
         &mut self,

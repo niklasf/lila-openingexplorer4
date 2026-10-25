@@ -235,14 +235,7 @@ pub struct LichessGame {
 
 impl LichessGame {
     pub fn initial_position(&self) -> Result<VariantPosition, InvalidSetup> {
-        match &self.setup {
-            None => Ok(VariantPosition::new(Variant::Chess)),
-            Some(setup) => {
-                let (setup, variant) = setup.unpack_variant().map_err(|_| InvalidSetup)?;
-                VariantPosition::from_setup(variant, setup, CastlingMode::Chess960)
-                    .map_err(|_| InvalidSetup)
-            }
-        }
+        initial_position(self.setup.as_ref())
     }
 
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
@@ -321,6 +314,17 @@ impl Arbitrary<'_> for LichessGame {
 #[derive(Debug, Error)]
 #[error("invalid setup")]
 pub struct InvalidSetup;
+
+pub fn initial_position(setup: Option<&PackedSetup>) -> Result<VariantPosition, InvalidSetup> {
+    match setup {
+        None => Ok(VariantPosition::new(Variant::Chess)),
+        Some(setup) => {
+            let (setup, variant) = setup.unpack_variant().map_err(|_| InvalidSetup)?;
+            VariantPosition::from_setup(variant, setup, CastlingMode::Chess960)
+                .map_err(|_| InvalidSetup)
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

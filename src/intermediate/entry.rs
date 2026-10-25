@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::fmt;
 
 use bytes::{Buf, BufMut};
@@ -14,20 +13,6 @@ use crate::{
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct IntermediateEntry(pub [u8; IntermediateEntry::SIZE]);
-
-impl Ord for IntermediateEntry {
-    #[inline]
-    fn cmp(&self, other: &IntermediateEntry) -> Ordering {
-        self.0[..IntermediateEntry::KEY_SIZE].cmp(&other.0[..IntermediateEntry::KEY_SIZE])
-    }
-}
-
-impl PartialOrd for IntermediateEntry {
-    #[inline]
-    fn partial_cmp(&self, other: &IntermediateEntry) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
 
 impl IntermediateEntry {
     pub const SIZE: usize = 30;
@@ -71,6 +56,15 @@ impl IntermediateEntry {
     #[inline]
     pub fn hash_prefix(&self) -> u64 {
         u64::from_be_bytes(self.0[..8].try_into().expect("8 bytes"))
+    }
+
+    #[inline]
+    pub fn sort_key(&self) -> (u128, u64) {
+        // key() + month() + sub_key() + seq_and_outcome()
+        (
+            u128::from_be_bytes(self.0[..16].try_into().expect("16 bytes")),
+            u64::from_be_bytes(self.0[14..22].try_into().expect("8 bytes")),
+        )
     }
 
     #[inline]
