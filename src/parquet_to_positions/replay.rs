@@ -2,7 +2,7 @@ use nohash_hasher::IntMap;
 use shakmaty::{
     ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Position,
     packed::PackedUciMove,
-    variant::{Variant, VariantPosition},
+    variant::{Variant, VariantPosition, WithPositionMut},
     zobrist::Zobrist128,
 };
 use thiserror::Error;
@@ -87,23 +87,37 @@ impl Replayer {
         self.visits.clear();
         self.initial_turn = pos.turn();
 
-        let mut decoder = PackedMovesDecoder::new(moves)?;
-        let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
-        let mut ply = 0;
-        while let Some(m) = decoder.decode_next(&pos)? {
-            let packed = PackedUciMove::pack(m.to_uci(CastlingMode::Chess960));
-            self.visits
-                .entry(hash)
-                .and_modify(|visit| visit.m = packed)
-                .or_insert(Visit { ply, m: packed });
-            ply += 1;
-
-            let updated = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
-            pos.play_unchecked(m);
-            hash = updated.unwrap_or_else(|| pos.zobrist_hash(EnPassantMode::Legal));
+        struct ReplayGame<'a, 'b> {
+            visits: &'a mut IntMap<Zobrist128, Visit>,
+            decoder: PackedMovesDecoder<'b>,
         }
 
-        Ok(())
+        impl WithPositionMut for ReplayGame<'_, '_> {
+            type Output = Result<(), InvalidPackedMoves>;
+
+            fn call<P: Position>(mut self, pos: &mut P) -> Self::Output {
+                let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
+                let mut ply = 0;
+                while let Some(m) = self.decoder.decode_next(pos)? {
+                    let packed = PackedUciMove::pack(m.to_uci(CastlingMode::Chess960));
+                    self.visits
+                        .entry(hash)
+                        .and_modify(|visit| visit.m = packed)
+                        .or_insert(Visit { ply, m: packed });
+                    ply += 1;
+
+                    let updated = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
+                    pos.play_unchecked(m);
+                    hash = updated.unwrap_or_else(|| pos.zobrist_hash(EnPassantMode::Legal));
+                }
+                Ok(())
+            }
+        }
+
+        Ok(pos.with_position_mut(ReplayGame {
+            visits: &mut self.visits,
+            decoder: PackedMovesDecoder::new(moves)?,
+        })?)
     }
 
     /// Number of positions recorded by the last replay.

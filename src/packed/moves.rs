@@ -93,27 +93,12 @@ impl PackedMovesDecoder<'_> {
     }
 
     #[inline]
-    pub fn decode_next(
+    pub fn decode_next<P: Position>(
         &mut self,
-        pos: &VariantPosition,
+        pos: &P,
     ) -> Result<Option<Move>, InvalidPackedMoves> {
-        struct DecodeMove<'a, 'b> {
-            reader: &'a mut BitReader<'b>,
-        }
-
-        impl WithPosition for DecodeMove<'_, '_> {
-            type Output = Result<Move, InvalidPackedMoves>;
-
-            #[inline]
-            fn call<P: Position>(self, pos: &P) -> Self::Output {
-                decode_move(self.reader, pos)
-            }
-        }
-
         Ok(if self.reader.has_remaining() {
-            Some(pos.with_position(DecodeMove {
-                reader: &mut self.reader,
-            })?)
+            Some(decode_move(&mut self.reader, pos)?)
         } else {
             None
         })
@@ -219,7 +204,8 @@ impl BitReader<'_> {
 
 #[inline]
 fn bits_for(slots: usize) -> u32 {
-    slots.next_power_of_two().ilog2()
+    // Same as slots.next_power_of_two().ilog2()
+    usize::BITS - slots.saturating_sub(1).leading_zeros()
 }
 
 #[inline]
@@ -233,6 +219,36 @@ fn square_index(sq: Square, mask: Bitboard) -> u32 {
     below.count() as u32
 }
 
+#[inline]
+fn nth_square(mask: Bitboard, n: usize) -> Option<Square> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        if fast_pdep() {
+            if n >= 64 {
+                return None;
+            }
+
+            // SAFETY: Part of bmi2 target feature.
+            return Bitboard(unsafe { std::arch::x86_64::_pdep_u64(1 << n, mask.0) }).first();
+        }
+    }
+    mask.nth(n)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline]
+fn fast_pdep() -> bool {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| {
+        // Everything with bmi2 except AMD family 17h.
+        let (vendor, info) = (std::arch::x86_64::__cpuid(0), std::arch::x86_64::__cpuid(1));
+        let amd = (vendor.ebx, vendor.edx, vendor.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163);
+        let family = ((info.eax >> 8) & 0xf) + ((info.eax >> 20) & 0xff);
+        !(amd && family == 0x17)
+    })
+}
+
+#[inline]
 fn pseudo_legal_targets<P: Position>(pos: &P, role: Role, from: Square) -> Bitboard {
     match role {
         Role::Pawn => {
@@ -241,8 +257,10 @@ fn pseudo_legal_targets<P: Position>(pos: &P, role: Role, from: Square) -> Bitbo
             let two_step = one_step.shift(forward)
                 & !pos.board().occupied()
                 & pos.turn().fold_wb(Bitboard::SOUTH, Bitboard::NORTH);
-            let captures = attacks::pawn_attacks(pos.turn(), from)
-                & (pos.them() | Bitboard::from_iter(pos.maybe_ep_square()));
+            let ep = pos
+                .maybe_ep_square()
+                .map_or(Bitboard::EMPTY, Bitboard::from_square);
+            let captures = attacks::pawn_attacks(pos.turn(), from) & (pos.them() | ep);
             one_step | two_step | captures
         }
         Role::Knight => attacks::knight_attacks(from) & !pos.us(),
@@ -279,47 +297,44 @@ fn encode_move<P: Position>(writer: &mut BitWriter, pos: &P, m: Move) {
     }
 }
 
+#[inline]
 fn decode_move<P: Position>(reader: &mut BitReader, pos: &P) -> Result<Move, InvalidPackedMoves> {
     let piece_bits = bits_for(pos.us().count() + usize::from(pos.pockets().is_some()));
     let piece_index = reader.read_bits(piece_bits)? as usize;
     if piece_index < pos.us().count() {
-        let from = pos
-            .us()
-            .into_iter()
-            .nth(piece_index)
-            .ok_or(InvalidPackedMoves)?;
+        let from = nth_square(pos.us(), piece_index).ok_or(InvalidPackedMoves)?;
 
         let role = pos.board().role_at(from).ok_or(InvalidPackedMoves)?;
 
         let targets = pseudo_legal_targets(pos, role, from);
         let target_bits = bits_for(targets.count());
-        let to = targets
-            .into_iter()
-            .nth(reader.read_bits(target_bits)? as usize)
+        let to = nth_square(targets, reader.read_bits(target_bits)? as usize)
             .ok_or(InvalidPackedMoves)?;
 
-        let promotion = if role == Role::Pawn && to.rank() == pos.turn().relative_rank(Rank::Eighth)
-        {
-            Some(
-                Role::try_from(reader.read_bits(bits_for(6))? + 1)
-                    .map_err(|_| InvalidPackedMoves)?,
-            )
-        } else {
-            if piece_bits == 0 && target_bits == 0 && reader.read_bits(1)? != 0 {
-                return Err(InvalidPackedMoves);
-            }
-            None
-        };
+        // Deliberately fused with &, to make a single rarely taken branch.
+        let promotion =
+            if (role == Role::Pawn) & (to.rank() == pos.turn().relative_rank(Rank::Eighth)) {
+                Some(
+                    Role::try_from(reader.read_bits(bits_for(6))? + 1)
+                        .map_err(|_| InvalidPackedMoves)?,
+                )
+            } else {
+                if piece_bits == 0 && target_bits == 0 && reader.read_bits(1)? != 0 {
+                    return Err(InvalidPackedMoves);
+                }
+                None
+            };
 
-        Ok(if role == Role::King && pos.us().contains(to) {
+        let castle = (role == Role::King) & pos.us().contains(to);
+        let en_passant = (role == Role::Pawn)
+            & (from.file() != to.file())
+            & !pos.board().occupied().contains(to);
+        Ok(if castle {
             Move::Castle {
                 king: from,
                 rook: to,
             }
-        } else if role == Role::Pawn
-            && from.file() != to.file()
-            && !pos.board().occupied().contains(to)
-        {
+        } else if en_passant {
             Move::EnPassant { from, to }
         } else {
             Move::Normal {
