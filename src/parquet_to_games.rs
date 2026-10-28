@@ -118,13 +118,6 @@ fn new_chunk() -> Vec<u8> {
     Vec::with_capacity(CHUNK_STRIDE as usize)
 }
 
-/// Hard limit for the size of each SST file.
-const SST_MAX_SIZE: u64 = 512 * 1024 * 1024;
-
-/// Start a new SST file once the current one reaches this size. The margin
-/// leaves room for the index and footer written when finishing the file.
-const SST_ROLL_SIZE: u64 = SST_MAX_SIZE - 16 * 1024 * 1024;
-
 /// Initial guess for the ratio of SST bytes to uncompressed value bytes, used
 /// until measured (about 1.1 with `PackedMoves` and 4 KB zstd blocks).
 const INITIAL_SST_RATIO: f64 = 1.1;
@@ -193,6 +186,8 @@ pub struct Config {
     /// Maximum size of the zstd dictionary trained for each SST file (0 to
     /// disable dictionary compression).
     pub sst_zstd_dict: i32,
+    /// Approximate size of the SST files.
+    pub sst_target_size: u64,
 }
 
 /// Bytes of the fixed length prefix of each record.
@@ -402,6 +397,8 @@ struct SstContext<'a> {
     opts: &'a Options,
     env_opts: &'a EnvOptions,
     out: &'a Path,
+    /// Start a new SST file once the current one reaches this size.
+    target_size: u64,
     stats: Mutex<Stats>,
 }
 
@@ -556,6 +553,7 @@ pub fn convert(
         opts: &sst_config.options(),
         env_opts: &sst_config.env_options(),
         out,
+        target_size: config.sst_target_size,
         stats: Mutex::new(Stats::default()),
     };
     let counters = Counters::default();
@@ -926,7 +924,7 @@ fn write_partition(
     }
 
     let ratio = sst.stats.lock().expect("lock stats").ratio();
-    let raw_per_range = (SST_ROLL_SIZE as f64 * 0.97 / ratio) as usize;
+    let raw_per_range = (sst.target_size as f64 * 0.97 / ratio) as usize;
     let raw_per_game = partition.record_bytes() / partition.index.len();
     let games_per_range = (raw_per_range / raw_per_game.max(1))
         .min(partition.index.len().div_ceil(threads))
@@ -970,12 +968,10 @@ fn write_sst_range(
     let finish = |writer: &mut Option<SstFileWriter<'_>>, games: &mut u64, raw: &mut u64| {
         if let Some(mut w) = writer.take() {
             w.finish()?;
-            let bytes = w.file_size();
-            assert!(bytes <= SST_MAX_SIZE, "sst file too large: {bytes}");
             sst.stats
                 .lock()
                 .expect("lock stats")
-                .add_file(*games, bytes, *raw);
+                .add_file(*games, w.file_size(), *raw);
             *games = 0;
             *raw = 0;
         }
@@ -998,7 +994,7 @@ fn write_sst_range(
         games_in_file += 1;
         raw_in_file += (GameId::SIZE + value.len()) as u64;
 
-        if w.file_size() >= SST_ROLL_SIZE {
+        if w.file_size() >= sst.target_size {
             finish(&mut writer, &mut games_in_file, &mut raw_in_file)?;
         }
     }

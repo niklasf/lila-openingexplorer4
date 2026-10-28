@@ -70,9 +70,9 @@ struct Args {
     /// scan does not compete with the SST writes.
     #[clap(long)]
     no_overlap: bool,
-    /// Start a new SST file once the current one reaches this size (the
-    /// default matches target_file_size_base of RocksDB).
-    #[clap(long, default_value = "64m")]
+    /// Approximate size of the SST files. The target_file_size_base of the
+    /// column families should match.
+    #[clap(long, default_value = "512m")]
     sst_target_size: ByteSize,
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]

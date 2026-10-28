@@ -135,7 +135,8 @@ impl<'a> RollingSstWriter<'a> {
         Ok(())
     }
 
-    fn finish_file(&mut self) -> Result<(), rocksdb::Error> {
+    /// Finishes the current file, if any. The next key starts a new file.
+    pub fn finish_file(&mut self) -> Result<(), rocksdb::Error> {
         if let Some(mut w) = self.writer.take() {
             w.finish()?;
             self.stats

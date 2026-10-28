@@ -61,6 +61,10 @@ struct Args {
     /// scan does not compete with the SST writes.
     #[clap(long)]
     no_overlap: bool,
+    /// Approximate size of the SST files. The target_file_size_base of the
+    /// column family should match.
+    #[clap(long, default_value = "512m")]
+    sst_target_size: ByteSize,
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]
     sst_block_size: usize,
@@ -127,6 +131,7 @@ fn main() {
         sst_block_size: args.sst_block_size,
         sst_zstd_level: args.sst_zstd_level,
         sst_zstd_dict: args.sst_zstd_dict,
+        sst_target_size: args.sst_target_size.into(),
     };
 
     let plan = match Plan::new(&args.parquet, &config) {

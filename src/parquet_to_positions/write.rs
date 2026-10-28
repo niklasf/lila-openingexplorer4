@@ -28,10 +28,9 @@ pub const POSITIONS_DIR: &str = "positions";
 /// Ranges per SST thread and column family, to balance the load.
 const RANGES_PER_THREAD: usize = 4;
 
-/// Ranges are at least this many target file sizes, so that only a small
-/// fraction of the files are smaller than the target, as the last file of
-/// each range.
-const MIN_FILES_PER_RANGE: u64 = 4;
+/// Hard limit for SST files, as a multiple of the target size, in case the
+/// size estimate of a range is far off.
+const MAX_FILE_SIZE_FACTOR: u64 = 2;
 
 /// Initial guesses for SST bytes per record, used until measured.
 const INITIAL_COLD_BYTES_PER_RECORD: f64 = 9.0;
@@ -41,7 +40,7 @@ pub struct SstContext<'a> {
     pub opts: &'a Options,
     pub env_opts: &'a EnvOptions,
     pub out: &'a Path,
-    /// Start a new SST file once the current one reaches this size.
+    /// Approximate size of the SST files.
     pub target_size: u64,
     pub stats: Mutex<OutputStats>,
 }
@@ -93,8 +92,10 @@ enum Family {
 /// to SST files for both column families.
 ///
 /// For each column family, the partition is split into contiguous ranges of
-/// buckets, sized to produce a few full files each. All ranges are written
-/// in parallel. File names sort in key order.
+/// buckets, at most one target file size each, or more if that would exceed
+/// the number of parallel tasks. Each range is split by record count into
+/// equal files of at most the target size, so that there are no small
+/// leftover files. All ranges are written in parallel. File names sort in key order.
 pub fn write_partition(
     partition: &Partition,
     hot: &[HotEntry],
@@ -107,16 +108,20 @@ pub fn write_partition(
         sst.stats.lock().expect("lock stats").bytes_per_record();
     let records = partition.records() as f64;
     let hot_bytes: usize = hot.iter().map(|(key, value)| key.len() + value.len()).sum();
+    let target_size = sst.target_size as f64;
     let ranges = |estimated_bytes: f64| {
-        ((estimated_bytes / (MIN_FILES_PER_RANGE * sst.target_size) as f64) as usize)
-            .clamp(1, (threads * RANGES_PER_THREAD).min(BUCKETS))
+        let ranges = ((estimated_bytes / target_size).ceil() as usize)
+            .clamp(1, (threads * RANGES_PER_THREAD).min(BUCKETS));
+        let files = ((estimated_bytes / ranges as f64 / target_size).ceil() as usize).max(1);
+        (ranges, files)
     };
-    let positions_ranges = ranges(records * positions_per_record + hot_bytes as f64);
-    let cold_ranges = ranges(records * cold_per_record);
+    let (positions_ranges, positions_files) =
+        ranges(records * positions_per_record + hot_bytes as f64);
+    let (cold_ranges, cold_files) = ranges(records * cold_per_record);
     // The larger positions tasks first.
-    let tasks: Vec<(Family, usize, usize)> = (0..positions_ranges)
-        .map(|range| (Family::Positions, range, positions_ranges))
-        .chain((0..cold_ranges).map(|range| (Family::Cold, range, cold_ranges)))
+    let tasks: Vec<(Family, usize, usize, usize)> = (0..positions_ranges)
+        .map(|range| (Family::Positions, range, positions_ranges, positions_files))
+        .chain((0..cold_ranges).map(|range| (Family::Cold, range, cold_ranges, cold_files)))
         .collect();
     let next_task = AtomicUsize::new(0);
 
@@ -125,7 +130,7 @@ pub fn write_partition(
             s.spawn(|| {
                 let mut packer = EntryPacker::default();
                 let mut buf = Vec::new();
-                while let Some(&(family, range, ranges)) =
+                while let Some(&(family, range, ranges, files)) =
                     tasks.get(next_task.fetch_add(1, Ordering::Relaxed))
                 {
                     let buckets = range * BUCKETS / ranges..(range + 1) * BUCKETS / ranges;
@@ -137,6 +142,7 @@ pub fn write_partition(
                         family,
                         &partition.buckets[buckets],
                         &hot[hot_start..hot_end],
+                        files,
                         sst,
                         &format!("{memory_partition:05}_{range:05}"),
                         &mut packer,
@@ -155,11 +161,13 @@ fn hash_bytes(entry: &IntermediateEntry) -> &[u8] {
 }
 
 /// Writes the keys of one column family for sorted buckets and sorted hot
-/// entries of one key range.
+/// entries of one key range, split into the given number of files.
+#[allow(clippy::too_many_arguments)]
 fn write_range(
     family: Family,
     buckets: &[Vec<IntermediateEntry>],
     hot: &[HotEntry],
+    files: usize,
     sst: &SstContext<'_>,
     name: &str,
     packer: &mut EntryPacker,
@@ -173,8 +181,13 @@ fn write_range(
         sst.opts,
         sst.env_opts,
         sst.out.join(dir).join(name),
-        sst.target_size,
+        MAX_FILE_SIZE_FACTOR * sst.target_size,
     );
+    // Start the next file after this many records.
+    let total_records: usize = buckets.iter().map(Vec::len).sum();
+    let mut file = 1;
+    let mut next_file_at = total_records / files;
+    let mut records = 0;
     let mut cold_records = 0;
     let mut cold_group = ColdGroup::default();
     let mut position_records = 0;
@@ -184,6 +197,13 @@ fn write_range(
         .iter()
         .flat_map(|bucket| bucket.chunk_by(|a, b| hash_bytes(a) == hash_bytes(b)))
     {
+        if records >= next_file_at && file < files {
+            // Before the next put, so that cold groups stay whole.
+            writer.finish_file()?;
+            file += 1;
+            next_file_at = total_records * file / files;
+        }
+        records += run.len();
         let hash = hash_bytes(&run[0]);
         match (family, run) {
             (Family::Cold, [single]) => {
