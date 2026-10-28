@@ -451,7 +451,7 @@ pub struct Plan {
 impl Plan {
     pub fn new(parquet: &[PathBuf], config: &Config) -> io::Result<Plan> {
         let threads = config.threads;
-        let input = Input::open(parquet, config.row_groups, config.direct_io)?;
+        let input = Input::open(parquet, 0, config.row_groups, config.direct_io)?;
 
         let estimate = Estimate::sample(&input);
         // The layout depends on the read threads (buffers), which depend on

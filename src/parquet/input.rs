@@ -31,7 +31,14 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn open(paths: &[PathBuf], limit: Option<usize>, direct: bool) -> io::Result<Input> {
+    /// Opens the parquet files, using only `limit` row groups after skipping
+    /// the first `skip` row groups of the concatenated inputs.
+    pub fn open(
+        paths: &[PathBuf],
+        skip: usize,
+        limit: Option<usize>,
+        direct: bool,
+    ) -> io::Result<Input> {
         let readers = paths
             .iter()
             .map(|path| Ok(GameReader::try_new(PositionalFile::open(path)?)?))
@@ -54,6 +61,7 @@ impl Input {
             .enumerate()
             .flat_map(|(r, reader)| (0..reader.num_row_groups()).map(move |i| (r, i)))
             .collect();
+        row_groups.drain(..skip.min(row_groups.len()));
         if let Some(limit) = limit {
             row_groups.truncate(limit);
         }

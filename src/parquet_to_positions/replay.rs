@@ -47,18 +47,27 @@ pub struct Replayer {
     visits: IntMap<Zobrist128, Visit>,
     /// Side to move at ply 0 of the last replayed game.
     initial_turn: Color,
+    /// Games are truncated after this many plies.
+    max_ply: usize,
 }
 
 impl Default for Replayer {
     fn default() -> Replayer {
-        Replayer {
-            visits: IntMap::default(),
-            initial_turn: Color::White,
-        }
+        Replayer::new(None)
     }
 }
 
 impl Replayer {
+    /// Creates a replayer that records only the positions of the first
+    /// `max_ply` plies of each game, if given.
+    pub fn new(max_ply: Option<usize>) -> Replayer {
+        Replayer {
+            visits: IntMap::default(),
+            initial_turn: Color::White,
+            max_ply: max_ply.unwrap_or(usize::MAX),
+        }
+    }
+
     /// Replays the game of a row, and returns its metadata.
     pub fn replay_row(
         &mut self,
@@ -90,6 +99,7 @@ impl Replayer {
         struct ReplayGame<'a, 'b> {
             visits: &'a mut IntMap<Zobrist128, Visit>,
             decoder: PackedMovesDecoder<'b>,
+            max_ply: usize,
         }
 
         impl WithPositionMut for ReplayGame<'_, '_> {
@@ -98,7 +108,9 @@ impl Replayer {
             fn call<P: Position>(mut self, pos: &mut P) -> Self::Output {
                 let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
                 let mut ply = 0;
-                while let Some(m) = self.decoder.decode_next(pos)? {
+                while ply < self.max_ply
+                    && let Some(m) = self.decoder.decode_next(pos)?
+                {
                     let packed = PackedUciMove::pack(m.to_uci(CastlingMode::Chess960));
                     self.visits
                         .entry(hash)
@@ -117,6 +129,7 @@ impl Replayer {
         Ok(pos.with_position_mut(ReplayGame {
             visits: &mut self.visits,
             decoder: PackedMovesDecoder::new(moves)?,
+            max_ply: self.max_ply,
         })?)
     }
 

@@ -1,4 +1,5 @@
 mod bytes;
+mod cold;
 mod entry;
 mod game;
 mod game_id;
@@ -10,6 +11,7 @@ mod rating;
 mod zobrist;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
+pub use cold::{ColdGroup, ColdKey};
 pub use entry::{GameSeq, GroupHeader, LichessEntry, RatingGroup, SubStats};
 pub use game::{
     GamePlayer, InvalidRatingMode, InvalidSetup, InvalidSpeed, LichessGame, RatingMode, Speed,

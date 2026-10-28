@@ -50,6 +50,12 @@ struct Args {
     /// cold_positions and positions (which must be empty or missing).
     #[clap(long)]
     out: PathBuf,
+    /// Only index the positions of the first plies of each game.
+    #[clap(long)]
+    max_ply: Option<usize>,
+    /// Skip the first row groups of the inputs.
+    #[clap(long, default_value = "0", help_heading = "Benchmarking")]
+    skip_row_groups: usize,
     /// Only process the first row groups of the inputs.
     #[clap(long, help_heading = "Benchmarking")]
     row_groups: Option<usize>,
@@ -128,6 +134,8 @@ fn main() {
         io_depth: args.io_depth,
         direct_io: !args.no_direct_io,
         scratch_zstd_level: args.scratch_zstd_level,
+        max_ply: args.max_ply,
+        skip_row_groups: args.skip_row_groups,
         row_groups: args.row_groups,
         scatter_only: args.scatter_only,
         overlap: !args.no_overlap,
@@ -174,10 +182,12 @@ fn main() {
         stats.hot_positions,
     );
     println!(
-        "cold_positions: {} keys in {} files ({} bytes, {:.1} B/key, largest {} bytes)",
+        "cold_positions: {} groups for {} records in {} files ({} bytes, {:.1} B/record, {:.1} B/group, largest {} bytes)",
         output.cold.keys,
+        output.cold_records,
         output.cold.files,
         output.cold.bytes,
+        output.cold.bytes as f64 / output.cold_records.max(1) as f64,
         output.cold.bytes_per_key(),
         output.cold.largest_file,
     );

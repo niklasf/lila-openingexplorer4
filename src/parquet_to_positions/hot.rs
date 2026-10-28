@@ -46,7 +46,7 @@ pub struct Sample {
 }
 
 impl Sample {
-    pub fn replay(input: &Input, threads: usize) -> Sample {
+    pub fn replay(input: &Input, threads: usize, max_ply: Option<usize>) -> Sample {
         let num_row_groups = input.num_row_groups();
         let samples = SAMPLE_ROW_GROUPS.min(num_row_groups);
         let next = AtomicUsize::new(0);
@@ -55,7 +55,7 @@ impl Sample {
         thread::scope(|s| {
             for _ in 0..threads.clamp(1, samples.max(1)) {
                 s.spawn(|| {
-                    let mut replayer = Replayer::default();
+                    let mut replayer = Replayer::new(max_ply);
                     let mut counts: IntMap<Zobrist96, u64> = IntMap::default();
                     let mut months: HashSet<Month> = HashSet::new();
                     let (mut rows, mut records) = (0, 0);

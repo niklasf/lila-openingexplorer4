@@ -1,6 +1,6 @@
 use std::{sync::Mutex, thread};
 
-use crate::{intermediate::IntermediateEntry, scatter::ScratchFile};
+use crate::{intermediate::IntermediateEntry, packed::ColdKey, scatter::ScratchFile};
 
 /// Sub-buckets of a memory partition, by the hash bits below the partition
 /// bits. They are sorted in parallel and later written in parallel.
@@ -11,17 +11,21 @@ pub const BUCKETS: usize = 1 << BUCKET_BITS;
 /// shared bucket.
 const STAGE: usize = 1024;
 
-fn hash_prefix(key: &[u8; IntermediateEntry::KEY_SIZE]) -> u64 {
-    u64::from_be_bytes(key[..8].try_into().expect("8 bytes"))
+/// The hash prefix that is the key of a group in the cold_positions column
+/// family. Memory partitions and buckets are determined by this prefix
+/// only, so that all keys of a group are written by the same thread, in one
+/// SST file.
+fn hash_prefix(key: &[u8; IntermediateEntry::KEY_SIZE]) -> u32 {
+    u32::from_be_bytes(key[..ColdKey::PREFIX_SIZE].try_into().expect("cold prefix"))
 }
 
 /// The memory partition of a key, and the position of the key within the
 /// partition (multiply-shift: the integer and the fractional part of the
 /// scaled hash prefix). Together they are in key order.
 #[inline]
-fn split(key: &[u8; IntermediateEntry::KEY_SIZE], memory_partitions: usize) -> (usize, u64) {
-    let scaled = u128::from(hash_prefix(key)) * memory_partitions as u128;
-    ((scaled >> 64) as usize, scaled as u64)
+fn split(key: &[u8; IntermediateEntry::KEY_SIZE], memory_partitions: usize) -> (usize, u32) {
+    let scaled = u64::from(hash_prefix(key)) * memory_partitions as u64;
+    ((scaled >> 32) as usize, scaled as u32)
 }
 
 /// The memory partition of a key.
@@ -36,7 +40,7 @@ pub fn memory_partition(
 /// The bucket of a key within its memory partition.
 #[inline]
 pub fn bucket(key: &[u8; IntermediateEntry::KEY_SIZE], memory_partitions: usize) -> usize {
-    (split(key, memory_partitions).1 >> (64 - BUCKET_BITS)) as usize
+    (split(key, memory_partitions).1 >> (32 - BUCKET_BITS)) as usize
 }
 
 fn entries(raw: &[u8]) -> impl Iterator<Item = IntermediateEntry> + '_ {

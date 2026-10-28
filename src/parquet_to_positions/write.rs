@@ -11,7 +11,7 @@ use rocksdb::{EnvOptions, Options};
 
 use crate::{
     intermediate::{EntryPacker, IntermediateEntry},
-    packed::Zobrist96,
+    packed::{ColdGroup, ColdKey, Zobrist96},
     parquet_to_positions::{
         hot::HotEntry,
         partition::{BUCKETS, Partition, bucket},
@@ -34,7 +34,7 @@ const RANGES_PER_THREAD: usize = 4;
 const MIN_FILES_PER_RANGE: u64 = 4;
 
 /// Initial guesses for SST bytes per record, used until measured.
-const INITIAL_COLD_BYTES_PER_RECORD: f64 = 20.0;
+const INITIAL_COLD_BYTES_PER_RECORD: f64 = 9.0;
 const INITIAL_POSITIONS_BYTES_PER_RECORD: f64 = 2.0;
 
 pub struct SstContext<'a> {
@@ -48,8 +48,11 @@ pub struct SstContext<'a> {
 
 #[derive(Debug, Default, Clone)]
 pub struct OutputStats {
+    /// Cold groups are the keys.
     pub cold: SstStats,
     pub positions: SstStats,
+    /// Records written as cold entries.
+    pub cold_records: u64,
     /// Records written as part of a positions entry, excluding hot records.
     pub position_records: u64,
 }
@@ -58,7 +61,7 @@ impl OutputStats {
     /// SST bytes of each column family per record written so far
     /// (excluding hot records).
     fn bytes_per_record(&self) -> (f64, f64) {
-        let records = self.cold.keys + self.position_records;
+        let records = self.cold_records + self.position_records;
         if records == 0 {
             (
                 INITIAL_COLD_BYTES_PER_RECORD,
@@ -75,6 +78,7 @@ impl OutputStats {
     fn merge(&mut self, other: &OutputStats) {
         self.cold.merge(&other.cold);
         self.positions.merge(&other.positions);
+        self.cold_records += other.cold_records;
         self.position_records += other.position_records;
     }
 }
@@ -171,6 +175,8 @@ fn write_range(
         sst.out.join(dir).join(name),
         sst.target_size,
     );
+    let mut cold_records = 0;
+    let mut cold_group = ColdGroup::default();
     let mut position_records = 0;
     let mut hot = hot.iter().peekable();
 
@@ -180,7 +186,15 @@ fn write_range(
     {
         let hash = hash_bytes(&run[0]);
         match (family, run) {
-            (Family::Cold, [single]) => writer.put(hash, &single.game_id().to_bytes())?,
+            (Family::Cold, [single]) => {
+                let key = ColdKey::from_hash_bytes(hash);
+                if let Err(key) = cold_group.push(key, single.game_id()) {
+                    let (prefix, value) = cold_group.finish().expect("non-empty group");
+                    writer.put(&prefix, value)?;
+                    cold_group.push(key, single.game_id()).expect("empty group");
+                }
+                cold_records += 1;
+            }
             (Family::Cold, _) => (),
             (Family::Positions, [_]) => (),
             (Family::Positions, _) => {
@@ -202,6 +216,9 @@ fn write_range(
             }
         }
     }
+    if let Some((prefix, value)) = cold_group.finish() {
+        writer.put(&prefix, value)?;
+    }
     if family == Family::Positions {
         for (key, value) in hot {
             writer.put(key, value)?;
@@ -212,6 +229,7 @@ fn write_range(
     Ok(match family {
         Family::Cold => OutputStats {
             cold: written,
+            cold_records,
             ..OutputStats::default()
         },
         Family::Positions => OutputStats {

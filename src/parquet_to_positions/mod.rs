@@ -88,7 +88,7 @@ struct Estimate {
 impl Estimate {
     fn new(input: &Input, config: &Config, read_threads: u64) -> Estimate {
         let rows = input.total_rows();
-        let sample = Sample::replay(input, config.threads);
+        let sample = Sample::replay(input, config.threads, config.max_ply);
         let per_row = if sample.sampled_rows == 0 {
             0.0
         } else {
@@ -208,6 +208,10 @@ pub struct Config {
     pub direct_io: bool,
     /// Zstd level for scratch chunks, or 0 for no compression.
     pub scratch_zstd_level: i32,
+    /// Only index the positions of the first plies of each game.
+    pub max_ply: Option<usize>,
+    /// Skip the first row groups of the inputs.
+    pub skip_row_groups: usize,
     /// Only process the first row groups of the inputs.
     pub row_groups: Option<usize>,
     /// Stop after the scatter of the first pass.
@@ -251,7 +255,12 @@ pub struct Plan {
 impl Plan {
     pub fn new(parquet: &[PathBuf], config: &Config) -> io::Result<Plan> {
         let threads = config.threads;
-        let input = Input::open(parquet, config.row_groups, config.direct_io)?;
+        let input = Input::open(
+            parquet,
+            config.skip_row_groups,
+            config.row_groups,
+            config.direct_io,
+        )?;
 
         // The layout depends on the read threads (buffers), which depend on
         // the layout (overlap). Resolve with the larger read thread count.
@@ -453,10 +462,10 @@ pub fn convert(
                 log_above(
                     progress,
                     format!(
-                        "partition {memory_partition}: write {:.1?} ({} cold files with {:.1} B/key, {} positions files with {:.1} B/key so far)",
+                        "partition {memory_partition}: write {:.1?} ({} cold files with {:.1} B/record, {} positions files with {:.1} B/key so far)",
                         timer.elapsed(),
                         stats.cold.files,
-                        stats.cold.bytes_per_key(),
+                        stats.cold.bytes as f64 / stats.cold_records.max(1) as f64,
                         stats.positions.files,
                         stats.positions.bytes_per_key(),
                     ),
@@ -493,6 +502,7 @@ pub fn convert(
                     direct: config.direct_io,
                     counters,
                     hot_set,
+                    max_ply: config.max_ply,
                 },
                 progress,
             )
@@ -585,6 +595,7 @@ struct ScatterConfig<'a> {
     direct: bool,
     counters: &'a Counters,
     hot_set: &'a IntSet<Zobrist96>,
+    max_ply: Option<usize>,
 }
 
 /// Accumulated time of each scatter stage, summed over its threads.
@@ -679,7 +690,7 @@ fn scatter_pass(
             let tx = tx.clone();
             let prefetcher = prefetcher.clone();
             s.spawn(move || {
-                let mut replayer = Replayer::default();
+                let mut replayer = Replayer::new(config.max_ply);
                 let mut hot = HotBuffer::new(hot_map);
                 let mut local_resident: Vec<Vec<IntermediateEntry>> = (0
                     ..RESIDENT_PARTITIONS_PER_PASS)
