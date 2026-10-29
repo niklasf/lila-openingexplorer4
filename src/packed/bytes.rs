@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
 
 use crate::packed::{pack_uint, unpack_uint};
 
@@ -7,10 +7,10 @@ pub fn pack_bytes<B: BufMut>(buf: &mut B, bytes: &[u8]) {
     buf.put_slice(bytes);
 }
 
-pub fn unpack_bytes<B: Buf>(buf: &mut B) -> Vec<u8> {
+pub fn unpack_bytes<'a>(buf: &mut &'a [u8]) -> &'a [u8] {
     let len = unpack_uint(buf) as usize;
-    let mut bytes = vec![0; len];
-    buf.copy_to_slice(&mut bytes);
+    let (bytes, rest) = buf.split_at(len);
+    *buf = rest;
     bytes
 }
 
@@ -18,8 +18,8 @@ pub fn pack_string<B: BufMut>(buf: &mut B, s: &str) {
     pack_bytes(buf, s.as_bytes());
 }
 
-pub fn unpack_string<B: Buf>(buf: &mut B) -> String {
-    String::from_utf8(unpack_bytes(buf)).expect("valid utf-8")
+pub fn unpack_string<'a>(buf: &mut &'a [u8]) -> &'a str {
+    str::from_utf8(unpack_bytes(buf)).expect("valid utf-8")
 }
 
 #[cfg(test)]

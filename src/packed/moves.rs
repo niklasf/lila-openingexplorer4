@@ -1,6 +1,5 @@
 use std::num::NonZero;
 
-use bytes::{Buf, BufMut};
 use shakmaty::{
     Bitboard, Move, Position, Rank, Role, Square, attacks,
     variant::{VariantPosition, WithPosition},
@@ -11,16 +10,6 @@ use thiserror::Error;
 pub struct PackedMoves(pub Vec<u8>);
 
 impl PackedMoves {
-    pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
-        buf.put_slice(&self.0);
-    }
-
-    pub fn unpack_entire<B: Buf>(buf: &mut B) -> Self {
-        let mut bytes = Vec::new();
-        bytes.put(buf);
-        PackedMoves(bytes)
-    }
-
     pub fn encoder() -> PackedMovesEncoder {
         PackedMovesEncoder::default()
     }

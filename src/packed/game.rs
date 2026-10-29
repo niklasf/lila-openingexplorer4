@@ -58,14 +58,6 @@ impl GamePlayer {
             rating: self.rating,
         }
     }
-
-    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        GamePlayer {
-            title: Some(unpack_string(buf)).filter(|s| !s.is_empty()),
-            name: unpack_string(buf),
-            rating: Rating::unpack_optional(buf),
-        }
-    }
 }
 
 impl Arbitrary<'_> for GamePlayer {
@@ -263,30 +255,8 @@ impl LichessGame {
         self.as_borrowed().pack_entire(buf);
     }
 
-    pub fn unpack_entire<B: Buf>(buf: &mut B) -> Self {
-        let players = ByColor {
-            white: GamePlayer::unpack(buf),
-            black: GamePlayer::unpack(buf),
-        };
-        let date = LaxDate::unpack(buf);
-        let outcome = outcome_from_bits(buf.get_u8()).expect("valid outcome");
-        let (speed, rating_mode) = unpack_speed_and_rating_mode(buf);
-
-        let setup = Some(unpack_bytes(buf))
-            .filter(|bytes| !bytes.is_empty())
-            .map(|bytes| PackedSetup::try_from_bytes(&bytes).expect("packed setup"));
-
-        let moves = PackedMoves::unpack_entire(buf);
-
-        Self {
-            players,
-            date,
-            outcome,
-            speed,
-            rating_mode,
-            setup,
-            moves,
-        }
+    pub fn unpack_entire(bytes: &[u8]) -> Self {
+        BorrowedLichessGame::unpack_entire(bytes).into_owned()
     }
 }
 
@@ -331,11 +301,27 @@ pub struct BorrowedGamePlayer<'a> {
     pub rating: Option<Rating>,
 }
 
-impl BorrowedGamePlayer<'_> {
+impl<'a> BorrowedGamePlayer<'a> {
     fn pack<B: BufMut>(&self, buf: &mut B) {
         pack_string(buf, self.title.unwrap_or(""));
         pack_string(buf, self.name);
         Rating::pack_optional(self.rating, buf);
+    }
+
+    fn unpack(buf: &mut &'a [u8]) -> Self {
+        BorrowedGamePlayer {
+            title: Some(unpack_string(buf)).filter(|title| !title.is_empty()),
+            name: unpack_string(buf),
+            rating: Rating::unpack_optional(buf),
+        }
+    }
+
+    pub fn into_owned(self) -> GamePlayer {
+        GamePlayer {
+            title: self.title.map(str::to_owned),
+            name: self.name.to_owned(),
+            rating: self.rating,
+        }
     }
 }
 
@@ -353,7 +339,42 @@ pub struct BorrowedLichessGame<'a> {
     pub moves: &'a [u8],
 }
 
-impl BorrowedLichessGame<'_> {
+impl<'a> BorrowedLichessGame<'a> {
+    pub fn unpack_entire(bytes: &'a [u8]) -> Self {
+        let mut buf = bytes;
+        let players = ByColor {
+            white: BorrowedGamePlayer::unpack(&mut buf),
+            black: BorrowedGamePlayer::unpack(&mut buf),
+        };
+        let date = LaxDate::unpack(&mut buf);
+        let outcome = outcome_from_bits(buf.get_u8()).expect("valid outcome");
+        let (speed, rating_mode) = unpack_speed_and_rating_mode(&mut buf);
+        let setup = Some(unpack_bytes(&mut buf)).filter(|setup| !setup.is_empty());
+        BorrowedLichessGame {
+            players,
+            date,
+            outcome,
+            speed,
+            rating_mode,
+            setup,
+            moves: buf,
+        }
+    }
+
+    pub fn into_owned(self) -> LichessGame {
+        LichessGame {
+            players: self.players.map(BorrowedGamePlayer::into_owned),
+            date: self.date,
+            outcome: self.outcome,
+            speed: self.speed,
+            rating_mode: self.rating_mode,
+            setup: self
+                .setup
+                .map(|bytes| PackedSetup::try_from_bytes(bytes).expect("valid setup")),
+            moves: PackedMoves(self.moves.to_vec()),
+        }
+    }
+
     pub fn initial_position(&self) -> VariantPosition {
         let setup = self
             .setup
@@ -361,7 +382,6 @@ impl BorrowedLichessGame<'_> {
         initial_position(setup.as_ref())
     }
 
-    /// Packs the game like `LichessGame::pack_entire`.
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
         self.players.white.pack(buf);
         self.players.black.pack(buf);
@@ -437,7 +457,8 @@ mod tests {
 
             let mut buf = Vec::new();
             game.pack_entire(&mut buf);
-            assert_eq!(LichessGame::unpack_entire(&mut &buf[..]), game);
+            assert_eq!(BorrowedLichessGame::unpack(&buf), game.as_borrowed());
+            assert_eq!(LichessGame::unpack_entire(&buf), game);
             Ok(())
         });
     }
