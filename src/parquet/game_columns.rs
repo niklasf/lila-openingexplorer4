@@ -145,7 +145,9 @@ pub struct GameRow<'a> {
     pub outcome: Outcome,
     pub speed: Option<Speed>,
     pub rating_mode: RatingMode,
-    pub setup: Option<PackedSetup>,
+    /// `PackedSetup`, decoded by `initial_position()`.
+    pub setup: Option<&'a [u8]>,
+    /// `PackedMoves`, decoded when replaying the game.
     pub moves: &'a [u8],
 }
 
@@ -180,7 +182,10 @@ impl GameRow<'_> {
     }
 
     pub fn initial_position(&self) -> VariantPosition {
-        initial_position(self.setup.as_ref()).expect("valid setup")
+        let setup = self
+            .setup
+            .map(|bytes| PackedSetup::try_from_bytes(bytes).expect("valid setup"));
+        initial_position(setup.as_ref()).expect("valid setup")
     }
 
     /// Checks that the game can be stored in the games SST files.
@@ -228,10 +233,7 @@ impl PreparedGame<'_> {
         self.row.date.pack(buf);
         buf.put_u8(outcome_bits(self.row.outcome));
         pack_speed_and_rating_mode(buf, self.speed, self.row.rating_mode);
-        pack_bytes(
-            buf,
-            self.row.setup.as_ref().map_or(b"", PackedSetup::as_bytes),
-        );
+        pack_bytes(buf, self.row.setup.unwrap_or(b""));
         buf.put_slice(self.row.moves);
     }
 }
@@ -347,8 +349,7 @@ impl GameColumns {
                     .next()
                     .expect("setup")
                     .map(ByteArray::data)
-                    .filter(|bytes| !bytes.is_empty())
-                    .map(|bytes| PackedSetup::try_from_bytes(bytes).expect("valid setup")),
+                    .filter(|bytes| !bytes.is_empty()),
                 moves: moves.next().expect("moves").data(),
             })
         })

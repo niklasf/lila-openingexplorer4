@@ -17,7 +17,7 @@ use parquet::{
         reader::{ChunkReader, Length},
     },
 };
-use shakmaty::{ByColor, Outcome, packed::PackedSetup};
+use shakmaty::{ByColor, Outcome};
 
 use crate::{
     packed::{GameId, LaxDate, Rating, RatingMode, Speed},
@@ -348,8 +348,8 @@ impl<'a> BatchColumns<'a> {
             speed: self.speed.get(i),
             rating_mode: self.rating_mode.get(i).expect("required rating_mode"),
             // Empty setups are treated like missing setups.
-            setup: (self.setup.is_valid(i) && !self.setup.value(i).is_empty())
-                .then(|| PackedSetup::try_from_bytes(self.setup.value(i)).expect("valid setup")),
+            setup: Some(self.setup.value(i))
+                .filter(|bytes| self.setup.is_valid(i) && !bytes.is_empty()),
             moves: self.moves.value(i),
         }
     }
