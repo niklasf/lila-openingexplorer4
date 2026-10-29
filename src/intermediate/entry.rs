@@ -118,7 +118,7 @@ impl IntermediateEntry {
 
     #[inline]
     pub fn game_id(&self) -> GameId {
-        GameId::unpack(&mut &self.0[24..30])
+        GameId::try_from(*self.0[24..30].as_array().expect("6 bytes")).expect("valid game id")
     }
 }
 
@@ -126,12 +126,13 @@ impl fmt::Debug for IntermediateEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IntermediateEntry")
             .field("hash", &self.hash())
+            .field("uci_move", &format_args!("{}", self.uci_move().unpack()))
+            .field("group_header", &self.group_header())
             .field("month", &self.month())
-            .field("sub_key", &self.sub_key())
             .field("seq", &self.seq())
             .field("outcome", &self.outcome())
             .field("rating", &self.rating())
-            .field("game_id", &&self.0[24..30])
+            .field("game_id", &self.game_id())
             .finish()
     }
 }

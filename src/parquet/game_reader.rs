@@ -150,7 +150,7 @@ impl<T: ChunkReader + Clone + 'static> GameReader<T> {
             .as_chunks::<{ GameId::SIZE }>()
             .0
             .iter()
-            .map(|game_id| GameId::unpack(&mut game_id.as_slice()))
+            .map(|&game_id| GameId::try_from(game_id).expect("valid game id"))
             .collect())
     }
 }

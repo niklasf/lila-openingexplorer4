@@ -10,6 +10,9 @@ pub struct GameId(u64);
 impl GameId {
     pub const SIZE: usize = 6;
 
+    /// Number of valid game ids (8 base 62 digits).
+    pub const COUNT: u64 = 62_u64.pow(8);
+
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; Self::SIZE];
         self.pack(&mut &mut bytes[..]);
@@ -19,7 +22,7 @@ impl GameId {
     /// The partition of the game id when the id space is split into
     /// `partitions` equal ranges.
     pub fn partition(self, partitions: usize) -> usize {
-        (u128::from(self.0) * partitions as u128 / 62_u128.pow(8)) as usize
+        (u128::from(self.0) * partitions as u128 / u128::from(GameId::COUNT)) as usize
     }
 
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
@@ -27,9 +30,9 @@ impl GameId {
     }
 
     pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        let n = buf.get_uint(Self::SIZE);
-        assert!(n < 62_u64.pow(8), "invalid game id");
-        GameId(n)
+        let mut bytes = [0; Self::SIZE];
+        buf.copy_to_slice(&mut bytes);
+        GameId::try_from(bytes).expect("valid game id")
     }
 
     pub fn from_ascii(bytes: &[u8]) -> Result<Self, InvalidGameId> {
@@ -54,6 +57,19 @@ impl GameId {
 #[derive(Error, Debug)]
 #[error("invalid game id")]
 pub struct InvalidGameId;
+
+impl TryFrom<[u8; GameId::SIZE]> for GameId {
+    type Error = InvalidGameId;
+
+    fn try_from(bytes: [u8; GameId::SIZE]) -> Result<GameId, InvalidGameId> {
+        let n = (&bytes[..]).get_uint(GameId::SIZE);
+        if n < GameId::COUNT {
+            Ok(GameId(n))
+        } else {
+            Err(InvalidGameId)
+        }
+    }
+}
 
 impl FromStr for GameId {
     type Err = InvalidGameId;
@@ -89,7 +105,7 @@ impl fmt::Debug for GameId {
 
 impl Arbitrary<'_> for GameId {
     fn arbitrary(g: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
-        Ok(GameId(g.int_in_range(0..=(62u64.pow(8) - 1))?))
+        Ok(GameId(g.int_in_range(0..=GameId::COUNT - 1)?))
     }
 }
 
