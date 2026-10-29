@@ -9,9 +9,8 @@ use shakmaty::{
     variant::{Variant, VariantPosition},
 };
 
-use crate::{
-    packed::{GameId, LaxDate, PackedMoves, Rating, RatingMode, Speed},
-    parquet::{OwnedGameRow, OwnedPlayerRow},
+use crate::packed::{
+    GameId, GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode, Speed,
 };
 
 pub struct GameVisitor;
@@ -233,7 +232,7 @@ impl ParsedGame {
         Ok((pos, setup))
     }
 
-    pub fn into_row(self) -> io::Result<OwnedGameRow> {
+    pub fn into_game(self) -> io::Result<(GameId, LichessGame)> {
         let game_id = self
             .game_id
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing game id"))?;
@@ -263,10 +262,9 @@ impl ParsedGame {
 
         let moves = encoder.finish();
 
-        Ok(OwnedGameRow {
-            game_id,
+        let game = LichessGame {
             players: ByColor {
-                white: OwnedPlayerRow {
+                white: GamePlayer {
                     title: self.white_title,
                     name: self.white.ok_or_else(|| {
                         io::Error::new(
@@ -276,7 +274,7 @@ impl ParsedGame {
                     })?,
                     rating: self.white_elo,
                 },
-                black: OwnedPlayerRow {
+                black: GamePlayer {
                     title: self.black_title,
                     name: self.black.ok_or_else(|| {
                         io::Error::new(
@@ -298,7 +296,9 @@ impl ParsedGame {
             rating_mode: RatingMode::Rated, // always rated for monthly export
             setup,
             moves,
-        })
+        };
+
+        Ok((game_id, game))
     }
 }
 

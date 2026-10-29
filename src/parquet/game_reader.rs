@@ -374,20 +374,19 @@ mod tests {
 
     use super::*;
     use crate::{
-        packed::{LaxDate, PackedMoves, Rating, RatingMode, Speed},
-        parquet::{GameColumns, OwnedGameRow, OwnedPlayerRow},
+        packed::{GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode, Speed},
+        parquet::GameColumns,
     };
 
-    fn game(game_id: &[u8], title: Option<&str>, speed: Option<Speed>) -> OwnedGameRow {
-        OwnedGameRow {
-            game_id: GameId::from_ascii(game_id).unwrap(),
+    fn game(title: Option<&str>, speed: Option<Speed>) -> LichessGame {
+        LichessGame {
             players: ByColor {
-                white: OwnedPlayerRow {
+                white: GamePlayer {
                     title: title.map(str::to_owned),
                     name: "white".to_owned(),
                     rating: Some(Rating::try_from(1500).unwrap()),
                 },
-                black: OwnedPlayerRow {
+                black: GamePlayer {
                     title: None,
                     name: "black".to_owned(),
                     rating: None,
@@ -405,9 +404,13 @@ mod tests {
     #[test]
     fn test_rows_match_generic_reader() {
         let mut columns = GameColumns::default();
-        columns.push(game(b"abcdefgh", Some("GM"), Some(Speed::Blitz)));
-        columns.push(game(b"12345678", None, None));
-        columns.push(game(b"ABCDEFGH", Some("FM"), Some(Speed::Classical)));
+        for (game_id, title, speed) in [
+            ("abcdefgh", Some("GM"), Some(Speed::Blitz)),
+            ("12345678", None, None),
+            ("ABCDEFGH", Some("FM"), Some(Speed::Classical)),
+        ] {
+            columns.push(game_id.parse().unwrap(), game(title, speed));
+        }
 
         let mut file = Vec::new();
         let mut writer = SerializedFileWriter::new(

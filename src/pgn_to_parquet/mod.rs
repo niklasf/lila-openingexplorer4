@@ -290,10 +290,10 @@ fn encode_chunk(
             continue;
         }
 
-        match game.into_row() {
-            Ok(row) => {
-                game_ids.push(row.game_id);
-                columns.push(row);
+        match game.into_game() {
+            Ok((game_id, game)) => {
+                game_ids.push(game_id);
+                columns.push(game_id, game);
                 stats.games += 1;
             }
             Err(err) => {

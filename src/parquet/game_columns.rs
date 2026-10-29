@@ -17,28 +17,11 @@ use shakmaty::{
 
 use crate::{
     packed::{
-        GameId, LaxDate, Month, PackedMoves, Rating, RatingMode, Speed, initial_position,
-        outcome_bits, pack_bytes, pack_speed_and_rating_mode, pack_string,
+        GameId, GamePlayer, LaxDate, LichessGame, Month, Rating, RatingMode, Speed,
+        initial_position, outcome_bits, pack_bytes, pack_speed_and_rating_mode, pack_string,
     },
     parquet::{OptionalColumn, RequiredColumn},
 };
-
-pub struct OwnedGameRow {
-    pub game_id: GameId,
-    pub players: ByColor<OwnedPlayerRow>,
-    pub date: LaxDate,
-    pub outcome: KnownOutcome,
-    pub speed: Option<Speed>,
-    pub rating_mode: RatingMode,
-    pub setup: Option<PackedSetup>,
-    pub moves: PackedMoves,
-}
-
-pub struct OwnedPlayerRow {
-    pub title: Option<String>,
-    pub name: String,
-    pub rating: Option<Rating>,
-}
 
 #[derive(Default)]
 pub struct PlayerColumns {
@@ -66,7 +49,7 @@ impl PlayerColumns {
         self.rating.append(&mut other.rating);
     }
 
-    pub fn push(&mut self, player: OwnedPlayerRow) {
+    pub fn push(&mut self, player: GamePlayer) {
         self.title.push(
             player
                 .title
@@ -297,9 +280,9 @@ impl GameColumns {
         })
     }
 
-    pub fn push(&mut self, game: OwnedGameRow) {
+    pub fn push(&mut self, game_id: GameId, game: LichessGame) {
         self.game_id
-            .push(FixedLenByteArray::from(game.game_id.to_bytes().to_vec()));
+            .push(FixedLenByteArray::from(game_id.to_bytes().to_vec()));
 
         self.players.white.push(game.players.white);
         self.players.black.push(game.players.black);
@@ -494,7 +477,6 @@ mod tests {
     use arbtest::arbtest;
 
     use super::*;
-    use crate::packed::LichessGame;
 
     #[test]
     fn test_pack_lichess_game_matches_pack_entire() {
@@ -502,35 +484,13 @@ mod tests {
             let game_id: GameId = u.arbitrary()?;
             let game: LichessGame = u.arbitrary()?;
 
-            let row = OwnedGameRow {
-                game_id,
-                players: ByColor {
-                    white: OwnedPlayerRow {
-                        title: game.players.white.title.clone(),
-                        name: game.players.white.name.clone(),
-                        rating: game.players.white.rating,
-                    },
-                    black: OwnedPlayerRow {
-                        title: game.players.black.title.clone(),
-                        name: game.players.black.name.clone(),
-                        rating: game.players.black.rating,
-                    },
-                },
-                date: game.date.clone(),
-                outcome: game.outcome,
-                speed: game.speed,
-                rating_mode: game.rating_mode,
-                setup: game.setup.clone(),
-                moves: game.moves.clone(),
-            };
-
-            let mut columns = GameColumns::default();
-            columns.push(row);
-            let row = columns.rows().next().expect("row");
-            assert_eq!(row.game_id, game_id);
-
             let mut expected = Vec::new();
             game.pack_entire(&mut expected);
+
+            let mut columns = GameColumns::default();
+            columns.push(game_id, game);
+            let row = columns.rows().next().expect("row");
+            assert_eq!(row.game_id, game_id);
 
             let mut actual = Vec::new();
             row.pack_lichess_game(&mut actual);
