@@ -5,7 +5,9 @@ mod optional_column;
 mod positional_file;
 mod required_column;
 
-pub use game_columns::{GameColumns, GameRow, InvalidGameRow, PlayerRow, PreparedGame};
+pub use game_columns::{
+    GameColumns, GameRow, InvalidGameRow, OwnedGameRow, OwnedPlayerRow, PlayerRow, PreparedGame,
+};
 pub use game_reader::{GameBatch, GameReader, RowGroupBytes};
 pub use input::{Input, PrefetchTimes, Prefetcher};
 pub use optional_column::OptionalColumn;

@@ -33,7 +33,7 @@ use parquet::{
     },
     schema::types::ColumnPath,
 };
-pub use pgn::{FlatGame, FlatPlayer, GameVisitor};
+pub use pgn::GameVisitor;
 use pgn_reader::Reader as PgnReader;
 
 use crate::{packed::GameId, parquet::GameColumns};
@@ -283,10 +283,10 @@ fn encode_chunk(
             continue;
         }
 
-        match FlatGame::flatten(game) {
-            Ok(flat) => {
-                game_ids.push(flat.game_id);
-                columns.push(flat);
+        match game.into_row() {
+            Ok(row) => {
+                game_ids.push(row.game_id);
+                columns.push(row);
                 stats.games += 1;
             }
             Err(err) => {

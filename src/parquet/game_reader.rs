@@ -323,7 +323,7 @@ impl<'a> BatchColumns<'a> {
                 white: self.players.white.get(i),
                 black: self.players.black.get(i),
             },
-            date_year: optional_int(self.date_year, i),
+            date_year: self.date_year.value(i),
             date_month: optional_int(self.date_month, i),
             date_day: optional_int(self.date_day, i),
             outcome: self.outcome.get(i).expect("required outcome"),
@@ -359,26 +359,25 @@ mod tests {
     use super::*;
     use crate::{
         packed::{LaxDate, PackedMoves, Rating, RatingMode, Speed},
-        parquet::GameColumns,
-        pgn_to_parquet::{FlatGame, FlatPlayer},
+        parquet::{GameColumns, OwnedGameRow, OwnedPlayerRow},
     };
 
-    fn game(game_id: &[u8], title: Option<&str>, speed: Option<Speed>) -> FlatGame {
-        FlatGame {
+    fn game(game_id: &[u8], title: Option<&str>, speed: Option<Speed>) -> OwnedGameRow {
+        OwnedGameRow {
             game_id: GameId::from_ascii(game_id).unwrap(),
             players: ByColor {
-                white: FlatPlayer {
+                white: OwnedPlayerRow {
                     title: title.map(str::to_owned),
                     name: "white".to_owned(),
                     rating: Some(Rating::try_from(1500).unwrap()),
                 },
-                black: FlatPlayer {
+                black: OwnedPlayerRow {
                     title: None,
                     name: "black".to_owned(),
                     rating: None,
                 },
             },
-            date: Some(LaxDate::from_ymd(2020, Some(1), None).unwrap()),
+            date: LaxDate::from_ymd(2020, Some(1), None).unwrap(),
             outcome: Outcome::Unknown,
             speed,
             rating_mode: RatingMode::Rated,

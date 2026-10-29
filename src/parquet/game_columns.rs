@@ -18,12 +18,28 @@ use thiserror::Error;
 
 use crate::{
     packed::{
-        GameId, LaxDate, Month, Rating, RatingMode, Speed, initial_position, outcome_bits,
-        pack_bytes, pack_speed_and_rating_mode,
+        GameId, LaxDate, Month, PackedMoves, Rating, RatingMode, Speed, initial_position,
+        outcome_bits, pack_bytes, pack_speed_and_rating_mode,
     },
     parquet::{OptionalColumn, RequiredColumn},
-    pgn_to_parquet::{FlatGame, FlatPlayer},
 };
+
+pub struct OwnedGameRow {
+    pub game_id: GameId,
+    pub players: ByColor<OwnedPlayerRow>,
+    pub date: LaxDate,
+    pub outcome: Outcome,
+    pub speed: Option<Speed>,
+    pub rating_mode: RatingMode,
+    pub setup: Option<PackedSetup>,
+    pub moves: PackedMoves,
+}
+
+pub struct OwnedPlayerRow {
+    pub title: Option<String>,
+    pub name: String,
+    pub rating: Option<Rating>,
+}
 
 #[derive(Default)]
 pub struct PlayerColumns {
@@ -51,7 +67,7 @@ impl PlayerColumns {
         self.rating.append(&mut other.rating);
     }
 
-    pub fn push(&mut self, player: FlatPlayer) {
+    pub fn push(&mut self, player: OwnedPlayerRow) {
         self.title.push(
             player
                 .title
@@ -117,7 +133,7 @@ pub struct PlayerRow<'a> {
 pub struct GameRow<'a> {
     pub game_id: GameId,
     pub players: ByColor<PlayerRow<'a>>,
-    pub date_year: Option<i32>,
+    pub date_year: i32,
     pub date_month: Option<i32>,
     pub date_day: Option<i32>,
     pub outcome: &'a [u8],
@@ -160,7 +176,7 @@ impl<'a> GameRow<'a> {
     }
 
     pub fn month(&self) -> Result<Month, InvalidGameRow> {
-        let year = self.date_year.ok_or(InvalidGameRow::MissingDate)?;
+        let year = self.date_year;
         let month = self.date_month.ok_or(InvalidGameRow::MissingDate)?;
         Month::from_year_and_month(
             u16::try_from(year).map_err(|_| InvalidGameRow::InvalidDate)?,
@@ -205,8 +221,7 @@ impl<'a> GameRow<'a> {
                 .map(|player| (player.title.unwrap_or(b""), player.name)),
             ratings: self.ratings()?,
             date: LaxDate::from_ymd(
-                u32::try_from(self.date_year.ok_or(InvalidGameRow::MissingDate)?)
-                    .map_err(|_| InvalidGameRow::InvalidDate)?,
+                u32::try_from(self.date_year).map_err(|_| InvalidGameRow::InvalidDate)?,
                 optional_u8(self.date_month)?,
                 optional_u8(self.date_day)?,
             )
@@ -264,7 +279,7 @@ fn optional_u8(n: Option<i32>) -> Result<Option<u8>, InvalidGameRow> {
 pub struct GameColumns {
     game_id: RequiredColumn<FixedLenByteArrayType>, // 0
     players: ByColor<PlayerColumns>,                // 1,2,3 / 4,5,6
-    date_year: OptionalColumn<Int32Type>,           // 7
+    date_year: RequiredColumn<Int32Type>,           // 7
     date_month: OptionalColumn<Int32Type>,          // 8
     date_day: OptionalColumn<Int32Type>,            // 9
     outcome: RequiredColumn<ByteArrayType>,         // 10
@@ -344,7 +359,7 @@ impl GameColumns {
                     white: white.next().expect("white"),
                     black: black.next().expect("black"),
                 },
-                date_year: date_year.next().expect("date_year").copied(),
+                date_year: *date_year.next().expect("date_year"),
                 date_month: date_month.next().expect("date_month").copied(),
                 date_day: date_day.next().expect("date_day").copied(),
                 outcome: outcome.next().expect("outcome").data(),
@@ -356,19 +371,16 @@ impl GameColumns {
         })
     }
 
-    pub fn push(&mut self, game: FlatGame) {
+    pub fn push(&mut self, game: OwnedGameRow) {
         self.game_id
             .push(FixedLenByteArray::from(game.game_id.to_bytes().to_vec()));
 
         self.players.white.push(game.players.white);
         self.players.black.push(game.players.black);
 
-        self.date_year
-            .push(game.date.as_ref().map(|d| d.year() as i32));
-        self.date_month
-            .push(game.date.as_ref().and_then(|d| d.month()).map(i32::from));
-        self.date_day
-            .push(game.date.as_ref().and_then(|d| d.day()).map(i32::from));
+        self.date_year.push(game.date.year() as i32);
+        self.date_month.push(game.date.month().map(i32::from));
+        self.date_day.push(game.date.day().map(i32::from));
 
         self.outcome.push(ByteArray::from(Bytes::from_static(
             game.outcome.as_str().as_bytes(),
@@ -473,7 +485,7 @@ impl GameColumns {
                     string("black_title", Repetition::OPTIONAL),
                     string("black_name", Repetition::REQUIRED),
                     int32("black_rating", Repetition::OPTIONAL),
-                    int32("date_year", Repetition::OPTIONAL),
+                    int32("date_year", Repetition::REQUIRED),
                     int32("date_month", Repetition::OPTIONAL),
                     int32("date_day", Repetition::OPTIONAL),
                     string("outcome", Repetition::REQUIRED),
@@ -564,21 +576,21 @@ mod tests {
             let game_id: GameId = u.arbitrary()?;
             let game: LichessGame = u.arbitrary()?;
 
-            let flat = FlatGame {
+            let row = OwnedGameRow {
                 game_id,
                 players: ByColor {
-                    white: FlatPlayer {
+                    white: OwnedPlayerRow {
                         title: game.players.white.title.clone(),
                         name: game.players.white.name.clone(),
                         rating: Some(game.players.white.rating),
                     },
-                    black: FlatPlayer {
+                    black: OwnedPlayerRow {
                         title: game.players.black.title.clone(),
                         name: game.players.black.name.clone(),
                         rating: Some(game.players.black.rating),
                     },
                 },
-                date: Some(game.date.clone()),
+                date: game.date.clone(),
                 outcome: game.outcome,
                 speed: Some(game.speed),
                 rating_mode: game.rating_mode,
@@ -587,7 +599,7 @@ mod tests {
             };
 
             let mut columns = GameColumns::default();
-            columns.push(flat);
+            columns.push(row);
             let row = columns.rows().next().expect("row");
             assert_eq!(row.game_id, game_id);
 

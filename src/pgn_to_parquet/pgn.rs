@@ -9,7 +9,10 @@ use shakmaty::{
     variant::{Variant, VariantPosition},
 };
 
-use crate::packed::{GameId, LaxDate, PackedMoves, Rating, RatingMode, Speed};
+use crate::{
+    packed::{GameId, LaxDate, PackedMoves, Rating, RatingMode, Speed},
+    parquet::{OwnedGameRow, OwnedPlayerRow},
+};
 
 pub struct GameVisitor;
 
@@ -225,36 +228,17 @@ impl ParsedGame {
 
         Ok((pos, setup))
     }
-}
 
-pub struct FlatPlayer {
-    pub title: Option<String>,
-    pub name: String,
-    pub rating: Option<Rating>,
-}
-
-pub struct FlatGame {
-    pub game_id: GameId,
-    pub players: ByColor<FlatPlayer>,
-    pub date: Option<LaxDate>,
-    pub outcome: Outcome,
-    pub speed: Option<Speed>,
-    pub rating_mode: RatingMode,
-    pub setup: Option<PackedSetup>,
-    pub moves: PackedMoves,
-}
-
-impl FlatGame {
-    pub fn flatten(parsed: ParsedGame) -> io::Result<FlatGame> {
-        let game_id = parsed
+    pub fn into_row(self) -> io::Result<OwnedGameRow> {
+        let game_id = self
             .game_id
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing game id"))?;
 
-        let (mut pos, setup) = parsed.initial_position()?;
+        let (mut pos, setup) = self.initial_position()?;
 
-        let mut encoder = PackedMoves::encoder_with_capacity(parsed.moves.len());
+        let mut encoder = PackedMoves::encoder_with_capacity(self.moves.len());
 
-        for san in &parsed.moves {
+        for san in &self.moves {
             let m = san.to_move(&pos).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -268,33 +252,38 @@ impl FlatGame {
 
         let moves = encoder.finish();
 
-        Ok(FlatGame {
+        Ok(OwnedGameRow {
             game_id,
             players: ByColor {
-                white: FlatPlayer {
-                    title: parsed.white_title,
-                    name: parsed.white.ok_or_else(|| {
+                white: OwnedPlayerRow {
+                    title: self.white_title,
+                    name: self.white.ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("missing white name @ {:?}", game_id),
                         )
                     })?,
-                    rating: parsed.white_elo,
+                    rating: self.white_elo,
                 },
-                black: FlatPlayer {
-                    title: parsed.black_title,
-                    name: parsed.black.ok_or_else(|| {
+                black: OwnedPlayerRow {
+                    title: self.black_title,
+                    name: self.black.ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("missing black name @ {:?}", game_id),
                         )
                     })?,
-                    rating: parsed.black_elo,
+                    rating: self.black_elo,
                 },
             },
-            date: parsed.date,
-            outcome: parsed.outcome.unwrap_or(Outcome::Unknown),
-            speed: parsed.speed,
+            date: self.date.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing date @ {:?}", game_id),
+                )
+            })?,
+            outcome: self.outcome.unwrap_or(Outcome::Unknown),
+            speed: self.speed,
             rating_mode: RatingMode::Rated, // always rated for monthly export
             setup,
             moves,
