@@ -17,10 +17,10 @@ use parquet::{
         reader::{ChunkReader, Length},
     },
 };
-use shakmaty::ByColor;
+use shakmaty::{ByColor, Outcome, packed::PackedSetup};
 
 use crate::{
-    packed::GameId,
+    packed::{GameId, LaxDate, Rating, RatingMode, Speed},
     parquet::{GameRow, PlayerRow},
 };
 
@@ -237,29 +237,36 @@ impl GameBatch {
     }
 }
 
-struct DictionaryColumn<'a> {
+/// A dictionary encoded column, with the dictionary decoded once per batch.
+struct DictionaryColumn<'a, T> {
     keys: &'a Int32Array,
-    values: &'a StringArray,
+    values: Vec<T>,
 }
 
-impl<'a> DictionaryColumn<'a> {
-    fn new(array: &'a DictionaryArray<Int32Type>) -> DictionaryColumn<'a> {
+impl<'a, T: Copy> DictionaryColumn<'a, T> {
+    fn new(batch: &'a RecordBatch, name: &str, decode: impl Fn(&'a str) -> T) -> Self {
+        let array: &DictionaryArray<Int32Type> = column(batch, name).as_dictionary();
         DictionaryColumn {
             keys: array.keys(),
-            values: array.values().as_string(),
+            values: array
+                .values()
+                .as_string::<i32>()
+                .iter()
+                .map(|value| decode(value.expect("dictionary value")))
+                .collect(),
         }
     }
 
     #[inline]
-    fn get(&self, i: usize) -> Option<&'a [u8]> {
+    fn get(&self, i: usize) -> Option<T> {
         self.keys
             .is_valid(i)
-            .then(|| self.values.value(self.keys.value(i) as usize).as_bytes())
+            .then(|| self.values[self.keys.value(i) as usize])
     }
 }
 
 struct PlayerColumns<'a> {
-    title: DictionaryColumn<'a>,
+    title: DictionaryColumn<'a, &'a str>,
     name: &'a StringArray,
     rating: &'a Int32Array,
 }
@@ -267,7 +274,7 @@ struct PlayerColumns<'a> {
 impl<'a> PlayerColumns<'a> {
     fn new(batch: &'a RecordBatch, color: &str) -> PlayerColumns<'a> {
         PlayerColumns {
-            title: dictionary_column(batch, &format!("{color}_title")),
+            title: DictionaryColumn::new(batch, &format!("{color}_title"), |title| title),
             name: column(batch, &format!("{color}_name")).as_string(),
             rating: column(batch, &format!("{color}_rating")).as_primitive(),
         }
@@ -277,8 +284,9 @@ impl<'a> PlayerColumns<'a> {
     fn get(&self, i: usize) -> PlayerRow<'a> {
         PlayerRow {
             title: self.title.get(i),
-            name: self.name.value(i).as_bytes(),
-            rating: optional_int(self.rating, i),
+            name: self.name.value(i),
+            rating: optional_int(self.rating, i)
+                .map(|rating| Rating::try_from(rating).expect("valid rating")),
         }
     }
 }
@@ -289,9 +297,9 @@ struct BatchColumns<'a> {
     date_year: &'a Int32Array,
     date_month: &'a Int32Array,
     date_day: &'a Int32Array,
-    outcome: DictionaryColumn<'a>,
-    speed: DictionaryColumn<'a>,
-    rating_mode: DictionaryColumn<'a>,
+    outcome: DictionaryColumn<'a, Outcome>,
+    speed: DictionaryColumn<'a, Speed>,
+    rating_mode: DictionaryColumn<'a, RatingMode>,
     setup: &'a BinaryArray,
     moves: &'a BinaryArray,
 }
@@ -307,9 +315,15 @@ impl<'a> BatchColumns<'a> {
             date_year: column(batch, "date_year").as_primitive(),
             date_month: column(batch, "date_month").as_primitive(),
             date_day: column(batch, "date_day").as_primitive(),
-            outcome: dictionary_column(batch, "outcome"),
-            speed: dictionary_column(batch, "speed"),
-            rating_mode: dictionary_column(batch, "rating_mode"),
+            outcome: DictionaryColumn::new(batch, "outcome", |s| {
+                Outcome::from_ascii(s.as_bytes()).expect("valid outcome")
+            }),
+            speed: DictionaryColumn::new(batch, "speed", |s| {
+                Speed::from_ascii(s.as_bytes()).expect("valid speed")
+            }),
+            rating_mode: DictionaryColumn::new(batch, "rating_mode", |s| {
+                RatingMode::from_ascii(s.as_bytes()).expect("valid rating mode")
+            }),
             setup: column(batch, "setup").as_binary(),
             moves: column(batch, "moves").as_binary(),
         }
@@ -323,13 +337,19 @@ impl<'a> BatchColumns<'a> {
                 white: self.players.white.get(i),
                 black: self.players.black.get(i),
             },
-            date_year: self.date_year.value(i),
-            date_month: optional_int(self.date_month, i),
-            date_day: optional_int(self.date_day, i),
+            date: LaxDate::from_ymd(
+                u32::try_from(self.date_year.value(i)).expect("valid year"),
+                optional_int(self.date_month, i)
+                    .map(|month| u8::try_from(month).expect("valid month")),
+                optional_int(self.date_day, i).map(|day| u8::try_from(day).expect("valid day")),
+            )
+            .expect("valid date"),
             outcome: self.outcome.get(i).expect("required outcome"),
             speed: self.speed.get(i),
             rating_mode: self.rating_mode.get(i).expect("required rating_mode"),
-            setup: self.setup.is_valid(i).then(|| self.setup.value(i)),
+            // Empty setups are treated like missing setups.
+            setup: (self.setup.is_valid(i) && !self.setup.value(i).is_empty())
+                .then(|| PackedSetup::try_from_bytes(self.setup.value(i)).expect("valid setup")),
             moves: self.moves.value(i),
         }
     }
@@ -340,10 +360,6 @@ fn column<'a>(batch: &'a RecordBatch, name: &str) -> &'a dyn Array {
         .column_by_name(name)
         .unwrap_or_else(|| panic!("column {name}"))
         .as_ref()
-}
-
-fn dictionary_column<'a>(batch: &'a RecordBatch, name: &str) -> DictionaryColumn<'a> {
-    DictionaryColumn::new(column(batch, name).as_dictionary())
 }
 
 #[inline]
@@ -411,8 +427,8 @@ mod tests {
 
         let pack = |row: GameRow<'_>| {
             let mut buf = row.game_id.to_bytes().to_vec();
-            buf.extend(row.players.white.title.unwrap_or(b"-"));
-            buf.extend(row.speed.unwrap_or(b"-"));
+            buf.extend(row.players.white.title.unwrap_or("-").as_bytes());
+            buf.extend(row.speed.map_or("-", Speed::as_str).as_bytes());
             row.pack_lichess_game(&mut buf).map(|()| buf)
         };
         let expected: Vec<_> = columns.rows().map(pack).collect();

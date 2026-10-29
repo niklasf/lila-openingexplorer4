@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::{
     packed::{
         GameId, LaxDate, Month, PackedMoves, Rating, RatingMode, Speed, initial_position,
-        outcome_bits, pack_bytes, pack_speed_and_rating_mode,
+        outcome_bits, pack_bytes, pack_speed_and_rating_mode, pack_string,
     },
     parquet::{OptionalColumn, RequiredColumn},
 };
@@ -116,122 +116,82 @@ impl PlayerColumns {
         let mut rating = self.rating.iter();
         iter::from_fn(move || {
             Some(PlayerRow {
-                name: name.next()?.data(),
-                title: title.next().expect("title").map(ByteArray::data),
-                rating: rating.next().expect("rating").copied(),
+                name: str::from_utf8(name.next()?.data()).expect("valid utf-8"),
+                title: title
+                    .next()
+                    .expect("title")
+                    .map(|title| str::from_utf8(title.data()).expect("valid utf-8")),
+                rating: rating
+                    .next()
+                    .expect("rating")
+                    .copied()
+                    .map(|rating| Rating::try_from(rating).expect("valid rating")),
             })
         })
     }
 }
 
+#[derive(Copy, Clone)]
 pub struct PlayerRow<'a> {
-    pub title: Option<&'a [u8]>,
-    pub name: &'a [u8],
-    pub rating: Option<i32>,
+    pub title: Option<&'a str>,
+    pub name: &'a str,
+    pub rating: Option<Rating>,
 }
 
 pub struct GameRow<'a> {
     pub game_id: GameId,
     pub players: ByColor<PlayerRow<'a>>,
-    pub date_year: i32,
-    pub date_month: Option<i32>,
-    pub date_day: Option<i32>,
-    pub outcome: &'a [u8],
-    pub speed: Option<&'a [u8]>,
-    pub rating_mode: &'a [u8],
-    pub setup: Option<&'a [u8]>,
+    pub date: LaxDate,
+    pub outcome: Outcome,
+    pub speed: Option<Speed>,
+    pub rating_mode: RatingMode,
+    pub setup: Option<PackedSetup>,
     pub moves: &'a [u8],
 }
 
+/// Reasons to exclude a game of the parquet file from the SST files.
 #[derive(Debug, Error, Copy, Clone, PartialEq, Eq)]
 pub enum InvalidGameRow {
     #[error("missing rating")]
     MissingRating,
-    #[error("invalid rating")]
-    InvalidRating,
-    #[error("missing date")]
-    MissingDate,
-    #[error("invalid date")]
-    InvalidDate,
-    #[error("invalid outcome")]
-    InvalidOutcome,
     #[error("missing speed")]
     MissingSpeed,
-    #[error("invalid speed")]
-    InvalidSpeed,
-    #[error("invalid rating mode")]
-    InvalidRatingMode,
+    #[error("missing month")]
+    MissingMonth,
     #[error("unknown outcome")]
     UnknownOutcome,
-    #[error("invalid setup")]
-    InvalidSetup,
 }
 
-impl<'a> GameRow<'a> {
-    pub fn ratings(&self) -> Result<ByColor<Rating>, InvalidGameRow> {
-        self.players.as_ref().try_map(|player| {
-            Rating::try_from(player.rating.ok_or(InvalidGameRow::MissingRating)?)
-                .map_err(|_| InvalidGameRow::InvalidRating)
-        })
-    }
-
+impl GameRow<'_> {
+    /// The month of the game, required for positions.
     pub fn month(&self) -> Result<Month, InvalidGameRow> {
-        let year = self.date_year;
-        let month = self.date_month.ok_or(InvalidGameRow::MissingDate)?;
-        Month::from_year_and_month(
-            u16::try_from(year).map_err(|_| InvalidGameRow::InvalidDate)?,
-            u16::try_from(month).map_err(|_| InvalidGameRow::InvalidDate)?,
-        )
-        .map_err(|_| InvalidGameRow::InvalidDate)
+        self.date
+            .month()
+            .map(|_| self.date.earliest_month())
+            .ok_or(InvalidGameRow::MissingMonth)
     }
 
-    pub fn outcome(&self) -> Result<Outcome, InvalidGameRow> {
-        Outcome::from_ascii(self.outcome).map_err(|_| InvalidGameRow::InvalidOutcome)
-    }
-
+    /// The outcome of the game, required to be known for positions.
     pub fn known_outcome(&self) -> Result<KnownOutcome, InvalidGameRow> {
-        match self.outcome()? {
+        match self.outcome {
             Outcome::Known(outcome) => Ok(outcome),
             Outcome::Unknown => Err(InvalidGameRow::UnknownOutcome),
         }
     }
 
-    pub fn speed(&self) -> Result<Speed, InvalidGameRow> {
-        Speed::from_ascii(self.speed.ok_or(InvalidGameRow::MissingSpeed)?)
-            .map_err(|_| InvalidGameRow::InvalidSpeed)
+    pub fn initial_position(&self) -> VariantPosition {
+        initial_position(self.setup.as_ref()).expect("valid setup")
     }
 
-    fn initial_setup(&self) -> Result<Option<PackedSetup>, InvalidGameRow> {
-        self.setup
-            .filter(|bytes| !bytes.is_empty())
-            .map(PackedSetup::try_from_bytes)
-            .transpose()
-            .map_err(|_| InvalidGameRow::InvalidSetup)
-    }
-
-    pub fn initial_position(&self) -> Result<VariantPosition, InvalidGameRow> {
-        initial_position(self.initial_setup()?.as_ref()).map_err(|_| InvalidGameRow::InvalidSetup)
-    }
-
-    pub fn prepare(&self) -> Result<PreparedGame<'a>, InvalidGameRow> {
+    /// Checks that the game can be stored in the games SST files.
+    pub fn prepare(&self) -> Result<PreparedGame<'_>, InvalidGameRow> {
         Ok(PreparedGame {
-            players: self
+            row: self,
+            ratings: self
                 .players
                 .as_ref()
-                .map(|player| (player.title.unwrap_or(b""), player.name)),
-            ratings: self.ratings()?,
-            date: LaxDate::from_ymd(
-                u32::try_from(self.date_year).map_err(|_| InvalidGameRow::InvalidDate)?,
-                optional_u8(self.date_month)?,
-                optional_u8(self.date_day)?,
-            )
-            .map_err(|_| InvalidGameRow::InvalidDate)?,
-            outcome: self.outcome()?,
-            speed: self.speed()?,
-            rating_mode: RatingMode::from_ascii(self.rating_mode)
-                .map_err(|_| InvalidGameRow::InvalidRatingMode)?,
-            setup: self.setup.unwrap_or(b""),
-            moves: self.moves,
+                .try_map(|player| player.rating.ok_or(InvalidGameRow::MissingRating))?,
+            speed: self.speed.ok_or(InvalidGameRow::MissingSpeed)?,
         })
     }
 
@@ -241,38 +201,39 @@ impl<'a> GameRow<'a> {
     }
 }
 
+/// A game that can be stored in the games SST files.
 pub struct PreparedGame<'a> {
-    /// Title and name of each player.
-    players: ByColor<(&'a [u8], &'a [u8])>,
+    row: &'a GameRow<'a>,
     ratings: ByColor<Rating>,
-    date: LaxDate,
-    outcome: Outcome,
     speed: Speed,
-    rating_mode: RatingMode,
-    setup: &'a [u8],
-    moves: &'a [u8],
 }
 
 impl PreparedGame<'_> {
+    pub fn ratings(&self) -> ByColor<Rating> {
+        self.ratings
+    }
+
+    pub fn speed(&self) -> Speed {
+        self.speed
+    }
+
     /// Packs the game like `LichessGame::pack_entire`.
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         for color in Color::ALL {
-            let &(title, name) = self.players.get(color);
-            pack_bytes(buf, title);
-            pack_bytes(buf, name);
+            let player = self.row.players.get(color);
+            pack_string(buf, player.title.unwrap_or(""));
+            pack_string(buf, player.name);
             self.ratings.get(color).pack(buf);
         }
-        self.date.pack(buf);
-        buf.put_u8(outcome_bits(self.outcome));
-        pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
-        pack_bytes(buf, self.setup);
-        buf.put_slice(self.moves);
+        self.row.date.pack(buf);
+        buf.put_u8(outcome_bits(self.row.outcome));
+        pack_speed_and_rating_mode(buf, self.speed, self.row.rating_mode);
+        pack_bytes(
+            buf,
+            self.row.setup.as_ref().map_or(b"", PackedSetup::as_bytes),
+        );
+        buf.put_slice(self.row.moves);
     }
-}
-
-fn optional_u8(n: Option<i32>) -> Result<Option<u8>, InvalidGameRow> {
-    n.map(|n| u8::try_from(n).map_err(|_| InvalidGameRow::InvalidDate))
-        .transpose()
 }
 
 #[derive(Default)]
@@ -359,13 +320,35 @@ impl GameColumns {
                     white: white.next().expect("white"),
                     black: black.next().expect("black"),
                 },
-                date_year: *date_year.next().expect("date_year"),
-                date_month: date_month.next().expect("date_month").copied(),
-                date_day: date_day.next().expect("date_day").copied(),
-                outcome: outcome.next().expect("outcome").data(),
-                speed: speed.next().expect("speed").map(ByteArray::data),
-                rating_mode: rating_mode.next().expect("rating_mode").data(),
-                setup: setup.next().expect("setup").map(ByteArray::data),
+                date: LaxDate::from_ymd(
+                    u32::try_from(*date_year.next().expect("date_year")).expect("valid year"),
+                    date_month
+                        .next()
+                        .expect("date_month")
+                        .map(|&month| u8::try_from(month).expect("valid month")),
+                    date_day
+                        .next()
+                        .expect("date_day")
+                        .map(|&day| u8::try_from(day).expect("valid day")),
+                )
+                .expect("valid date"),
+                outcome: Outcome::from_ascii(outcome.next().expect("outcome").data())
+                    .expect("valid outcome"),
+                speed: speed
+                    .next()
+                    .expect("speed")
+                    .map(|speed| Speed::from_ascii(speed.data()).expect("valid speed")),
+                rating_mode: RatingMode::from_ascii(
+                    rating_mode.next().expect("rating_mode").data(),
+                )
+                .expect("valid rating mode"),
+                // Empty setups are treated like missing setups.
+                setup: setup
+                    .next()
+                    .expect("setup")
+                    .map(ByteArray::data)
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(|bytes| PackedSetup::try_from_bytes(bytes).expect("valid setup")),
                 moves: moves.next().expect("moves").data(),
             })
         })

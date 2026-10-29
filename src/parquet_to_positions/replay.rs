@@ -5,21 +5,12 @@ use shakmaty::{
     variant::{Variant, VariantPosition, WithPositionMut},
     zobrist::Zobrist128,
 };
-use thiserror::Error;
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::{GameId, InvalidPackedMoves, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
-    parquet::{GameRow, InvalidGameRow, PreparedGame},
+    packed::{GameId, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
+    parquet::{GameRow, InvalidGameRow},
 };
-
-#[derive(Debug, Error)]
-pub enum InvalidGame {
-    #[error("{0}")]
-    Row(#[from] InvalidGameRow),
-    #[error("{0}")]
-    Moves(#[from] InvalidPackedMoves),
-}
 
 /// A position reached in a game, and the move that was eventually played
 /// from it.
@@ -73,21 +64,22 @@ impl Replayer {
         &mut self,
         row: &GameRow<'_>,
         seq: GlobalGameSeq,
-    ) -> Result<GameInfo, InvalidGame> {
-        // Index only games that parquet_to_games would store.
-        let _: PreparedGame<'_> = row.prepare()?;
+    ) -> Result<GameInfo, InvalidGameRow> {
+        // Index only games that parquet_to_games stores, and of those only
+        // the games with a month and a known outcome.
+        let prepared = row.prepare()?;
 
-        let pos = row.initial_position()?;
+        let pos = row.initial_position();
         let info = GameInfo {
             game_id: row.game_id,
             seq,
             variant: pos.variant(),
             month: row.month()?,
-            speed: row.speed()?,
-            ratings: row.ratings()?,
+            speed: prepared.speed(),
+            ratings: prepared.ratings(),
             outcome: row.known_outcome()?,
         };
-        self.replay(pos, row.moves)?;
+        self.replay(pos, row.moves);
         Ok(info)
     }
 
@@ -95,7 +87,7 @@ impl Replayer {
     /// that a move was played from is recorded once, with the move that was
     /// played from it last: loops within the game are not counted multiple
     /// times. The final position is not recorded.
-    fn replay(&mut self, mut pos: VariantPosition, moves: &[u8]) -> Result<(), InvalidGame> {
+    fn replay(&mut self, mut pos: VariantPosition, moves: &[u8]) {
         self.visits.clear();
         self.initial_turn = pos.turn();
 
@@ -106,13 +98,13 @@ impl Replayer {
         }
 
         impl WithPositionMut for ReplayGame<'_, '_> {
-            type Output = Result<(), InvalidPackedMoves>;
+            type Output = ();
 
             fn call<P: Position>(mut self, pos: &mut P) -> Self::Output {
                 let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
                 let mut ply = 0;
                 while ply < self.max_ply
-                    && let Some(m) = self.decoder.decode_next(pos)?
+                    && let Some(m) = self.decoder.decode_next(pos).expect("valid moves")
                 {
                     let packed = PackedUciMove::pack(m.to_uci(CastlingMode::Chess960));
                     self.visits
@@ -125,15 +117,14 @@ impl Replayer {
                     pos.play_unchecked(m);
                     hash = updated.unwrap_or_else(|| pos.zobrist_hash(EnPassantMode::Legal));
                 }
-                Ok(())
             }
         }
 
-        Ok(pos.with_position_mut(ReplayGame {
+        pos.with_position_mut(ReplayGame {
             visits: &mut self.visits,
-            decoder: PackedMovesDecoder::new(moves)?,
+            decoder: PackedMovesDecoder::new(moves).expect("valid moves"),
             max_ply: self.max_ply,
-        })?)
+        });
     }
 
     /// Number of positions recorded by the last replay.
@@ -193,7 +184,7 @@ mod tests {
         let moves = encoder.finish();
 
         let mut replayer = Replayer::default();
-        replayer.replay(initial, &moves.0).unwrap();
+        replayer.replay(initial, &moves.0);
         let mut visits: Vec<_> = replayer.visits.into_iter().collect();
         visits.sort_by_key(|(_, visit)| visit.ply);
         visits
