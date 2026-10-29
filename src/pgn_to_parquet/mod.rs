@@ -56,6 +56,7 @@ pub struct Config {
 pub struct Stats {
     pub games: u64,
     pub unplayed: u64,
+    pub unfinished: u64,
     pub duplicates: u64,
     pub invalid: u64,
 }
@@ -64,6 +65,7 @@ impl Stats {
     fn add(&mut self, other: &Stats) {
         self.games += other.games;
         self.unplayed += other.unplayed;
+        self.unfinished += other.unfinished;
         self.duplicates += other.duplicates;
         self.invalid += other.invalid;
     }
@@ -280,6 +282,11 @@ fn encode_chunk(
 
         if game.plies() < 2 {
             stats.unplayed += 1;
+            continue;
+        }
+
+        if game.outcome().is_unknown() {
+            stats.unfinished += 1;
             continue;
         }
 
@@ -603,13 +610,14 @@ pub fn convert(
                     let file = next.0;
                     total.add(&file_stats);
                     let _ = progress.println(format!(
-                            "[{:>8.1?}] {}/{} {}: {} games, {} unplayed, {} duplicates, {} invalid, {:.1?}",
+                            "[{:>8.1?}] {}/{} {}: {} games, {} unplayed, {} unfinished, {} duplicates, {} invalid, {:.1?}",
                             started.elapsed(),
                             file.index() + 1,
                             pgns.len(),
                             pgns[file.index()].display(),
                             file_stats.games,
                             file_stats.unplayed,
+                            file_stats.unfinished,
                             file_stats.duplicates,
                             file_stats.invalid,
                             file_started.elapsed(),

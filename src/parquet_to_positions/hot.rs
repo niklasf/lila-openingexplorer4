@@ -70,9 +70,7 @@ impl Sample {
                         let batch = input.read_games(i).expect("read row group");
                         for row in batch.rows() {
                             rows += 1;
-                            let Ok(info) = replayer.replay_row(&row, seq) else {
-                                continue;
-                            };
+                            let info = replayer.replay_row(&row, seq);
                             months.insert(info.month);
                             records += replayer.len() as u64;
                             for hash in replayer.hashes_before(SAMPLE_PLIES) {

@@ -152,7 +152,7 @@ mod tests {
                     );
                 }
                 let m = PackedUciMove::pack(*u.choose(&moves)?);
-                let speed = *u.choose(&[Speed::Blitz, Speed::Rapid])?;
+                let speed = *u.choose(&[Some(Speed::Blitz), Some(Speed::Rapid), None])?;
                 let rating = Rating::try_from(u.int_in_range(900..=1300)?).unwrap();
                 let outcome: KnownOutcome = u.arbitrary()?;
                 let game_id: GameId = u.arbitrary()?;

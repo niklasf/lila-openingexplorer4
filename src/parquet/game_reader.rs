@@ -17,7 +17,7 @@ use parquet::{
         reader::{ChunkReader, Length},
     },
 };
-use shakmaty::{ByColor, Outcome};
+use shakmaty::{ByColor, KnownOutcome};
 
 use crate::{
     packed::{GameId, LaxDate, Rating, RatingMode, Speed},
@@ -297,7 +297,7 @@ struct BatchColumns<'a> {
     date_year: &'a Int32Array,
     date_month: &'a Int32Array,
     date_day: &'a Int32Array,
-    outcome: DictionaryColumn<'a, Outcome>,
+    outcome: DictionaryColumn<'a, KnownOutcome>,
     speed: DictionaryColumn<'a, Speed>,
     rating_mode: DictionaryColumn<'a, RatingMode>,
     setup: &'a BinaryArray,
@@ -316,7 +316,7 @@ impl<'a> BatchColumns<'a> {
             date_month: column(batch, "date_month").as_primitive(),
             date_day: column(batch, "date_day").as_primitive(),
             outcome: DictionaryColumn::new(batch, "outcome", |s| {
-                Outcome::from_ascii(s.as_bytes()).expect("valid outcome")
+                KnownOutcome::from_ascii(s.as_bytes()).expect("known outcome")
             }),
             speed: DictionaryColumn::new(batch, "speed", |s| {
                 Speed::from_ascii(s.as_bytes()).expect("valid speed")
@@ -370,7 +370,7 @@ fn optional_int(array: &Int32Array, i: usize) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use parquet::file::writer::SerializedFileWriter;
-    use shakmaty::Outcome;
+    use shakmaty::KnownOutcome;
 
     use super::*;
     use crate::{
@@ -394,7 +394,7 @@ mod tests {
                 },
             },
             date: LaxDate::from_ymd(2020, Some(1), None).unwrap(),
-            outcome: Outcome::Unknown,
+            outcome: KnownOutcome::Draw,
             speed,
             rating_mode: RatingMode::Rated,
             setup: None,
@@ -429,7 +429,8 @@ mod tests {
             let mut buf = row.game_id.to_bytes().to_vec();
             buf.extend(row.players.white.title.unwrap_or("-").as_bytes());
             buf.extend(row.speed.map_or("-", Speed::as_str).as_bytes());
-            row.pack_lichess_game(&mut buf).map(|()| buf)
+            row.pack_lichess_game(&mut buf);
+            buf
         };
         let expected: Vec<_> = columns.rows().map(pack).collect();
         let actual: Vec<_> = batch.rows().map(pack).collect();

@@ -194,6 +194,10 @@ impl ParsedGame {
         self.moves.len()
     }
 
+    pub fn outcome(&self) -> Outcome {
+        self.outcome.unwrap_or(Outcome::Unknown)
+    }
+
     fn initial_position(&self) -> io::Result<(VariantPosition, Option<PackedSetup>)> {
         let variant = self.variant.unwrap_or_default();
 
@@ -233,6 +237,13 @@ impl ParsedGame {
         let game_id = self
             .game_id
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing game id"))?;
+
+        let outcome = self.outcome().known().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown outcome @ {:?}", game_id),
+            )
+        })?;
 
         let (mut pos, setup) = self.initial_position()?;
 
@@ -282,7 +293,7 @@ impl ParsedGame {
                     format!("missing date @ {:?}", game_id),
                 )
             })?,
-            outcome: self.outcome.unwrap_or(Outcome::Unknown),
+            outcome,
             speed: self.speed,
             rating_mode: RatingMode::Rated, // always rated for monthly export
             setup,

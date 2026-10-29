@@ -161,8 +161,6 @@ impl Estimate {
 struct Counters {
     /// Valid games (counted in the first pass).
     games: AtomicU64,
-    /// Games that could not be indexed (counted in the first pass).
-    skipped_games: AtomicU64,
     /// Records routed to memory partitions.
     records: AtomicU64,
     hot_records: AtomicU64,
@@ -227,8 +225,6 @@ pub struct Config {
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
     pub games: u64,
-    /// Games that could not be indexed.
-    pub skipped: u64,
     /// Records of all games, including hot records.
     pub records: u64,
     pub hot_positions: usize,
@@ -570,7 +566,6 @@ pub fn convert(
     let hot_records = counters.hot_records.load(Ordering::Relaxed);
     Ok(Stats {
         games: counters.games.load(Ordering::Relaxed),
-        skipped: counters.skipped_games.load(Ordering::Relaxed),
         records: records + hot_records,
         hot_positions: hot_set.len(),
         hot_records,
@@ -693,7 +688,7 @@ fn scatter_pass(
                     .map(|_| Vec::new())
                     .collect();
                 let mut chunks: Vec<Chunk> = (0..scratch_partitions).map(|_| new_chunk()).collect();
-                let (mut games, mut skipped) = (0, 0);
+                let mut games = 0;
                 let (mut records, mut hot_records) = (0, 0);
 
                 while let Some(fetched) = timed(&times.recv, || prefetcher.recv()) {
@@ -705,10 +700,7 @@ fn scatter_pass(
                     let mut sending = Duration::ZERO;
                     for (k, row) in batch.rows().enumerate() {
                         let seq = GlobalGameSeq::new(first_row + k as u64).expect("seq");
-                        let Ok(info) = replayer.replay_row(&row, seq) else {
-                            skipped += 1;
-                            continue;
-                        };
+                        let info = replayer.replay_row(&row, seq);
                         games += 1;
 
                         for entry in replayer.entries(&info) {
@@ -756,7 +748,6 @@ fn scatter_pass(
 
                 if pass == 0 {
                     counters.games.fetch_add(games, Ordering::Relaxed);
-                    counters.skipped_games.fetch_add(skipped, Ordering::Relaxed);
                 }
                 counters.records.fetch_add(records, Ordering::Relaxed);
                 counters

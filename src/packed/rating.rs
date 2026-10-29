@@ -7,13 +7,17 @@ use thiserror::Error;
 
 use crate::packed::{pack_int, unpack_int};
 
-#[derive(Arbitrary, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Arbitrary, Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rating {
     offset: i16,
 }
 
 impl Rating {
     const BASE: i32 = 1500;
+
+    /// Packed in place of the offset of a missing rating. Outside the range
+    /// of offsets.
+    const MISSING: i64 = i16::MAX as i64 + 1;
 
     pub fn offset(self) -> i16 {
         self.offset
@@ -37,6 +41,22 @@ impl Rating {
 
     pub fn unpack_fixed<B: Buf>(buf: &mut B) -> Self {
         Rating::from_offset(buf.get_i16())
+    }
+
+    pub fn pack_optional<B: BufMut>(rating: Option<Rating>, buf: &mut B) {
+        pack_int(
+            buf,
+            rating.map_or(Rating::MISSING, |rating| i64::from(rating.offset)),
+        );
+    }
+
+    pub fn unpack_optional<B: Buf>(buf: &mut B) -> Option<Rating> {
+        match unpack_int(buf) {
+            Rating::MISSING => None,
+            offset => Some(Rating::from_offset(
+                i16::try_from(offset).expect("valid rating"),
+            )),
+        }
     }
 
     pub fn from_ascii(bytes: &[u8]) -> Result<Self, InvalidRating> {

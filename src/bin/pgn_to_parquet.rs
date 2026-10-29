@@ -14,8 +14,8 @@ static ALLOC: Jemalloc = Jemalloc;
 /// Converts PGN files (optionally zstd compressed) to a single parquet file,
 /// with one row per game, in the order of the files and their games.
 ///
-/// Unplayed games (fewer than two plies) and games that cannot be parsed are
-/// skipped.
+/// Unplayed games (fewer than two plies), unfinished games (without a known
+/// outcome), and games that cannot be parsed are skipped.
 ///
 /// Games whose id already appeared among the recent games (at least
 /// the previous 100k, also across consecutive files) are skipped as
@@ -89,7 +89,7 @@ fn main() {
     };
 
     println!(
-        "{} games, {} unplayed skipped, {} duplicates skipped, {} invalid skipped",
-        stats.games, stats.unplayed, stats.duplicates, stats.invalid
+        "{} games, {} unplayed skipped, {} unfinished skipped, {} duplicates skipped, {} invalid skipped",
+        stats.games, stats.unplayed, stats.unfinished, stats.duplicates, stats.invalid
     );
 }

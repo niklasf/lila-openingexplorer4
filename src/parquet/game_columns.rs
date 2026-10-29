@@ -14,7 +14,6 @@ use parquet::{
 use shakmaty::{
     ByColor, Color, KnownOutcome, Outcome, packed::PackedSetup, variant::VariantPosition,
 };
-use thiserror::Error;
 
 use crate::{
     packed::{
@@ -28,7 +27,7 @@ pub struct OwnedGameRow {
     pub game_id: GameId,
     pub players: ByColor<OwnedPlayerRow>,
     pub date: LaxDate,
-    pub outcome: Outcome,
+    pub outcome: KnownOutcome,
     pub speed: Option<Speed>,
     pub rating_mode: RatingMode,
     pub setup: Option<PackedSetup>,
@@ -142,7 +141,7 @@ pub struct GameRow<'a> {
     pub game_id: GameId,
     pub players: ByColor<PlayerRow<'a>>,
     pub date: LaxDate,
-    pub outcome: Outcome,
+    pub outcome: KnownOutcome,
     pub speed: Option<Speed>,
     pub rating_mode: RatingMode,
     /// `PackedSetup`, decoded by `initial_position()`.
@@ -151,34 +150,11 @@ pub struct GameRow<'a> {
     pub moves: &'a [u8],
 }
 
-/// Reasons to exclude a game of the parquet file from the SST files.
-#[derive(Debug, Error, Copy, Clone, PartialEq, Eq)]
-pub enum InvalidGameRow {
-    #[error("missing rating")]
-    MissingRating,
-    #[error("missing speed")]
-    MissingSpeed,
-    #[error("missing month")]
-    MissingMonth,
-    #[error("unknown outcome")]
-    UnknownOutcome,
-}
-
 impl GameRow<'_> {
-    /// The month of the game, required for positions.
-    pub fn month(&self) -> Result<Month, InvalidGameRow> {
-        self.date
-            .month()
-            .map(|_| self.date.earliest_month())
-            .ok_or(InvalidGameRow::MissingMonth)
-    }
-
-    /// The outcome of the game, required to be known for positions.
-    pub fn known_outcome(&self) -> Result<KnownOutcome, InvalidGameRow> {
-        match self.outcome {
-            Outcome::Known(outcome) => Ok(outcome),
-            Outcome::Unknown => Err(InvalidGameRow::UnknownOutcome),
-        }
+    /// The month of the game for statistics: the earliest possible month if
+    /// only the year is known.
+    pub fn month(&self) -> Month {
+        self.date.earliest_month()
     }
 
     pub fn initial_position(&self) -> VariantPosition {
@@ -188,53 +164,19 @@ impl GameRow<'_> {
         initial_position(setup.as_ref()).expect("valid setup")
     }
 
-    /// Checks that the game can be stored in the games SST files.
-    pub fn prepare(&self) -> Result<PreparedGame<'_>, InvalidGameRow> {
-        Ok(PreparedGame {
-            row: self,
-            ratings: self
-                .players
-                .as_ref()
-                .try_map(|player| player.rating.ok_or(InvalidGameRow::MissingRating))?,
-            speed: self.speed.ok_or(InvalidGameRow::MissingSpeed)?,
-        })
-    }
-
-    pub fn pack_lichess_game<B: BufMut>(&self, buf: &mut B) -> Result<(), InvalidGameRow> {
-        self.prepare()?.pack(buf);
-        Ok(())
-    }
-}
-
-/// A game that can be stored in the games SST files.
-pub struct PreparedGame<'a> {
-    row: &'a GameRow<'a>,
-    ratings: ByColor<Rating>,
-    speed: Speed,
-}
-
-impl PreparedGame<'_> {
-    pub fn ratings(&self) -> ByColor<Rating> {
-        self.ratings
-    }
-
-    pub fn speed(&self) -> Speed {
-        self.speed
-    }
-
     /// Packs the game like `LichessGame::pack_entire`.
-    pub fn pack<B: BufMut>(&self, buf: &mut B) {
+    pub fn pack_lichess_game<B: BufMut>(&self, buf: &mut B) {
         for color in Color::ALL {
-            let player = self.row.players.get(color);
+            let player = self.players.get(color);
             pack_string(buf, player.title.unwrap_or(""));
             pack_string(buf, player.name);
-            self.ratings.get(color).pack(buf);
+            Rating::pack_optional(player.rating, buf);
         }
-        self.row.date.pack(buf);
-        buf.put_u8(outcome_bits(self.row.outcome));
-        pack_speed_and_rating_mode(buf, self.speed, self.row.rating_mode);
-        pack_bytes(buf, self.row.setup.unwrap_or(b""));
-        buf.put_slice(self.row.moves);
+        self.date.pack(buf);
+        buf.put_u8(outcome_bits(Outcome::Known(self.outcome)));
+        pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
+        pack_bytes(buf, self.setup.unwrap_or(b""));
+        buf.put_slice(self.moves);
     }
 }
 
@@ -334,8 +276,8 @@ impl GameColumns {
                         .map(|&day| u8::try_from(day).expect("valid day")),
                 )
                 .expect("valid date"),
-                outcome: Outcome::from_ascii(outcome.next().expect("outcome").data())
-                    .expect("valid outcome"),
+                outcome: KnownOutcome::from_ascii(outcome.next().expect("outcome").data())
+                    .expect("known outcome"),
                 speed: speed
                     .next()
                     .expect("speed")
@@ -566,17 +508,17 @@ mod tests {
                     white: OwnedPlayerRow {
                         title: game.players.white.title.clone(),
                         name: game.players.white.name.clone(),
-                        rating: Some(game.players.white.rating),
+                        rating: game.players.white.rating,
                     },
                     black: OwnedPlayerRow {
                         title: game.players.black.title.clone(),
                         name: game.players.black.name.clone(),
-                        rating: Some(game.players.black.rating),
+                        rating: game.players.black.rating,
                     },
                 },
                 date: game.date.clone(),
                 outcome: game.outcome,
-                speed: Some(game.speed),
+                speed: game.speed,
                 rating_mode: game.rating_mode,
                 setup: game.setup.clone(),
                 moves: game.moves.clone(),
@@ -591,7 +533,7 @@ mod tests {
             game.pack_entire(&mut expected);
 
             let mut actual = Vec::new();
-            row.pack_lichess_game(&mut actual).expect("valid row");
+            row.pack_lichess_game(&mut actual);
             assert_eq!(actual, expected);
 
             Ok(())

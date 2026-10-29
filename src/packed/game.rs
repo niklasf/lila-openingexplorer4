@@ -49,21 +49,21 @@ pub fn outcome_from_bits(bits: u8) -> Option<Outcome> {
 pub struct GamePlayer {
     pub title: Option<String>,
     pub name: String,
-    pub rating: Rating,
+    pub rating: Option<Rating>,
 }
 
 impl GamePlayer {
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         pack_string(buf, self.title.as_ref().unwrap_or(&String::new()));
         pack_string(buf, &self.name);
-        self.rating.pack(buf);
+        Rating::pack_optional(self.rating, buf);
     }
 
     pub fn unpack<B: Buf>(buf: &mut B) -> Self {
         GamePlayer {
             title: Some(unpack_string(buf)).filter(|s| !s.is_empty()),
             name: unpack_string(buf),
-            rating: Rating::unpack(buf),
+            rating: Rating::unpack_optional(buf),
         }
     }
 }
@@ -211,13 +211,22 @@ impl RatingMode {
 #[error("invalid rating mode")]
 pub struct InvalidRatingMode;
 
-pub fn pack_speed_and_rating_mode<B: BufMut>(buf: &mut B, speed: Speed, rating_mode: RatingMode) {
-    buf.put_u8(speed.bits() | (rating_mode.bits() << 3));
+/// Packs the speed into the low 3 bits (0 if missing), and the rating mode
+/// into the next bit.
+pub fn pack_speed_and_rating_mode<B: BufMut>(
+    buf: &mut B,
+    speed: Option<Speed>,
+    rating_mode: RatingMode,
+) {
+    buf.put_u8(speed.map_or(0, Speed::bits) | (rating_mode.bits() << 3));
 }
 
-pub fn unpack_speed_and_rating_mode<B: Buf>(buf: &mut B) -> (Speed, RatingMode) {
+pub fn unpack_speed_and_rating_mode<B: Buf>(buf: &mut B) -> (Option<Speed>, RatingMode) {
     let packed = buf.get_u8();
-    let speed = Speed::from_bits(packed & 0b111).expect("valid speed");
+    let speed = match packed & 0b111 {
+        0 => None,
+        bits => Some(Speed::from_bits(bits).expect("valid speed")),
+    };
     let rating_mode = RatingMode::from_bits(packed >> 3).expect("valid rating mode");
     (speed, rating_mode)
 }
@@ -226,8 +235,8 @@ pub fn unpack_speed_and_rating_mode<B: Buf>(buf: &mut B) -> (Speed, RatingMode) 
 pub struct LichessGame {
     pub players: ByColor<GamePlayer>,
     pub date: LaxDate,
-    pub outcome: Outcome,
-    pub speed: Speed,
+    pub outcome: KnownOutcome,
+    pub speed: Option<Speed>,
     pub rating_mode: RatingMode,
     pub setup: Option<PackedSetup>,
     pub moves: PackedMoves,
@@ -242,7 +251,7 @@ impl LichessGame {
         self.players.white.pack(buf);
         self.players.black.pack(buf);
         self.date.pack(buf);
-        buf.put_u8(outcome_bits(self.outcome));
+        buf.put_u8(outcome_bits(Outcome::Known(self.outcome)));
         pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
         pack_bytes(
             buf,
@@ -257,7 +266,9 @@ impl LichessGame {
             black: GamePlayer::unpack(buf),
         };
         let date = LaxDate::unpack(buf);
-        let outcome = outcome_from_bits(buf.get_u8()).expect("valid outcome");
+        let outcome = outcome_from_bits(buf.get_u8())
+            .and_then(Outcome::known)
+            .expect("known outcome");
         let (speed, rating_mode) = unpack_speed_and_rating_mode(buf);
 
         let setup = Some(unpack_bytes(buf))

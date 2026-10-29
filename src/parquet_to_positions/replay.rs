@@ -9,7 +9,7 @@ use shakmaty::{
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
     packed::{GameId, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
-    parquet::{GameRow, InvalidGameRow},
+    parquet::GameRow,
 };
 
 /// A position reached in a game, and the move that was eventually played
@@ -28,7 +28,7 @@ pub struct GameInfo {
     pub seq: GlobalGameSeq,
     pub variant: Variant,
     pub month: Month,
-    pub speed: Speed,
+    pub speed: Option<Speed>,
     pub ratings: ByColor<Rating>,
     pub outcome: KnownOutcome,
 }
@@ -60,27 +60,19 @@ impl Replayer {
     }
 
     /// Replays the game of a row, and returns its metadata.
-    pub fn replay_row(
-        &mut self,
-        row: &GameRow<'_>,
-        seq: GlobalGameSeq,
-    ) -> Result<GameInfo, InvalidGameRow> {
-        // Index only games that parquet_to_games stores, and of those only
-        // the games with a month and a known outcome.
-        let prepared = row.prepare()?;
-
+    pub fn replay_row(&mut self, row: &GameRow<'_>, seq: GlobalGameSeq) -> GameInfo {
         let pos = row.initial_position();
         let info = GameInfo {
             game_id: row.game_id,
             seq,
             variant: pos.variant(),
-            month: row.month()?,
-            speed: prepared.speed(),
-            ratings: prepared.ratings(),
-            outcome: row.known_outcome()?,
+            month: row.month(),
+            speed: row.speed,
+            ratings: row.players.map(|player| player.rating.unwrap_or_default()),
+            outcome: row.outcome,
         };
         self.replay(pos, row.moves);
-        Ok(info)
+        info
     }
 
     /// Replays the moves of a game from its initial position. Each position

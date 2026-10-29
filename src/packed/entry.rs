@@ -87,22 +87,16 @@ impl Add<usize> for GameSeq {
 
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct GroupHeader {
-    pub speed: Speed,
+    pub speed: Option<Speed>,
     pub rating_group: RatingGroup,
 }
 
 impl GroupHeader {
-    /// Packs the header into the low 7 bits of a byte. Ordering groups by
-    /// this byte is the canonical order of groups within a move.
+    /// Packs the header into the low 7 bits of a byte: the speed (0 if
+    /// missing) into the low 3 bits, and the rating group above. Ordering
+    /// groups by this byte is the canonical order of groups within a move.
     pub fn to_byte(&self) -> u8 {
-        let packed_speed = match self.speed {
-            Speed::UltraBullet => 1,
-            Speed::Bullet => 2,
-            Speed::Blitz => 3,
-            Speed::Rapid => 4,
-            Speed::Classical => 5,
-            Speed::Correspondence => 6,
-        };
+        let packed_speed = self.speed.map_or(0, Speed::bits);
         let packed_rating_group = match self.rating_group {
             RatingGroup::Low => 0,
             RatingGroup::Group1000 => 1,
@@ -121,13 +115,8 @@ impl GroupHeader {
 
     pub fn from_byte(packed: u8) -> Option<GroupHeader> {
         let speed = match packed & 0b111 {
-            1 => Speed::UltraBullet,
-            2 => Speed::Bullet,
-            3 => Speed::Blitz,
-            4 => Speed::Rapid,
-            5 => Speed::Classical,
-            6 => Speed::Correspondence,
-            _ => return None,
+            0 => None,
+            bits => Some(Speed::from_bits(bits)?),
         };
         let rating_group = match packed >> 3 {
             0 => RatingGroup::Low,
@@ -313,7 +302,7 @@ impl LichessEntry {
     pub fn add_game(
         &mut self,
         m: PackedUciMove,
-        speed: Speed,
+        speed: Option<Speed>,
         rating: Rating,
         outcome: KnownOutcome,
         month: Month,

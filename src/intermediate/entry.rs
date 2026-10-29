@@ -23,7 +23,7 @@ impl IntermediateEntry {
         hash: Zobrist96,
         month: Month,
         m: PackedUciMove,
-        speed: Speed,
+        speed: Option<Speed>,
         rating: Rating,
         outcome: KnownOutcome,
         seq: GlobalGameSeq,
@@ -162,7 +162,7 @@ mod tests {
             let hash: Zobrist96 = u.arbitrary()?;
             let month: Month = u.arbitrary()?;
             let m = PackedUciMove::pack(u.arbitrary()?);
-            let speed: Speed = u.arbitrary()?;
+            let speed: Option<Speed> = u.arbitrary()?;
             let rating: Rating = u.arbitrary()?;
             let outcome: KnownOutcome = u.arbitrary()?;
             let seq: GlobalGameSeq = u.arbitrary()?;

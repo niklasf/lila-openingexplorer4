@@ -55,9 +55,8 @@ impl Estimate {
             for row in batch.rows() {
                 value.clear();
                 sampled_rows += 1;
-                if row.pack_lichess_game(&mut value).is_ok() {
-                    sampled_bytes += (GameId::SIZE + LEN_PREFIX + value.len()) as u64;
-                }
+                row.pack_lichess_game(&mut value);
+                sampled_bytes += (GameId::SIZE + LEN_PREFIX + value.len()) as u64;
             }
         }
         let per_row = if sampled_rows == 0 {
@@ -128,8 +127,6 @@ const SORT_BUCKETS: usize = 8;
 /// Counters shared by the threads of one run.
 #[derive(Default)]
 struct Counters {
-    /// Games that could not be represented as `LichessGame`.
-    skipped_games: AtomicU64,
     /// Bytes currently occupied by scratch files.
     scratch_usage: Gauge,
     /// Bytes of scratch files of previous passes that are still to be
@@ -199,33 +196,22 @@ const LEN_PREFIX: usize = 2;
 const _: () = assert!(MAX_RECORD_SIZE - GameId::SIZE - LEN_PREFIX <= u16::MAX as usize);
 
 /// Appends a record to a buffer of records: `game_id` (6 bytes), a 2 byte
-/// little endian value length, and the value produced by `pack`. Nothing is
-/// appended if `pack` fails. Returns the offset of the length prefix.
-fn push_record<E>(
-    buf: &mut Vec<u8>,
-    game_id: GameId,
-    pack: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
-) -> Result<u64, E> {
+/// little endian value length, and the value produced by `pack`. Returns the
+/// offset of the length prefix.
+fn push_record(buf: &mut Vec<u8>, game_id: GameId, pack: impl FnOnce(&mut Vec<u8>)) -> u64 {
     let start = buf.len();
     buf.extend_from_slice(&game_id.to_bytes());
     let len_offset = buf.len();
     buf.extend_from_slice(&[0; LEN_PREFIX]);
-    match pack(buf) {
-        Ok(()) => {
-            assert!(
-                buf.len() - start <= MAX_RECORD_SIZE,
-                "record of {} too large",
-                game_id
-            );
-            let len = (buf.len() - len_offset - LEN_PREFIX) as u16;
-            buf[len_offset..len_offset + LEN_PREFIX].copy_from_slice(&len.to_le_bytes());
-            Ok(len_offset as u64)
-        }
-        Err(err) => {
-            buf.truncate(start);
-            Err(err)
-        }
-    }
+    pack(buf);
+    assert!(
+        buf.len() - start <= MAX_RECORD_SIZE,
+        "record of {} too large",
+        game_id
+    );
+    let len = (buf.len() - len_offset - LEN_PREFIX) as u16;
+    buf[len_offset..len_offset + LEN_PREFIX].copy_from_slice(&len.to_le_bytes());
+    len_offset as u64
 }
 
 /// Reads the length prefix at the given offset of a buffer of records.
@@ -248,11 +234,7 @@ struct MemoryPartition {
 }
 
 impl MemoryPartition {
-    fn push<E>(
-        &mut self,
-        game_id: GameId,
-        pack: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
-    ) -> Result<(), E> {
+    fn push(&mut self, game_id: GameId, pack: impl FnOnce(&mut Vec<u8>)) {
         if self
             .chunks
             .last()
@@ -261,10 +243,9 @@ impl MemoryPartition {
             self.chunks.push(new_chunk());
         }
         let chunk = self.chunks.len() - 1;
-        let offset = push_record(&mut self.chunks[chunk], game_id, pack)?;
+        let offset = push_record(&mut self.chunks[chunk], game_id, pack);
         self.index
             .push((game_id, chunk as u64 * CHUNK_STRIDE + offset));
-        Ok(())
     }
 
     fn record_bytes(&self) -> usize {
@@ -412,8 +393,6 @@ pub struct Stats {
     /// Uncompressed value bytes of the games in the SST files.
     pub raw_bytes: u64,
     pub largest_file: u64,
-    /// Games that could not be represented as `LichessGame`.
-    pub skipped: u64,
 }
 
 impl Stats {
@@ -703,9 +682,7 @@ pub fn convert(
 
     progress.finish();
 
-    let mut stats = sst.stats.into_inner().expect("stats");
-    stats.skipped = counters.skipped_games.load(Ordering::Relaxed);
-    Ok(stats)
+    Ok(sst.stats.into_inner().expect("stats"))
 }
 
 type Resident = Vec<(usize, MemoryPartition)>;
@@ -809,11 +786,10 @@ fn scatter_pass(
                     .collect();
                 let mut chunks: Vec<Vec<u8>> =
                     (0..scratch_partitions).map(|_| new_chunk()).collect();
-                let mut skipped = 0;
 
-                let mut route = |row: GameRow<'_>,
-                                 local_resident: &mut Vec<MemoryPartition>,
-                                 chunks: &mut Vec<Vec<u8>>| {
+                let route = |row: GameRow<'_>,
+                             local_resident: &mut Vec<MemoryPartition>,
+                             chunks: &mut Vec<Vec<u8>>| {
                     let Some(j) = layout.pass_memory_partition(
                         row.game_id.partition(layout.memory_partitions()),
                         pass,
@@ -822,17 +798,10 @@ fn scatter_pass(
                     };
                     let pack = |buf: &mut Vec<u8>| row.pack_lichess_game(buf);
                     if j >= scratch_partitions {
-                        if local_resident[j - scratch_partitions]
-                            .push(row.game_id, pack)
-                            .is_err()
-                        {
-                            skipped += 1;
-                        }
+                        local_resident[j - scratch_partitions].push(row.game_id, pack);
                     } else {
                         let chunk = &mut chunks[j];
-                        if push_record(chunk, row.game_id, pack).is_err() {
-                            skipped += 1;
-                        }
+                        push_record(chunk, row.game_id, pack);
                         if chunk.len() >= CHUNK_SIZE {
                             let full = mem::replace(chunk, new_chunk());
                             timed(&times.send, || tx.send((j, full))).expect("send chunk");
@@ -858,10 +827,6 @@ fn scatter_pass(
                     }
                 }
 
-                config
-                    .counters
-                    .skipped_games
-                    .fetch_add(skipped, Ordering::Relaxed);
                 resident
                     .lock()
                     .expect("lock resident")

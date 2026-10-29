@@ -161,13 +161,12 @@ fn main() {
     };
 
     println!(
-        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes, ratio {:.3}), {} skipped games",
+        "done in {:.1?}: {} games in {} sst files ({} bytes, largest {} bytes, ratio {:.3})",
         started.elapsed(),
         stats.games,
         stats.files,
         stats.bytes,
         stats.largest_file,
         stats.ratio(),
-        stats.skipped,
     );
 }
