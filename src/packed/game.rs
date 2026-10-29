@@ -246,7 +246,7 @@ impl LichessGame {
     pub fn as_borrowed(&self) -> BorrowedLichessGame<'_> {
         BorrowedLichessGame {
             players: self.players.as_ref().map(GamePlayer::as_borrowed),
-            date: self.date.clone(),
+            date: self.date,
             outcome: self.outcome,
             speed: self.speed,
             rating_mode: self.rating_mode,

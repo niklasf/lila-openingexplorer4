@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::packed::Month;
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct LaxDate {
     year_since_1900: u8,
     month: Option<NonZeroU8>,
