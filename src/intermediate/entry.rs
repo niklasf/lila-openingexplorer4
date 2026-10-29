@@ -6,7 +6,7 @@ use shakmaty::{KnownOutcome, packed::PackedUciMove};
 use crate::{
     intermediate::GlobalGameSeq,
     packed::{
-        GameId, GroupHeader, Month, Rating, RatingGroup, Speed, Zobrist96, outcome_bits,
+        CellKey, GameId, GroupHeader, Month, Rating, RatingGroup, Speed, Zobrist96, outcome_bits,
         outcome_from_bits,
     },
 };
@@ -58,7 +58,7 @@ impl IntermediateEntry {
 
     #[inline]
     pub fn sort_key(&self) -> (u128, u64) {
-        // key() + sub_key() + month() + seq_and_outcome()
+        // key() + cell_key() + seq_and_outcome()
         (
             u128::from_be_bytes(self.0[..16].try_into().expect("16 bytes")),
             u64::from_be_bytes(self.0[14..22].try_into().expect("8 bytes")),
@@ -76,18 +76,18 @@ impl IntermediateEntry {
     }
 
     #[inline]
-    pub fn sub_key(&self) -> IntermediateSubKey {
-        IntermediateSubKey(self.0[12..15].try_into().expect("3 bytes"))
+    pub fn cell_key(&self) -> CellKey {
+        CellKey::from_packed([self.0[12], self.0[13]], self.0[14], self.month())
     }
 
     #[inline]
     pub fn uci_move(&self) -> PackedUciMove {
-        self.sub_key().uci_move()
+        self.cell_key().uci_move()
     }
 
     #[inline]
     pub fn group_header(&self) -> GroupHeader {
-        self.sub_key().group_header()
+        self.cell_key().group_header()
     }
 
     #[inline]
@@ -128,19 +128,6 @@ impl fmt::Debug for IntermediateEntry {
             .field("rating", &self.rating())
             .field("game_id", &self.game_id())
             .finish()
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct IntermediateSubKey(pub [u8; 3]);
-
-impl IntermediateSubKey {
-    pub fn uci_move(&self) -> PackedUciMove {
-        PackedUciMove::from_bytes([self.0[0], self.0[1]])
-    }
-
-    pub fn group_header(&self) -> GroupHeader {
-        GroupHeader::from_byte(self.0[2]).expect("valid group header")
     }
 }
 

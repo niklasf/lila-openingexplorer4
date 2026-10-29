@@ -457,7 +457,7 @@ mod tests {
 
             let mut buf = Vec::new();
             game.pack_entire(&mut buf);
-            assert_eq!(BorrowedLichessGame::unpack(&buf), game.as_borrowed());
+            assert_eq!(BorrowedLichessGame::unpack_entire(&buf), game.as_borrowed());
             assert_eq!(LichessGame::unpack_entire(&buf), game);
             Ok(())
         });

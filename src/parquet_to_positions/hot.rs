@@ -12,8 +12,8 @@ use nohash_hasher::IntMap;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    intermediate::{EntryBuilder, EntryPacker, GlobalGameSeq, IntermediateEntry},
-    packed::{Month, Zobrist96},
+    intermediate::{GlobalGameSeq, IntermediateEntry},
+    packed::{LichessEntry, Month, Zobrist96},
     parquet::Input,
     parquet_to_positions::replay::Replayer,
 };
@@ -142,7 +142,7 @@ pub type HotEntries = Vec<HotEntry>;
 
 /// Aggregated entries of hot positions, keyed by `IntermediateEntry::key()`.
 pub struct HotMap {
-    shards: Vec<Mutex<FxHashMap<[u8; IntermediateEntry::KEY_SIZE], EntryBuilder>>>,
+    shards: Vec<Mutex<FxHashMap<[u8; IntermediateEntry::KEY_SIZE], LichessEntry>>>,
 }
 
 impl Default for HotMap {
@@ -167,9 +167,9 @@ impl HotMap {
                 .lock()
                 .expect("lock hot shard");
             for key_run in shard_run.chunk_by(|a, b| a.key() == b.key()) {
-                let builder = shard.entry(*key_run[0].key()).or_default();
+                let lichess_entry = shard.entry(*key_run[0].key()).or_default();
                 for entry in key_run {
-                    builder.add(entry);
+                    lichess_entry.add_record(entry);
                 }
             }
         }
@@ -177,14 +177,13 @@ impl HotMap {
     }
 
     pub fn pack(self) -> HotEntries {
-        let mut packer = EntryPacker::default();
         let mut packed: HotEntries = self
             .shards
             .into_iter()
             .flat_map(|shard| shard.into_inner().expect("hot shard"))
-            .map(|(key, builder)| {
+            .map(|(key, mut lichess_entry)| {
                 let mut buf = Vec::new();
-                builder.pack(&mut packer, &mut buf);
+                lichess_entry.pack_entire(&mut buf);
                 (key, buf)
             })
             .collect();

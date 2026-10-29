@@ -9,10 +9,8 @@ pub struct ColdKey {
 impl ColdKey {
     /// Hash bytes used as RocksDB key.
     pub const PREFIX_SIZE: usize = 4;
-    /// Further hash bytes stored in each entry of the group.
+    /// Further hash bytes stored in each item of the group.
     pub const SUFFIX_SIZE: usize = 2;
-    /// Size of one entry in the value of a group.
-    pub const ENTRY_SIZE: usize = ColdKey::SUFFIX_SIZE + GameId::SIZE;
 
     pub fn new(hash: &Zobrist96) -> ColdKey {
         ColdKey::from_hash_bytes(hash.as_bytes())
@@ -38,36 +36,41 @@ impl ColdKey {
     /// The games of a group that may contain this position, from the value
     /// of the group.
     pub fn candidates<'a>(&self, value: &'a [u8]) -> impl Iterator<Item = GameId> + 'a {
-        let (entries, rest) = value.as_chunks::<{ ColdKey::ENTRY_SIZE }>();
+        let (items, rest) = value.as_chunks::<{ ColdGroup::ITEM_SIZE }>();
         assert!(rest.is_empty(), "cold value truncated");
         let suffix = self.suffix;
-        let start = entries.partition_point(|entry| entry[..ColdKey::SUFFIX_SIZE] < suffix[..]);
-        entries[start..]
+        let start = items.partition_point(|item| item[..ColdKey::SUFFIX_SIZE] < suffix[..]);
+        items[start..]
             .iter()
-            .take_while(move |entry| entry[..ColdKey::SUFFIX_SIZE] == suffix)
-            .map(|entry| GameId::unpack(&mut &entry[ColdKey::SUFFIX_SIZE..]))
+            .take_while(move |item| item[..ColdKey::SUFFIX_SIZE] == suffix)
+            .map(|item| GameId::unpack(&mut &item[ColdKey::SUFFIX_SIZE..]))
     }
 }
 
+/// The games of all positions whose hashes share a prefix, keyed by the
+/// prefix. The value is a sequence of items, sorted by suffix.
 #[derive(Debug, Default)]
 pub struct ColdGroup {
     prefix: Option<[u8; ColdKey::PREFIX_SIZE]>,
     value: Vec<u8>,
-    entries: u64,
+    items: u64,
 }
 
 impl ColdGroup {
-    /// Adds an entry. Must be called in key order. Returns `Err` with the key
-    /// if the entry does not belong to the current group; the current group
+    /// Size of an item of the value: the hash suffix and the game.
+    pub const ITEM_SIZE: usize = ColdKey::SUFFIX_SIZE + GameId::SIZE;
+
+    /// Adds an item. Must be called in key order. Returns `Err` with the key
+    /// if the item does not belong to the current group; the current group
     /// must then be finished first.
     pub fn push(&mut self, key: ColdKey, game_id: GameId) -> Result<(), ColdKey> {
         match self.prefix {
             Some(prefix) if prefix != key.prefix => return Err(key),
             Some(_) => {
                 debug_assert!(
-                    self.value[self.value.len() - ColdKey::ENTRY_SIZE..][..ColdKey::SUFFIX_SIZE]
+                    self.value[self.value.len() - ColdGroup::ITEM_SIZE..][..ColdKey::SUFFIX_SIZE]
                         <= key.suffix[..],
-                    "cold entries out of order"
+                    "cold items out of order"
                 );
             }
             None => {
@@ -77,7 +80,7 @@ impl ColdGroup {
         }
         self.value.extend_from_slice(&key.suffix);
         self.value.extend_from_slice(&game_id.to_bytes());
-        self.entries += 1;
+        self.items += 1;
         Ok(())
     }
 
@@ -85,15 +88,15 @@ impl ColdGroup {
         self.prefix.is_none()
     }
 
-    pub fn entries(&self) -> u64 {
-        self.entries
+    pub fn items(&self) -> u64 {
+        self.items
     }
 
-    /// The RocksDB key and value of the group, if it has entries. The group
+    /// The RocksDB key and value of the group, if it has items. The group
     /// is empty afterwards.
     pub fn finish(&mut self) -> Option<([u8; ColdKey::PREFIX_SIZE], &[u8])> {
         let prefix = self.prefix.take()?;
-        self.entries = 0;
+        self.items = 0;
         Some((prefix, &self.value))
     }
 }
@@ -124,7 +127,7 @@ mod tests {
         for (i, key) in keys.iter().enumerate() {
             group.push(*key, game(i as u64 + 1)).unwrap();
         }
-        assert_eq!(group.entries(), 4);
+        assert_eq!(group.items(), 4);
         assert!(
             group
                 .push(ColdKey::new(&hash([1, 2, 3, 5, 0, 0])), game(5))
@@ -132,7 +135,7 @@ mod tests {
         );
         let (prefix, value) = group.finish().unwrap();
         assert_eq!(prefix, [1, 2, 3, 4]);
-        assert_eq!(value.len(), 4 * ColdKey::ENTRY_SIZE);
+        assert_eq!(value.len(), 4 * ColdGroup::ITEM_SIZE);
         let lookup = |key: ColdKey| key.candidates(value).collect::<Vec<_>>();
         assert_eq!(lookup(keys[0]), vec![game(1), game(2)]);
         assert_eq!(lookup(keys[2]), vec![game(3)]);
@@ -142,6 +145,6 @@ mod tests {
         assert_eq!(lookup(ColdKey::new(&hash([1, 2, 3, 4, 255, 255]))), vec![]);
         assert!(group.is_empty());
         group.push(keys[0], game(9)).unwrap();
-        assert_eq!(group.finish().unwrap().1.len(), ColdKey::ENTRY_SIZE);
+        assert_eq!(group.finish().unwrap().1.len(), ColdGroup::ITEM_SIZE);
     }
 }

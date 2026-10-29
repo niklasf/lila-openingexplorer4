@@ -12,7 +12,10 @@ mod zobrist;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
 pub use cold::{ColdGroup, ColdKey};
-pub use entry::{GAMES_PER_CELL, GameSeq, GroupHeader, LichessEntry, RatingGroup, SubStats};
+pub use entry::{
+    CellGames, CellKey, CellView, CellViews, EntryCell, EntryView, GAMES_PER_CELL, GameSeq,
+    GroupHeader, LichessEntry, RatingGroup, SubStats,
+};
 pub use game::{
     BorrowedGamePlayer, BorrowedLichessGame, GamePlayer, InvalidRatingMode, InvalidSpeed,
     LichessGame, RatingMode, Speed, initial_position, outcome_bits, outcome_from_bits,

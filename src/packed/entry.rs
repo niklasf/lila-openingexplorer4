@@ -1,4 +1,4 @@
-use std::{cmp::max, collections::BTreeMap, ops::Add};
+use std::collections::BTreeMap;
 
 use arbitrary::{Arbitrary, Unstructured};
 use bytes::{Buf, BufMut};
@@ -72,18 +72,12 @@ impl RatingGroup {
     }
 }
 
-/// Used to preserve chronological order across the groups of a
-/// `LichessEntry`.
-#[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct GameSeq(pub usize);
-
-impl Add<usize> for GameSeq {
-    type Output = GameSeq;
-
-    fn add(self, rhs: usize) -> Self::Output {
-        GameSeq(self.0 + rhs)
-    }
-}
+/// Orders games of the same month within a `LichessEntry`: games are ranked
+/// by month, then by this number. Numbers are only comparable within one
+/// entry. Packing condenses them into ranks, and merging continues after the
+/// largest number of the entry.
+#[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GameSeq(pub u64);
 
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct GroupHeader {
@@ -219,33 +213,80 @@ impl SubStats {
     }
 }
 
-/// The games of a cell that are packed: the most recent ones, exactly
-/// `min(GAMES_PER_CELL, games of the cell)` of them. Panics if
-/// fewer are given.
-fn packed_games<'a, K>(stats: &SubStats, games: &'a [(K, GameId)]) -> &'a [(K, GameId)] {
-    let n = stats.games().min(GAMES_PER_CELL as u64) as usize;
-    assert!(games.len() >= n, "cell is missing games");
-    &games[games.len() - n..]
-}
-
-/// Move, group header and month, ordered canonically.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct CellKey {
+/// Move, group header and month of a cell, ordered canonically.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CellKey {
     m: [u8; 2],
     header: u8,
     month: Month,
 }
 
-/// Statistics and most recent games of a month of a group.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+impl CellKey {
+    pub fn new(m: PackedUciMove, header: GroupHeader, month: Month) -> CellKey {
+        CellKey {
+            m: m.to_bytes(),
+            header: header.to_byte(),
+            month,
+        }
+    }
+
+    /// From the packed move, the `GroupHeader::to_byte()` and the month.
+    pub fn from_packed(m: [u8; 2], header: u8, month: Month) -> CellKey {
+        CellKey { m, header, month }
+    }
+
+    pub fn uci_move(&self) -> PackedUciMove {
+        PackedUciMove::from_bytes(self.m)
+    }
+
+    pub fn group_header(&self) -> GroupHeader {
+        GroupHeader::from_byte(self.header).expect("valid group header")
+    }
+
+    pub fn month(&self) -> Month {
+        self.month
+    }
+}
+
+/// A cell to be packed: its statistics and games, ordered by `GameSeq`.
+/// At least the most recent `min(GAMES_PER_CELL, games of the cell)` games
+/// must be given.
+#[derive(Debug, Copy, Clone)]
+pub struct EntryCell<'a> {
+    pub key: CellKey,
+    pub stats: SubStats,
+    pub games: &'a [(GameSeq, GameId)],
+}
+
+impl<'a> EntryCell<'a> {
+    /// The games that are packed: the most recent ones, exactly
+    /// `min(GAMES_PER_CELL, games of the cell)` of them.
+    fn packed_games(&self) -> &'a [(GameSeq, GameId)] {
+        let n = self.stats.games().min(GAMES_PER_CELL as u64) as usize;
+        assert!(self.games.len() >= n, "cell is missing games");
+        &self.games[self.games.len() - n..]
+    }
+}
+
+/// Statistics and most recent games of a cell.
+#[derive(Debug, Default, Clone)]
 struct Cell {
     stats: SubStats,
-    /// In chronological order.
+    /// In any order, truncated to the most recent games once in a while.
     games: Vec<(GameSeq, GameId)>,
 }
 
 impl Cell {
+    fn push_game(&mut self, seq: GameSeq, game_id: GameId) {
+        self.games.push((seq, game_id));
+        if self.games.len() >= 4 * GAMES_PER_CELL {
+            self.truncate_games();
+        }
+    }
+
+    /// Sorts the games and keeps only the most recent ones.
     fn truncate_games(&mut self) {
+        self.games.sort_unstable_by_key(|(seq, _)| *seq);
         self.games
             .drain(..self.games.len().saturating_sub(GAMES_PER_CELL));
     }
@@ -271,23 +312,32 @@ impl Cell {
 /// Each month_rec is a cell: the games of a month for a move and group. The
 /// first month delta of a group is relative to 1900-01. Each cell has
 /// exactly `min(GAMES_PER_CELL, games of the cell)` games, the most recent
-/// ones. The rank of a game is its chronological position among all packed
-/// games of the entry.
+/// ones. The rank of a game is its chronological position (by month, then
+/// `GameSeq`) among all packed games of the entry.
 ///
-/// Merging is associative: each merged entry is considered more recent than
-/// the entry it is merged into.
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+/// Merging is associative: within a month, the games of a merged entry are
+/// considered more recent than the games of the entry it is merged into.
+#[derive(Default, Debug, Clone)]
 pub struct LichessEntry {
     cells: BTreeMap<CellKey, Cell>,
-    next_game_seq: GameSeq,
 }
 
 impl Arbitrary<'_> for LichessEntry {
     fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
         let mut entry = LichessEntry::new();
-        for part in u.arbitrary_iter()? {
-            let (m, speed, rating, outcome, month, game) = part?;
-            entry.add_game(PackedUciMove::pack(m), speed, rating, outcome, month, game);
+        for (seq, part) in u.arbitrary_iter()?.enumerate() {
+            let (m, speed, rating, outcome, month, game_id) = part?;
+            let header = GroupHeader {
+                speed,
+                rating_group: RatingGroup::select(rating),
+            };
+            entry.add_game(
+                CellKey::new(PackedUciMove::pack(m), header, month),
+                rating,
+                outcome,
+                GameSeq(seq as u64),
+                game_id,
+            );
         }
         Ok(entry)
     }
@@ -298,123 +348,70 @@ impl LichessEntry {
         LichessEntry::default()
     }
 
-    /// Adds a game, more recent than all games added before.
+    /// Adds a game to the cell of the key, which must match the rating.
     pub fn add_game(
         &mut self,
-        m: PackedUciMove,
-        speed: Option<Speed>,
+        key: CellKey,
         rating: Rating,
         outcome: KnownOutcome,
-        month: Month,
-        game: GameId,
+        seq: GameSeq,
+        game_id: GameId,
     ) {
-        let header = GroupHeader {
-            speed,
-            rating_group: RatingGroup::select(rating),
-        };
-        let cell = self
-            .cells
-            .entry(CellKey {
-                m: m.to_bytes(),
-                header: header.to_byte(),
-                month,
-            })
-            .or_default();
-
+        debug_assert_eq!(
+            key.group_header().rating_group,
+            RatingGroup::select(rating),
+            "rating does not match cell"
+        );
+        let cell = self.cells.entry(key).or_default();
         cell.stats.add(rating, outcome);
-        cell.games.push((self.next_game_seq, game));
-        cell.truncate_games();
-        self.next_game_seq = self.next_game_seq.add(1);
+        cell.push_game(seq, game_id);
     }
 
-    pub fn pack_entire(&self, buf: &mut Vec<u8>) {
-        Self::pack_entire_external(
+    pub fn pack_entire(&mut self, buf: &mut Vec<u8>) {
+        for cell in self.cells.values_mut() {
+            cell.truncate_games();
+        }
+        Self::pack_cells_entire(
             buf,
-            self.cells.iter().map(|(key, cell)| {
-                (
-                    PackedUciMove::from_bytes(key.m),
-                    GroupHeader::from_byte(key.header).expect("valid group header"),
-                    key.month,
-                    &cell.stats,
-                    &cell.games[..],
-                )
+            self.cells.iter().map(|(key, cell)| EntryCell {
+                key: *key,
+                stats: cell.stats,
+                games: &cell.games,
             }),
         );
     }
 
-    /// Merges a packed entry into this entry. Its games are considered more
-    /// recent than all games of this entry.
-    pub fn merge_unpack_entire<B: Buf>(&mut self, buf: &mut B) {
-        let base_game_seq = self.next_game_seq;
+    /// Merges a packed entry into this entry. Within a month, its games are
+    /// considered more recent than all games of this entry.
+    pub fn merge_unpack_entire(&mut self, bytes: &[u8]) {
+        let base = self
+            .cells
+            .values()
+            .flat_map(|cell| cell.games.iter().map(|(seq, _)| seq.0 + 1))
+            .max()
+            .unwrap_or(0);
 
-        while buf.has_remaining() {
-            let mut m = [0; 2];
-            buf.copy_to_slice(&mut m);
-
-            loop {
-                let byte = buf.get_u8();
-                let header =
-                    GroupHeader::from_byte(byte & !LAST_GROUP_OF_MOVE).expect("valid group header");
-
-                let mut month = 0;
-                loop {
-                    let tagged = unpack_uint(buf);
-                    month += tagged >> 1;
-                    let stats = SubStats::unpack(buf, header.rating_group);
-                    let cell = self
-                        .cells
-                        .entry(CellKey {
-                            m,
-                            header: header.to_byte(),
-                            month: Month::from_months_since_jan_1900(
-                                u16::try_from(month).expect("valid month"),
-                            ),
-                        })
-                        .or_default();
-                    cell.stats.merge(&stats);
-                    for _ in 0..stats.games().min(GAMES_PER_CELL as u64) {
-                        let seq = base_game_seq.add(unpack_uint(buf) as usize);
-                        self.next_game_seq = max(self.next_game_seq, seq.add(1));
-                        cell.games.push((seq, GameId::unpack(buf)));
-                    }
-                    cell.truncate_games();
-
-                    if tagged & 1 == 0 {
-                        break;
-                    }
-                }
-
-                if byte & LAST_GROUP_OF_MOVE != 0 {
-                    break;
-                }
+        for view in EntryView::unpack_entire(bytes).cells() {
+            let cell = self.cells.entry(view.key).or_default();
+            cell.stats.merge(&view.stats);
+            for (rank, game_id) in view.games {
+                cell.push_game(GameSeq(base + rank), game_id);
             }
         }
     }
 
-    /// Packs an entry from the months of all groups, which need to be in
-    /// canonical order (by move bytes, then by header byte, then by month),
-    /// each with at least its packed games (see `LichessEntry`) in
-    /// chronological order.
-    ///
-    /// `K` is used to maintain the chronological order of games across
-    /// groups and months (`GameSeq` or month and `GlobalGameSeq`).
-    pub fn pack_entire_external<'a, K, I>(buf: &mut Vec<u8>, cells: I)
+    /// Packs cells, which need to be in canonical order (by move bytes, then
+    /// by header byte, then by month).
+    pub fn pack_cells_entire<'a, I>(buf: &mut Vec<u8>, cells: I)
     where
-        K: Ord + Copy + 'a,
-        I: Iterator<
-                Item = (
-                    PackedUciMove,
-                    GroupHeader,
-                    Month,
-                    &'a SubStats,
-                    &'a [(K, GameId)],
-                ),
-            > + Clone,
+        I: Iterator<Item = EntryCell<'a>> + Clone,
     {
-        let mut keys: Vec<K> = cells
+        let mut keys: Vec<(Month, GameSeq)> = cells
             .clone()
-            .flat_map(|(_, _, _, stats, games)| {
-                packed_games(stats, games).iter().map(|(key, _)| *key)
+            .flat_map(|cell| {
+                cell.packed_games()
+                    .iter()
+                    .map(move |(seq, _)| (cell.key.month, *seq))
             })
             .collect();
         keys.sort_unstable();
@@ -422,12 +419,8 @@ impl LichessEntry {
         let mut prev: Option<CellKey> = None;
         let mut header_index = 0;
         let mut cells = cells.peekable();
-        while let Some((m, header, month, stats, games)) = cells.next() {
-            let key = CellKey {
-                m: m.to_bytes(),
-                header: header.to_byte(),
-                month,
-            };
+        while let Some(cell) = cells.next() {
+            let key = cell.key;
             debug_assert!(prev < Some(key), "cells not in canonical order");
             let new_move = prev.is_none_or(|prev| prev.m != key.m);
             let prev_month = match prev {
@@ -445,72 +438,228 @@ impl LichessEntry {
             };
             prev = Some(key);
 
-            let next = cells
-                .peek()
-                .map(|(m, header, ..)| (m.to_bytes(), header.to_byte()));
+            let next = cells.peek().map(|next| (next.key.m, next.key.header));
             let more_months = next == Some((key.m, key.header));
             if next.is_none_or(|(next_m, _)| next_m != key.m) {
                 buf[header_index] |= LAST_GROUP_OF_MOVE;
             }
 
-            let month = month.months_since_jan_1900();
+            let month = key.month.months_since_jan_1900();
             pack_uint(
                 buf,
                 u64::from(month - prev_month) << 1 | u64::from(more_months),
             );
-            stats.pack(buf, header.rating_group);
+            cell.stats.pack(buf, key.group_header().rating_group);
 
-            let games = packed_games(stats, games);
+            let games = cell.packed_games();
             debug_assert!(games.is_sorted_by(|a, b| a.0 < b.0), "games not in order");
-            for (key, game_id) in games {
-                pack_uint(buf, keys.partition_point(|k| k < key) as u64);
+            for (seq, game_id) in games {
+                pack_uint(buf, keys.partition_point(|k| *k < (key.month, *seq)) as u64);
                 game_id.pack(buf);
             }
         }
     }
 }
 
+/// A packed entry (see `LichessEntry`), read in place.
+#[derive(Debug, Copy, Clone)]
+pub struct EntryView<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> EntryView<'a> {
+    /// Views the entire slice as a packed entry.
+    pub fn unpack_entire(bytes: &'a [u8]) -> EntryView<'a> {
+        EntryView { bytes }
+    }
+
+    /// The cells, in canonical order.
+    pub fn cells(&self) -> CellViews<'a> {
+        CellViews {
+            buf: self.bytes,
+            m: [0; 2],
+            header: 0,
+            rating_group: RatingGroup::Low,
+            month: 0,
+            more_groups: false,
+            more_months: false,
+        }
+    }
+}
+
+/// A cell of a packed entry, read in place.
+#[derive(Debug, Clone)]
+pub struct CellView<'a> {
+    pub key: CellKey,
+    pub stats: SubStats,
+    /// The most recent `min(GAMES_PER_CELL, games of the cell)` games, with
+    /// their rank in the entry.
+    pub games: CellGames<'a>,
+}
+
+/// Iterator over the cells of a packed entry.
+#[derive(Debug, Clone)]
+pub struct CellViews<'a> {
+    buf: &'a [u8],
+    m: [u8; 2],
+    header: u8,
+    rating_group: RatingGroup,
+    month: u16,
+    more_groups: bool,
+    more_months: bool,
+}
+
+impl<'a> Iterator for CellViews<'a> {
+    type Item = CellView<'a>;
+
+    fn next(&mut self) -> Option<CellView<'a>> {
+        if !self.more_months {
+            if !self.more_groups {
+                if self.buf.is_empty() {
+                    return None;
+                }
+                self.buf.copy_to_slice(&mut self.m);
+            }
+            let byte = self.buf.get_u8();
+            self.header = byte & !LAST_GROUP_OF_MOVE;
+            self.rating_group = GroupHeader::from_byte(self.header)
+                .expect("valid group header")
+                .rating_group;
+            self.more_groups = byte & LAST_GROUP_OF_MOVE == 0;
+            self.month = 0;
+        }
+
+        let tagged = unpack_uint(&mut self.buf);
+        self.month += u16::try_from(tagged >> 1).expect("valid month");
+        self.more_months = tagged & 1 != 0;
+        let stats = SubStats::unpack(&mut self.buf, self.rating_group);
+
+        let start = self.buf;
+        for _ in 0..stats.games().min(GAMES_PER_CELL as u64) {
+            unpack_uint(&mut self.buf);
+            self.buf.advance(GameId::SIZE);
+        }
+        let games = &start[..start.len() - self.buf.len()];
+
+        Some(CellView {
+            key: CellKey {
+                m: self.m,
+                header: self.header,
+                month: Month::from_months_since_jan_1900(self.month),
+            },
+            stats,
+            games: CellGames { buf: games },
+        })
+    }
+}
+
+/// Iterator over the packed games of a cell, with their rank in the entry.
+#[derive(Debug, Clone)]
+pub struct CellGames<'a> {
+    buf: &'a [u8],
+}
+
+impl Iterator for CellGames<'_> {
+    type Item = (u64, GameId);
+
+    fn next(&mut self) -> Option<(u64, GameId)> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let rank = unpack_uint(&mut self.buf);
+        Some((rank, GameId::unpack(&mut self.buf)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arbtest::arbtest;
+    use shakmaty::uci::UciMove;
 
     use super::*;
 
     fn pack(entry: &LichessEntry) -> Vec<u8> {
         let mut buf = Vec::new();
-        entry.pack_entire(&mut buf);
+        entry.clone().pack_entire(&mut buf);
         buf
     }
 
     fn merge(packed: &[&[u8]]) -> Vec<u8> {
         let mut entry = LichessEntry::new();
         for buf in packed {
-            entry.merge_unpack_entire(&mut &buf[..]);
+            entry.merge_unpack_entire(buf);
         }
         pack(&entry)
     }
 
-    /// Statistics of all months of all groups, and their packed games in
-    /// chronological order.
+    type Game = (UciMove, Option<Speed>, Rating, KnownOutcome, Month, GameId);
+
+    fn add(entry: &mut LichessEntry, (m, speed, rating, outcome, month, game_id): Game, seq: u64) {
+        let header = GroupHeader {
+            speed,
+            rating_group: RatingGroup::select(rating),
+        };
+        entry.add_game(
+            CellKey::new(PackedUciMove::pack(m), header, month),
+            rating,
+            outcome,
+            GameSeq(seq),
+            game_id,
+        );
+    }
+
+    /// Statistics of all cells, and their packed games in chronological
+    /// order.
     #[allow(clippy::type_complexity)]
-    fn view(entry: &LichessEntry) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameId)>) {
-        let stats = entry
-            .cells
+    fn view(bytes: &[u8]) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameId)>) {
+        let cells: Vec<_> = EntryView::unpack_entire(bytes).cells().collect();
+        let mut games: Vec<_> = cells
             .iter()
-            .map(|(key, cell)| (*key, cell.stats))
+            .flat_map(|cell| {
+                cell.games
+                    .clone()
+                    .map(|(rank, game_id)| (rank, cell.key, game_id))
+            })
             .collect();
+        games.sort_unstable_by_key(|(rank, ..)| *rank);
+        assert!(
+            games
+                .iter()
+                .enumerate()
+                .all(|(i, (rank, ..))| i as u64 == *rank)
+        );
+        (
+            cells.iter().map(|cell| (cell.key, cell.stats)).collect(),
+            games
+                .into_iter()
+                .map(|(_, key, game_id)| (key, game_id))
+                .collect(),
+        )
+    }
+
+    /// Like `view`, but from the model.
+    #[allow(clippy::type_complexity)]
+    fn expected_view(entry: &LichessEntry) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameId)>) {
+        let mut entry = entry.clone();
+        for cell in entry.cells.values_mut() {
+            cell.truncate_games();
+        }
         let mut games: Vec<_> = entry
             .cells
             .iter()
             .flat_map(|(key, cell)| {
-                packed_games(&cell.stats, &cell.games)
+                cell.games
                     .iter()
-                    .map(|(seq, game_id)| (*seq, *key, *game_id))
+                    .map(|(seq, game_id)| ((key.month, *seq), *key, *game_id))
             })
             .collect();
-        games.sort_unstable();
+        games.sort_unstable_by_key(|(order, ..)| *order);
         (
-            stats,
+            entry
+                .cells
+                .iter()
+                .map(|(key, cell)| (*key, cell.stats))
+                .collect(),
             games
                 .into_iter()
                 .map(|(_, key, game_id)| (key, game_id))
@@ -551,9 +700,9 @@ mod tests {
             let lichess_entry: LichessEntry = u.arbitrary()?;
 
             let buf = pack(&lichess_entry);
+            assert_eq!(view(&buf), expected_view(&lichess_entry));
             let mut unpacked = LichessEntry::new();
-            unpacked.merge_unpack_entire(&mut &buf[..]);
-            assert_eq!(view(&unpacked), view(&lichess_entry));
+            unpacked.merge_unpack_entire(&buf);
             assert_eq!(pack(&unpacked), buf);
             Ok(())
         });
@@ -565,14 +714,15 @@ mod tests {
             // Adding all games to one entry is the same as merging entries
             // of consecutive parts.
             let mut all = LichessEntry::new();
+            let mut seq = 0;
             let mut packed_parts = Vec::new();
             for _ in 0..u.int_in_range(0..=4)? {
                 let mut part = LichessEntry::new();
-                for game in u.arbitrary_iter()? {
-                    let (m, speed, rating, outcome, month, game_id) = game?;
-                    let m = PackedUciMove::pack(m);
-                    all.add_game(m, speed, rating, outcome, month, game_id);
-                    part.add_game(m, speed, rating, outcome, month, game_id);
+                for (part_seq, game) in u.arbitrary_iter()?.enumerate() {
+                    let game: Game = game?;
+                    add(&mut all, game, seq);
+                    add(&mut part, game, part_seq as u64);
+                    seq += 1;
                 }
                 packed_parts.push(pack(&part));
             }
