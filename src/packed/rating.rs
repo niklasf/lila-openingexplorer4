@@ -27,16 +27,8 @@ impl Rating {
         Rating { offset }
     }
 
-    pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        pack_int(buf, self.offset as i64);
-    }
-
     pub fn pack_fixed<B: BufMut>(&self, buf: &mut B) {
         buf.put_i16(self.offset);
-    }
-
-    pub fn unpack<B: Buf>(buf: &mut B) -> Self {
-        Rating::from_offset(unpack_int(buf) as i16)
     }
 
     pub fn unpack_fixed<B: Buf>(buf: &mut B) -> Self {
@@ -120,13 +112,13 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_roundtrip() {
+    fn test_pack_optional_roundtrip() {
         arbtest(|u| {
-            let rating: Rating = u.arbitrary()?;
+            let rating: Option<Rating> = u.arbitrary()?;
 
             let mut buf = Vec::new();
-            rating.pack(&mut buf);
-            assert_eq!(Rating::unpack(&mut &buf[..]), rating);
+            Rating::pack_optional(rating, &mut buf);
+            assert_eq!(Rating::unpack_optional(&mut &buf[..]), rating);
             Ok(())
         });
     }

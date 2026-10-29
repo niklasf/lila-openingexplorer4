@@ -8,8 +8,7 @@ use shakmaty::{
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::{GameId, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
-    parquet::GameRow,
+    packed::{BorrowedLichessGame, GameId, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
 };
 
 /// A position reached in a game, and the move that was eventually played
@@ -59,19 +58,25 @@ impl Replayer {
         }
     }
 
-    /// Replays the game of a row, and returns its metadata.
-    pub fn replay_row(&mut self, row: &GameRow<'_>, seq: GlobalGameSeq) -> GameInfo {
-        let pos = row.initial_position();
+    /// Replays a game, and returns its metadata.
+    pub fn replay_game(
+        &mut self,
+        game_id: GameId,
+        game: &BorrowedLichessGame<'_>,
+        seq: GlobalGameSeq,
+    ) -> GameInfo {
+        let pos = game.initial_position();
         let info = GameInfo {
-            game_id: row.game_id,
+            game_id,
             seq,
             variant: pos.variant(),
-            month: row.month(),
-            speed: row.speed,
-            ratings: row.players.map(|player| player.rating.unwrap_or_default()),
-            outcome: row.outcome,
+            // The earliest possible month if only the year is known.
+            month: game.date.earliest_month(),
+            speed: game.speed,
+            ratings: game.players.map(|player| player.rating.unwrap_or_default()),
+            outcome: game.outcome,
         };
-        self.replay(pos, row.moves);
+        self.replay(pos, game.moves);
         info
     }
 

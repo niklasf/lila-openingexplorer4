@@ -14,8 +14,9 @@ pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
 pub use cold::{ColdGroup, ColdKey};
 pub use entry::{GAMES_PER_CELL, GameSeq, GroupHeader, LichessEntry, RatingGroup, SubStats};
 pub use game::{
-    GamePlayer, InvalidRatingMode, InvalidSetup, InvalidSpeed, LichessGame, RatingMode, Speed,
-    initial_position, outcome_bits, outcome_from_bits, pack_speed_and_rating_mode, unpack_uci_move,
+    BorrowedGamePlayer, BorrowedLichessGame, GamePlayer, InvalidRatingMode, InvalidSpeed,
+    LichessGame, RatingMode, Speed, initial_position, outcome_bits, outcome_from_bits,
+    pack_speed_and_rating_mode, unpack_uci_move,
 };
 pub use game_id::{GameId, InvalidGameId};
 pub use int::{pack_int, pack_uint, unpack_int, unpack_uint};

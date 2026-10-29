@@ -698,9 +698,9 @@ fn scatter_pass(
                     // Time spent blocked on the chunk writers is not replay.
                     let timer = Instant::now();
                     let mut sending = Duration::ZERO;
-                    for (k, row) in batch.rows().enumerate() {
+                    for (k, (game_id, game)) in batch.rows().enumerate() {
                         let seq = GlobalGameSeq::new(first_row + k as u64).expect("seq");
-                        let info = replayer.replay_row(&row, seq);
+                        let info = replayer.replay_game(game_id, &game, seq);
                         games += 1;
 
                         for entry in replayer.entries(&info) {

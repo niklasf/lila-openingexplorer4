@@ -1,6 +1,6 @@
 use std::{io::Write, iter, sync::Arc};
 
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use parquet::{
     basic::{Compression, LogicalType, Repetition, Type as PhysicalType},
     data_type::{ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int32Type},
@@ -11,14 +11,12 @@ use parquet::{
     },
     schema::types::{ColumnPath, Type, TypePtr},
 };
-use shakmaty::{
-    ByColor, Color, KnownOutcome, Outcome, packed::PackedSetup, variant::VariantPosition,
-};
+use shakmaty::{ByColor, KnownOutcome};
 
 use crate::{
     packed::{
-        GameId, GamePlayer, LaxDate, LichessGame, Month, Rating, RatingMode, Speed,
-        initial_position, outcome_bits, pack_bytes, pack_speed_and_rating_mode, pack_string,
+        BorrowedGamePlayer, BorrowedLichessGame, GameId, GamePlayer, LaxDate, LichessGame, Rating,
+        RatingMode, Speed,
     },
     parquet::{OptionalColumn, RequiredColumn},
 };
@@ -92,12 +90,12 @@ impl PlayerColumns {
         Ok(())
     }
 
-    pub fn rows(&self) -> impl Iterator<Item = PlayerRow<'_>> {
+    pub fn rows(&self) -> impl Iterator<Item = BorrowedGamePlayer<'_>> {
         let mut title = self.title.iter();
         let mut name = self.name.iter();
         let mut rating = self.rating.iter();
         iter::from_fn(move || {
-            Some(PlayerRow {
+            Some(BorrowedGamePlayer {
                 name: str::from_utf8(name.next()?.data()).expect("valid utf-8"),
                 title: title
                     .next()
@@ -110,56 +108,6 @@ impl PlayerColumns {
                     .map(|rating| Rating::try_from(rating).expect("valid rating")),
             })
         })
-    }
-}
-
-#[derive(Copy, Clone)]
-pub struct PlayerRow<'a> {
-    pub title: Option<&'a str>,
-    pub name: &'a str,
-    pub rating: Option<Rating>,
-}
-
-pub struct GameRow<'a> {
-    pub game_id: GameId,
-    pub players: ByColor<PlayerRow<'a>>,
-    pub date: LaxDate,
-    pub outcome: KnownOutcome,
-    pub speed: Option<Speed>,
-    pub rating_mode: RatingMode,
-    /// `PackedSetup`, decoded by `initial_position()`.
-    pub setup: Option<&'a [u8]>,
-    /// `PackedMoves`, decoded when replaying the game.
-    pub moves: &'a [u8],
-}
-
-impl GameRow<'_> {
-    /// The month of the game for statistics: the earliest possible month if
-    /// only the year is known.
-    pub fn month(&self) -> Month {
-        self.date.earliest_month()
-    }
-
-    pub fn initial_position(&self) -> VariantPosition {
-        let setup = self
-            .setup
-            .map(|bytes| PackedSetup::try_from_bytes(bytes).expect("valid setup"));
-        initial_position(setup.as_ref()).expect("valid setup")
-    }
-
-    /// Packs the game like `LichessGame::pack_entire`.
-    pub fn pack_lichess_game<B: BufMut>(&self, buf: &mut B) {
-        for color in Color::ALL {
-            let player = self.players.get(color);
-            pack_string(buf, player.title.unwrap_or(""));
-            pack_string(buf, player.name);
-            Rating::pack_optional(player.rating, buf);
-        }
-        self.date.pack(buf);
-        buf.put_u8(outcome_bits(Outcome::Known(self.outcome)));
-        pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
-        pack_bytes(buf, self.setup.unwrap_or(b""));
-        buf.put_slice(self.moves);
     }
 }
 
@@ -228,7 +176,7 @@ impl GameColumns {
         self.moves.append(&mut other.moves);
     }
 
-    pub fn rows(&self) -> impl Iterator<Item = GameRow<'_>> {
+    pub fn rows(&self) -> impl Iterator<Item = (GameId, BorrowedLichessGame<'_>)> {
         let mut game_id = self.game_id.iter();
         let mut white = self.players.white.rows();
         let mut black = self.players.black.rows();
@@ -241,42 +189,44 @@ impl GameColumns {
         let mut setup = self.setup.iter();
         let mut moves = self.moves.iter();
         iter::from_fn(move || {
-            Some(GameRow {
-                game_id: GameId::unpack(&mut game_id.next()?.data()),
-                players: ByColor {
-                    white: white.next().expect("white"),
-                    black: black.next().expect("black"),
+            Some((
+                GameId::unpack(&mut game_id.next()?.data()),
+                BorrowedLichessGame {
+                    players: ByColor {
+                        white: white.next().expect("white"),
+                        black: black.next().expect("black"),
+                    },
+                    date: LaxDate::from_ymd(
+                        u32::try_from(*date_year.next().expect("date_year")).expect("valid year"),
+                        date_month
+                            .next()
+                            .expect("date_month")
+                            .map(|&month| u8::try_from(month).expect("valid month")),
+                        date_day
+                            .next()
+                            .expect("date_day")
+                            .map(|&day| u8::try_from(day).expect("valid day")),
+                    )
+                    .expect("valid date"),
+                    outcome: KnownOutcome::from_ascii(outcome.next().expect("outcome").data())
+                        .expect("known outcome"),
+                    speed: speed
+                        .next()
+                        .expect("speed")
+                        .map(|speed| Speed::from_ascii(speed.data()).expect("valid speed")),
+                    rating_mode: RatingMode::from_ascii(
+                        rating_mode.next().expect("rating_mode").data(),
+                    )
+                    .expect("valid rating mode"),
+                    // Empty setups are treated like missing setups.
+                    setup: setup
+                        .next()
+                        .expect("setup")
+                        .map(ByteArray::data)
+                        .filter(|bytes| !bytes.is_empty()),
+                    moves: moves.next().expect("moves").data(),
                 },
-                date: LaxDate::from_ymd(
-                    u32::try_from(*date_year.next().expect("date_year")).expect("valid year"),
-                    date_month
-                        .next()
-                        .expect("date_month")
-                        .map(|&month| u8::try_from(month).expect("valid month")),
-                    date_day
-                        .next()
-                        .expect("date_day")
-                        .map(|&day| u8::try_from(day).expect("valid day")),
-                )
-                .expect("valid date"),
-                outcome: KnownOutcome::from_ascii(outcome.next().expect("outcome").data())
-                    .expect("known outcome"),
-                speed: speed
-                    .next()
-                    .expect("speed")
-                    .map(|speed| Speed::from_ascii(speed.data()).expect("valid speed")),
-                rating_mode: RatingMode::from_ascii(
-                    rating_mode.next().expect("rating_mode").data(),
-                )
-                .expect("valid rating mode"),
-                // Empty setups are treated like missing setups.
-                setup: setup
-                    .next()
-                    .expect("setup")
-                    .map(ByteArray::data)
-                    .filter(|bytes| !bytes.is_empty()),
-                moves: moves.next().expect("moves").data(),
-            })
+            ))
         })
     }
 
@@ -479,22 +429,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pack_lichess_game_matches_pack_entire() {
+    fn test_rows_roundtrip() {
         arbtest(|u| {
             let game_id: GameId = u.arbitrary()?;
             let game: LichessGame = u.arbitrary()?;
 
-            let mut expected = Vec::new();
-            game.pack_entire(&mut expected);
-
             let mut columns = GameColumns::default();
-            columns.push(game_id, game);
-            let row = columns.rows().next().expect("row");
-            assert_eq!(row.game_id, game_id);
-
-            let mut actual = Vec::new();
-            row.pack_lichess_game(&mut actual);
-            assert_eq!(actual, expected);
+            columns.push(game_id, game.clone());
+            assert_eq!(
+                columns.rows().next().expect("row"),
+                (game_id, game.as_borrowed())
+            );
 
             Ok(())
         });

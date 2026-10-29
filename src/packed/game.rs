@@ -2,7 +2,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use btoi::btou;
 use bytes::{Buf, BufMut};
 use shakmaty::{
-    ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Outcome, Position,
+    ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Position,
     packed::{PackedSetup, PackedUciMove},
     variant::{Variant, VariantPosition},
 };
@@ -18,29 +18,27 @@ pub fn unpack_uci_move<B: Buf>(buf: &mut B) -> PackedUciMove {
     PackedUciMove::from_bytes(bytes)
 }
 
-pub fn outcome_bits(outcome: Outcome) -> u8 {
+pub fn outcome_bits(outcome: KnownOutcome) -> u8 {
     match outcome {
-        Outcome::Unknown => 0,
-        Outcome::Known(KnownOutcome::Decisive {
+        KnownOutcome::Decisive {
             winner: Color::White,
-        }) => 1,
-        Outcome::Known(KnownOutcome::Decisive {
+        } => 1,
+        KnownOutcome::Decisive {
             winner: Color::Black,
-        }) => 2,
-        Outcome::Known(KnownOutcome::Draw) => 3,
+        } => 2,
+        KnownOutcome::Draw => 3,
     }
 }
 
-pub fn outcome_from_bits(bits: u8) -> Option<Outcome> {
+pub fn outcome_from_bits(bits: u8) -> Option<KnownOutcome> {
     Some(match bits {
-        0 => Outcome::Unknown,
-        1 => Outcome::Known(KnownOutcome::Decisive {
+        1 => KnownOutcome::Decisive {
             winner: Color::White,
-        }),
-        2 => Outcome::Known(KnownOutcome::Decisive {
+        },
+        2 => KnownOutcome::Decisive {
             winner: Color::Black,
-        }),
-        3 => Outcome::Known(KnownOutcome::Draw),
+        },
+        3 => KnownOutcome::Draw,
         _ => return None,
     })
 }
@@ -53,10 +51,12 @@ pub struct GamePlayer {
 }
 
 impl GamePlayer {
-    pub fn pack<B: BufMut>(&self, buf: &mut B) {
-        pack_string(buf, self.title.as_ref().unwrap_or(&String::new()));
-        pack_string(buf, &self.name);
-        Rating::pack_optional(self.rating, buf);
+    pub fn as_borrowed(&self) -> BorrowedGamePlayer<'_> {
+        BorrowedGamePlayer {
+            title: self.title.as_deref(),
+            name: &self.name,
+            rating: self.rating,
+        }
     }
 
     pub fn unpack<B: Buf>(buf: &mut B) -> Self {
@@ -243,21 +243,24 @@ pub struct LichessGame {
 }
 
 impl LichessGame {
-    pub fn initial_position(&self) -> Result<VariantPosition, InvalidSetup> {
+    pub fn as_borrowed(&self) -> BorrowedLichessGame<'_> {
+        BorrowedLichessGame {
+            players: self.players.as_ref().map(GamePlayer::as_borrowed),
+            date: self.date.clone(),
+            outcome: self.outcome,
+            speed: self.speed,
+            rating_mode: self.rating_mode,
+            setup: self.setup.as_ref().map(PackedSetup::as_bytes),
+            moves: &self.moves.0,
+        }
+    }
+
+    pub fn initial_position(&self) -> VariantPosition {
         initial_position(self.setup.as_ref())
     }
 
     pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
-        self.players.white.pack(buf);
-        self.players.black.pack(buf);
-        self.date.pack(buf);
-        buf.put_u8(outcome_bits(Outcome::Known(self.outcome)));
-        pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
-        pack_bytes(
-            buf,
-            self.setup.as_ref().map_or(b"", |setup| setup.as_bytes()),
-        );
-        self.moves.pack_entire(buf);
+        self.as_borrowed().pack_entire(buf);
     }
 
     pub fn unpack_entire<B: Buf>(buf: &mut B) -> Self {
@@ -266,9 +269,7 @@ impl LichessGame {
             black: GamePlayer::unpack(buf),
         };
         let date = LaxDate::unpack(buf);
-        let outcome = outcome_from_bits(buf.get_u8())
-            .and_then(Outcome::known)
-            .expect("known outcome");
+        let outcome = outcome_from_bits(buf.get_u8()).expect("valid outcome");
         let (speed, rating_mode) = unpack_speed_and_rating_mode(buf);
 
         let setup = Some(unpack_bytes(buf))
@@ -322,17 +323,63 @@ impl Arbitrary<'_> for LichessGame {
     }
 }
 
-#[derive(Debug, Error)]
-#[error("invalid setup")]
-pub struct InvalidSetup;
+/// A player of a `BorrowedLichessGame`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct BorrowedGamePlayer<'a> {
+    pub title: Option<&'a str>,
+    pub name: &'a str,
+    pub rating: Option<Rating>,
+}
 
-pub fn initial_position(setup: Option<&PackedSetup>) -> Result<VariantPosition, InvalidSetup> {
+impl BorrowedGamePlayer<'_> {
+    fn pack<B: BufMut>(&self, buf: &mut B) {
+        pack_string(buf, self.title.unwrap_or(""));
+        pack_string(buf, self.name);
+        Rating::pack_optional(self.rating, buf);
+    }
+}
+
+/// A `LichessGame` borrowing its data, with setup and moves not yet decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorrowedLichessGame<'a> {
+    pub players: ByColor<BorrowedGamePlayer<'a>>,
+    pub date: LaxDate,
+    pub outcome: KnownOutcome,
+    pub speed: Option<Speed>,
+    pub rating_mode: RatingMode,
+    /// `PackedSetup`, decoded by `initial_position()`.
+    pub setup: Option<&'a [u8]>,
+    /// `PackedMoves`.
+    pub moves: &'a [u8],
+}
+
+impl BorrowedLichessGame<'_> {
+    pub fn initial_position(&self) -> VariantPosition {
+        let setup = self
+            .setup
+            .map(|bytes| PackedSetup::try_from_bytes(bytes).expect("valid setup"));
+        initial_position(setup.as_ref())
+    }
+
+    /// Packs the game like `LichessGame::pack_entire`.
+    pub fn pack_entire<B: BufMut>(&self, buf: &mut B) {
+        self.players.white.pack(buf);
+        self.players.black.pack(buf);
+        self.date.pack(buf);
+        buf.put_u8(outcome_bits(self.outcome));
+        pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
+        pack_bytes(buf, self.setup.unwrap_or(b""));
+        buf.put_slice(self.moves);
+    }
+}
+
+pub fn initial_position(setup: Option<&PackedSetup>) -> VariantPosition {
     match setup {
-        None => Ok(VariantPosition::new(Variant::Chess)),
+        None => VariantPosition::new(Variant::Chess),
         Some(setup) => {
-            let (setup, variant) = setup.unpack_variant().map_err(|_| InvalidSetup)?;
+            let (setup, variant) = setup.unpack_variant().expect("valid setup");
             VariantPosition::from_setup(variant, setup, CastlingMode::Chess960)
-                .map_err(|_| InvalidSetup)
+                .expect("valid setup")
         }
     }
 }

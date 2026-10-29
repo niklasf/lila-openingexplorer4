@@ -68,9 +68,9 @@ impl Sample {
                         }
                         let i = k * num_row_groups / samples;
                         let batch = input.read_games(i).expect("read row group");
-                        for row in batch.rows() {
+                        for (game_id, game) in batch.rows() {
                             rows += 1;
-                            let info = replayer.replay_row(&row, seq);
+                            let info = replayer.replay_game(game_id, &game, seq);
                             months.insert(info.month);
                             records += replayer.len() as u64;
                             for hash in replayer.hashes_before(SAMPLE_PLIES) {

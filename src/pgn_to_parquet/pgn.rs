@@ -98,7 +98,7 @@ impl ParsedGame {
                     )
                 })?);
             }
-            b"WhiteTitle" => {
+            b"WhiteTitle" if !value.as_bytes().is_empty() => {
                 self.white_title = Some(String::from_utf8(value.as_bytes().to_owned()).map_err(
                     |err| {
                         io::Error::new(
@@ -108,7 +108,7 @@ impl ParsedGame {
                     },
                 )?);
             }
-            b"BlackTitle" => {
+            b"BlackTitle" if !value.as_bytes().is_empty() => {
                 self.black_title = Some(String::from_utf8(value.as_bytes().to_owned()).map_err(
                     |err| {
                         io::Error::new(

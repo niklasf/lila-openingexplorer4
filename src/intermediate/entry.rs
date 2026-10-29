@@ -1,7 +1,7 @@
 use std::fmt;
 
 use bytes::{Buf, BufMut};
-use shakmaty::{KnownOutcome, Outcome, packed::PackedUciMove};
+use shakmaty::{KnownOutcome, packed::PackedUciMove};
 
 use crate::{
     intermediate::GlobalGameSeq,
@@ -39,10 +39,7 @@ impl IntermediateEntry {
         buf.put_slice(&m.to_bytes());
         buf.put_u8(header.to_byte());
         month.pack(&mut buf);
-        buf.put_uint(
-            seq.get() << 2 | u64::from(outcome_bits(Outcome::Known(outcome))),
-            5,
-        );
+        buf.put_uint(seq.get() << 2 | u64::from(outcome_bits(outcome)), 5);
         rating.pack_fixed(&mut buf);
         game_id.pack(&mut buf);
         debug_assert!(buf.is_empty());
@@ -105,10 +102,7 @@ impl IntermediateEntry {
 
     #[inline]
     pub fn outcome(&self) -> KnownOutcome {
-        match outcome_from_bits((self.seq_and_outcome() & 0b11) as u8) {
-            Some(Outcome::Known(outcome)) => outcome,
-            _ => unreachable!("invalid outcome"),
-        }
+        outcome_from_bits((self.seq_and_outcome() & 0b11) as u8).expect("valid outcome")
     }
 
     #[inline]

@@ -14,8 +14,8 @@ use indicatif::{MultiProgress, ProgressBar};
 use rocksdb::{EnvOptions, Options, SstFileWriter};
 
 use crate::{
-    packed::GameId,
-    parquet::{GameRow, Input, PrefetchTimes, Prefetcher},
+    packed::{BorrowedLichessGame, GameId},
+    parquet::{Input, PrefetchTimes, Prefetcher},
     scatter::{
         ChunkWriterConfig, ChunkWriterTimes, Layout, RESIDENT_PARTITIONS_PER_PASS, ScratchFile,
         spawn_chunk_writers,
@@ -52,10 +52,10 @@ impl Estimate {
         for k in 0..samples {
             let i = k * num_row_groups / samples;
             let batch = input.read_games(i).expect("read row group");
-            for row in batch.rows() {
+            for (_, game) in batch.rows() {
                 value.clear();
                 sampled_rows += 1;
-                row.pack_lichess_game(&mut value);
+                game.pack_entire(&mut value);
                 sampled_bytes += (GameId::SIZE + LEN_PREFIX + value.len()) as u64;
             }
         }
@@ -787,21 +787,20 @@ fn scatter_pass(
                 let mut chunks: Vec<Vec<u8>> =
                     (0..scratch_partitions).map(|_| new_chunk()).collect();
 
-                let route = |row: GameRow<'_>,
+                let route = |(game_id, game): (GameId, BorrowedLichessGame<'_>),
                              local_resident: &mut Vec<MemoryPartition>,
                              chunks: &mut Vec<Vec<u8>>| {
-                    let Some(j) = layout.pass_memory_partition(
-                        row.game_id.partition(layout.memory_partitions()),
-                        pass,
-                    ) else {
+                    let Some(j) = layout
+                        .pass_memory_partition(game_id.partition(layout.memory_partitions()), pass)
+                    else {
                         return;
                     };
-                    let pack = |buf: &mut Vec<u8>| row.pack_lichess_game(buf);
+                    let pack = |buf: &mut Vec<u8>| game.pack_entire(buf);
                     if j >= scratch_partitions {
-                        local_resident[j - scratch_partitions].push(row.game_id, pack);
+                        local_resident[j - scratch_partitions].push(game_id, pack);
                     } else {
                         let chunk = &mut chunks[j];
-                        push_record(chunk, row.game_id, pack);
+                        push_record(chunk, game_id, pack);
                         if chunk.len() >= CHUNK_SIZE {
                             let full = mem::replace(chunk, new_chunk());
                             timed(&times.send, || tx.send((j, full))).expect("send chunk");

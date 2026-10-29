@@ -19,9 +19,8 @@ use parquet::{
 };
 use shakmaty::{ByColor, KnownOutcome};
 
-use crate::{
-    packed::{GameId, LaxDate, Rating, RatingMode, Speed},
-    parquet::{GameRow, PlayerRow},
+use crate::packed::{
+    BorrowedGamePlayer, BorrowedLichessGame, GameId, LaxDate, Rating, RatingMode, Speed,
 };
 
 const DICTIONARY_COLUMNS: [&str; 5] = [
@@ -231,7 +230,7 @@ impl GameBatch {
     }
 
     #[inline]
-    pub fn rows(&self) -> impl Iterator<Item = GameRow<'_>> {
+    pub fn rows(&self) -> impl Iterator<Item = (GameId, BorrowedLichessGame<'_>)> {
         let columns = BatchColumns::new(&self.0);
         (0..self.len()).map(move |i| columns.get(i))
     }
@@ -281,8 +280,8 @@ impl<'a> PlayerColumns<'a> {
     }
 
     #[inline]
-    fn get(&self, i: usize) -> PlayerRow<'a> {
-        PlayerRow {
+    fn get(&self, i: usize) -> BorrowedGamePlayer<'a> {
+        BorrowedGamePlayer {
             title: self.title.get(i),
             name: self.name.value(i),
             rating: optional_int(self.rating, i)
@@ -330,9 +329,8 @@ impl<'a> BatchColumns<'a> {
     }
 
     #[inline]
-    fn get(&self, i: usize) -> GameRow<'a> {
-        GameRow {
-            game_id: GameId::unpack(&mut self.game_id.value(i)),
+    fn get(&self, i: usize) -> (GameId, BorrowedLichessGame<'a>) {
+        let game = BorrowedLichessGame {
             players: ByColor {
                 white: self.players.white.get(i),
                 black: self.players.black.get(i),
@@ -351,7 +349,8 @@ impl<'a> BatchColumns<'a> {
             setup: Some(self.setup.value(i))
                 .filter(|bytes| self.setup.is_valid(i) && !bytes.is_empty()),
             moves: self.moves.value(i),
-        }
+        };
+        (GameId::unpack(&mut self.game_id.value(i)), game)
     }
 }
 
@@ -428,24 +427,17 @@ mod tests {
         let batch = reader.read_games(0).unwrap();
         assert_eq!(batch.len(), 3);
 
-        let pack = |row: GameRow<'_>| {
-            let mut buf = row.game_id.to_bytes().to_vec();
-            buf.extend(row.players.white.title.unwrap_or("-").as_bytes());
-            buf.extend(row.speed.map_or("-", Speed::as_str).as_bytes());
-            row.pack_lichess_game(&mut buf);
-            buf
-        };
-        let expected: Vec<_> = columns.rows().map(pack).collect();
-        let actual: Vec<_> = batch.rows().map(pack).collect();
+        let expected: Vec<_> = columns.rows().collect();
+        let actual: Vec<_> = batch.rows().collect();
         assert_eq!(actual, expected);
 
         let fetched = reader.fetch_row_group(0).unwrap();
         assert!(fetched.len() < file_len);
         let batch = reader.read_games_from(0, fetched).unwrap();
-        let actual: Vec<_> = batch.rows().map(pack).collect();
+        let actual: Vec<_> = batch.rows().collect();
         assert_eq!(actual, expected);
 
-        let game_ids: Vec<GameId> = columns.rows().map(|row| row.game_id).collect();
+        let game_ids: Vec<GameId> = columns.rows().map(|(game_id, _)| game_id).collect();
         assert_eq!(reader.read_game_ids(0).unwrap(), game_ids);
     }
 }
