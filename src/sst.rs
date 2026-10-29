@@ -1,6 +1,12 @@
 use std::path::PathBuf;
 
-use rocksdb::{BlockBasedOptions, DBCompressionType, EnvOptions, Options, SstFileWriter};
+use rocksdb::{
+    BlockBasedIndexType, BlockBasedOptions, DBCompressionType, DataBlockIndexType, EnvOptions,
+    Options, SstFileWriter,
+};
+
+/// Bloom-equivalent bits per key of filters, for about 1% false positives.
+const FILTER_BITS_PER_KEY: f64 = 10.0;
 
 #[derive(Debug, Copy, Clone)]
 pub struct SstConfig {
@@ -14,7 +20,9 @@ pub struct SstConfig {
 }
 
 impl SstConfig {
-    pub fn options(&self) -> Options {
+    /// Options for SST files that serve point lookups. Use a `filter` if
+    /// lookups often miss and the keys are sparse.
+    pub fn options(&self, filter: bool) -> Options {
         let mut opts = Options::default();
         if self.zstd_level == 0 {
             opts.set_compression_type(DBCompressionType::None);
@@ -27,6 +35,18 @@ impl SstConfig {
         }
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_size(self.block_size);
+        // Hash lookup within data blocks, instead of binary search.
+        table_opts.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
+        table_opts.set_data_block_hash_ratio(0.75);
+        // Large files: partition the index (and the filter), so that only
+        // the top-level index needs to stay in memory.
+        table_opts.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+        table_opts.set_metadata_block_size(4096);
+        if filter {
+            table_opts.set_ribbon_filter(FILTER_BITS_PER_KEY);
+            table_opts.set_partition_filters(true);
+            table_opts.set_optimize_filters_for_memory(true);
+        }
         opts.set_block_based_table_factory(&table_opts);
         opts
     }

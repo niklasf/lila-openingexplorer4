@@ -50,9 +50,10 @@ struct Args {
     /// cold_positions and positions (which must be empty or missing).
     #[clap(long)]
     out: PathBuf,
-    /// Only index the positions of the first plies of each game.
-    #[clap(long)]
-    max_ply: Option<usize>,
+    /// Only index the positions of the first plies of each game, or 0 for
+    /// all positions.
+    #[clap(long, default_value = "50")]
+    max_ply: usize,
     /// Skip the first row groups of the inputs.
     #[clap(long, default_value = "0", help_heading = "Benchmarking")]
     skip_row_groups: usize,
@@ -77,7 +78,8 @@ struct Args {
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]
     sst_block_size: usize,
-    /// Zstd level of the SST files, or 0 for no compression.
+    /// Zstd level of the cold positions SST files, or 0 for no compression.
+    /// The positions SST files are not compressed.
     #[clap(long, default_value = "3", value_parser = zstd_level())]
     sst_zstd_level: i32,
     /// Maximum size of the zstd dictionary trained for each SST file
@@ -134,7 +136,7 @@ fn main() {
         io_depth: args.io_depth,
         direct_io: !args.no_direct_io,
         scratch_zstd_level: args.scratch_zstd_level,
-        max_ply: args.max_ply,
+        max_ply: (args.max_ply > 0).then_some(args.max_ply),
         skip_row_groups: args.skip_row_groups,
         row_groups: args.row_groups,
         scatter_only: args.scatter_only,

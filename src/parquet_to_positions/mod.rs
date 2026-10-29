@@ -4,7 +4,7 @@ mod replay;
 mod write;
 
 use std::{
-    fmt, fs, io, mem,
+    fmt, io, mem,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -34,7 +34,7 @@ use crate::{
         spawn_chunk_writers,
     },
     sst::SstConfig,
-    util::{Gauge, log_above, progress_bar, timed, timed_seconds},
+    util::{Gauge, create_dir, create_empty_dir, log_above, progress_bar, timed, timed_seconds},
 };
 
 /// Partitions in memory at the same time: one being written to SST files,
@@ -336,19 +336,6 @@ struct PartitionJob {
     hot: HotEntries,
 }
 
-/// Creates an empty output directory.
-fn create_out_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)
-        .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", dir.display())))?;
-    if fs::read_dir(dir)?.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{}: not empty", dir.display()),
-        ));
-    }
-    Ok(())
-}
-
 /// Indexes the positions of the planned input into SST files in
 /// `out/cold_positions` and `out/positions`, using `scratch_dir` for
 /// temporary partition files.
@@ -372,12 +359,21 @@ pub fn convert(
     } = *plan;
 
     // Fail early rather than after the first scatter pass.
-    create_out_dir(&out.join(COLD_DIR))?;
-    create_out_dir(&out.join(POSITIONS_DIR))?;
+    create_dir(scratch_dir)?;
+    create_dir(out)?;
+    create_empty_dir(&out.join(COLD_DIR))?;
+    create_empty_dir(&out.join(POSITIONS_DIR))?;
 
     let hot_set: IntSet<Zobrist96> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
     let sst = SstContext {
-        opts: &config.sst.options(),
+        // Cold keys are dense prefixes of the hash space: every lookup
+        // hits a group, so a filter would not help.
+        cold_opts: &config.sst.options(false),
+        positions_opts: &SstConfig {
+            zstd_level: 0, // Incompressible data
+            ..config.sst
+        }
+        .options(true),
         env_opts: &config.sst.env_options(),
         out,
         target_size: config.sst_target_size,

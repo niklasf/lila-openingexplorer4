@@ -16,7 +16,7 @@ pub struct IntermediateEntry(pub [u8; IntermediateEntry::SIZE]);
 
 impl IntermediateEntry {
     pub const SIZE: usize = 30;
-    pub const KEY_SIZE: usize = Zobrist96::SIZE + 2;
+    pub const KEY_SIZE: usize = Zobrist96::SIZE;
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -36,9 +36,9 @@ impl IntermediateEntry {
         let mut bytes = [0; Self::SIZE];
         let mut buf = &mut bytes[..];
         hash.pack(&mut buf);
-        month.pack(&mut buf);
         buf.put_slice(&m.to_bytes());
         buf.put_u8(header.to_byte());
+        month.pack(&mut buf);
         buf.put_uint(
             seq.get() << 2 | u64::from(outcome_bits(Outcome::Known(outcome))),
             5,
@@ -61,7 +61,7 @@ impl IntermediateEntry {
 
     #[inline]
     pub fn sort_key(&self) -> (u128, u64) {
-        // key() + month() + sub_key() + seq_and_outcome()
+        // key() + sub_key() + month() + seq_and_outcome()
         (
             u128::from_be_bytes(self.0[..16].try_into().expect("16 bytes")),
             u64::from_be_bytes(self.0[14..22].try_into().expect("8 bytes")),
@@ -75,12 +75,12 @@ impl IntermediateEntry {
 
     #[inline]
     pub fn month(&self) -> Month {
-        Month::unpack(&mut &self.0[12..14])
+        Month::unpack(&mut &self.0[15..17])
     }
 
     #[inline]
     pub fn sub_key(&self) -> IntermediateSubKey {
-        IntermediateSubKey(self.0[14..17].try_into().expect("3 bytes"))
+        IntermediateSubKey(self.0[12..15].try_into().expect("3 bytes"))
     }
 
     #[inline]

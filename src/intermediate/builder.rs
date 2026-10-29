@@ -2,37 +2,43 @@ use std::collections::BTreeMap;
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry, IntermediateSubKey},
-    packed::{GameId, LichessEntry, SubStats},
+    packed::{GAMES_PER_CELL, GameId, LichessEntry, Month, SubStats},
 };
 
-pub const GAMES_PER_SUB_ENTRY: usize = 8;
+/// Chronological order of games: by month, then in input order.
+type GameKey = (Month, GlobalGameSeq);
 
 /// Reusable buffers for packing entries.
 #[derive(Default)]
 pub struct EntryPacker {
-    /// Sub-entries with the range of their kept games.
-    subs: Vec<(IntermediateSubKey, SubStats, usize, usize)>,
-    games: Vec<(GlobalGameSeq, GameId)>,
+    /// Months of groups, with the start and end index of their kept games.
+    cells: Vec<(IntermediateSubKey, Month, SubStats, usize, usize)>,
+    games: Vec<(GameKey, GameId)>,
 }
 
 impl EntryPacker {
     /// Packs the entry of the sorted intermediate entries of one key.
     pub fn pack_sorted(&mut self, records: &[IntermediateEntry], buf: &mut Vec<u8>) {
-        self.subs.clear();
+        self.cells.clear();
         self.games.clear();
-        for run in records.chunk_by(|a, b| a.sub_key() == b.sub_key()) {
+        for run in records.chunk_by(|a, b| a.sub_key() == b.sub_key() && a.month() == b.month()) {
             let mut stats = SubStats::default();
             for record in run {
                 stats.add(record.rating(), record.outcome());
             }
             let start = self.games.len();
             self.games.extend(
-                run[run.len().saturating_sub(GAMES_PER_SUB_ENTRY)..]
+                run[run.len().saturating_sub(GAMES_PER_CELL)..]
                     .iter()
-                    .map(|record| (record.seq(), record.game_id())),
+                    .map(|record| ((record.month(), record.seq()), record.game_id())),
             );
-            self.subs
-                .push((run[0].sub_key(), stats, start, self.games.len()));
+            self.cells.push((
+                run[0].sub_key(),
+                run[0].month(),
+                stats,
+                start,
+                self.games.len(),
+            ));
         }
 
         self.pack(buf);
@@ -40,15 +46,15 @@ impl EntryPacker {
 
     fn pack(&self, buf: &mut Vec<u8>) {
         buf.clear();
-        let games = &self.games;
         LichessEntry::pack_entire_external(
             buf,
-            self.subs.iter().map(|(key, stats, start, end)| {
+            self.cells.iter().map(|(key, month, stats, start, end)| {
                 (
                     key.uci_move(),
                     key.group_header(),
+                    *month,
                     stats,
-                    &games[*start..*end],
+                    &self.games[*start..*end],
                 )
             }),
         );
@@ -56,49 +62,53 @@ impl EntryPacker {
 }
 
 #[derive(Default)]
-struct SubBuilder {
+struct CellBuilder {
     stats: SubStats,
-    /// Kept games, truncated to the last `GAMES_PER_SUB_ENTRY` by sequence
-    /// number once in a while.
-    games: Vec<(GlobalGameSeq, GameId)>,
+    /// Kept games, truncated to the most recent `GAMES_PER_CELL` once in a
+    /// while.
+    games: Vec<(GameKey, GameId)>,
 }
 
-impl SubBuilder {
+impl CellBuilder {
     fn add(&mut self, record: &IntermediateEntry) {
         self.stats.add(record.rating(), record.outcome());
-        self.games.push((record.seq(), record.game_id()));
-        if self.games.len() >= 4 * GAMES_PER_SUB_ENTRY {
+        self.games
+            .push(((record.month(), record.seq()), record.game_id()));
+        if self.games.len() >= 4 * GAMES_PER_CELL {
             self.gc();
         }
     }
 
     fn gc(&mut self) {
-        self.games.sort_unstable_by_key(|(seq, _)| *seq);
+        self.games.sort_unstable_by_key(|(key, _)| *key);
         self.games
-            .drain(..self.games.len().saturating_sub(GAMES_PER_SUB_ENTRY));
+            .drain(..self.games.len().saturating_sub(GAMES_PER_CELL));
     }
 }
 
 #[derive(Default)]
 pub struct EntryBuilder {
-    subs: BTreeMap<IntermediateSubKey, SubBuilder>,
+    cells: BTreeMap<(IntermediateSubKey, Month), CellBuilder>,
 }
 
 impl EntryBuilder {
     pub fn add(&mut self, record: &IntermediateEntry) {
-        self.subs.entry(record.sub_key()).or_default().add(record);
+        self.cells
+            .entry((record.sub_key(), record.month()))
+            .or_default()
+            .add(record);
     }
 
     pub fn pack(self, packer: &mut EntryPacker, buf: &mut Vec<u8>) {
-        packer.subs.clear();
+        packer.cells.clear();
         packer.games.clear();
-        for (key, mut sub) in self.subs {
-            sub.gc();
+        for ((key, month), mut cell) in self.cells {
+            cell.gc();
             let start = packer.games.len();
-            packer.games.extend(sub.games);
+            packer.games.extend(cell.games);
             packer
-                .subs
-                .push((key, sub.stats, start, packer.games.len()));
+                .cells
+                .push((key, month, cell.stats, start, packer.games.len()));
         }
         packer.pack(buf);
     }
@@ -116,7 +126,7 @@ mod tests {
     fn test_packers_agree() {
         arbtest(|u| {
             let hash: Zobrist96 = u.arbitrary()?;
-            let month: Month = u.arbitrary()?;
+            let mut month = Month::from_months_since_jan_1900(u.int_in_range(1356..=1700)?);
             let moves = [
                 UciMove::Normal {
                     from: Square::E2,
@@ -135,6 +145,12 @@ mod tests {
             let mut seq = 0;
             for _ in 0..u.int_in_range(1..=200)? {
                 seq += u.int_in_range(1..=3)?;
+                // Input order is chronological by month.
+                if u.ratio(1, 8)? {
+                    month = Month::from_months_since_jan_1900(
+                        month.months_since_jan_1900() + u.int_in_range(1..=30)?,
+                    );
+                }
                 let m = PackedUciMove::pack(*u.choose(&moves)?);
                 let speed = *u.choose(&[Speed::Blitz, Speed::Rapid])?;
                 let rating = Rating::try_from(u.int_in_range(900..=1300)?).unwrap();
@@ -144,9 +160,8 @@ mod tests {
                 records.push(IntermediateEntry::new(
                     hash, month, m, speed, rating, outcome, seq, game_id,
                 ));
-                lichess_entry.add_game(m, speed, rating, outcome, game_id);
+                lichess_entry.add_game(m, speed, rating, outcome, month, game_id);
             }
-            lichess_entry.truncate_games(GAMES_PER_SUB_ENTRY);
             let mut expected = Vec::new();
             lichess_entry.pack_entire(&mut expected);
             let unpack = |buf: &[u8]| {

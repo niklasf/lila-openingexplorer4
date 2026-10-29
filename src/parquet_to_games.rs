@@ -1,5 +1,5 @@
 use std::{
-    fmt, fs, io, mem,
+    fmt, io, mem,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -21,7 +21,7 @@ use crate::{
         spawn_chunk_writers,
     },
     sst::SstConfig,
-    util::{Gauge, log_above, progress_bar, timed, timed_seconds},
+    util::{Gauge, create_dir, create_empty_dir, log_above, progress_bar, timed, timed_seconds},
 };
 
 /// Partitions in memory at the same time: one being written to SST files,
@@ -172,6 +172,8 @@ pub struct Config {
     pub direct_io: bool,
     /// Zstd level for scratch chunks, or 0 for no compression.
     pub scratch_zstd_level: i32,
+    /// Skip the first row groups of the inputs.
+    pub skip_row_groups: usize,
     /// Only process the first row groups of the inputs.
     pub row_groups: Option<usize>,
     /// Stop after the scatter of the first pass.
@@ -448,7 +450,12 @@ pub struct Plan {
 impl Plan {
     pub fn new(parquet: &[PathBuf], config: &Config) -> io::Result<Plan> {
         let threads = config.threads;
-        let input = Input::open(parquet, 0, config.row_groups, config.direct_io)?;
+        let input = Input::open(
+            parquet,
+            config.skip_row_groups,
+            config.row_groups,
+            config.direct_io,
+        )?;
 
         let estimate = Estimate::sample(&input);
         // The layout depends on the read threads (buffers), which depend on
@@ -533,15 +540,8 @@ pub fn convert(
     let num_rows = estimate.rows;
 
     // Fail early rather than after the first scatter pass.
-    if !fs::metadata(out)
-        .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", out.display())))?
-        .is_dir()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::NotADirectory,
-            format!("{}: not a directory", out.display()),
-        ));
-    }
+    create_dir(scratch_dir)?;
+    create_empty_dir(out)?;
 
     let sst_config = SstConfig {
         block_size: config.sst_block_size,
@@ -550,7 +550,7 @@ pub fn convert(
         direct_io: config.direct_io,
     };
     let sst = SstContext {
-        opts: &sst_config.options(),
+        opts: &sst_config.options(false),
         env_opts: &sst_config.env_options(),
         out,
         target_size: config.sst_target_size,

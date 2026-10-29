@@ -31,7 +31,7 @@ const MIN_SAMPLE_COUNT: u64 = 64;
 
 const MAX_HOT: usize = 256;
 
-/// Estimated memory per hot key (hash and month).
+/// Estimated memory per month of a hot position.
 pub const HOT_KEY_MEMORY: u64 = 64 << 10;
 
 /// Statistics from replaying a sample of the input.

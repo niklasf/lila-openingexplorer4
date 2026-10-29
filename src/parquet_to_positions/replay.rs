@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
     packed::{GameId, InvalidPackedMoves, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
-    parquet::{GameRow, InvalidGameRow},
+    parquet::{GameRow, InvalidGameRow, PreparedGame},
 };
 
 #[derive(Debug, Error)]
@@ -74,6 +74,9 @@ impl Replayer {
         row: &GameRow<'_>,
         seq: GlobalGameSeq,
     ) -> Result<GameInfo, InvalidGame> {
+        // Index only games that parquet_to_games would store.
+        let _: PreparedGame<'_> = row.prepare()?;
+
         let pos = row.initial_position()?;
         let info = GameInfo {
             game_id: row.game_id,

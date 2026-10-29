@@ -15,6 +15,10 @@ impl Month {
         Self { since_jan_1900 }
     }
 
+    pub fn months_since_jan_1900(self) -> u16 {
+        self.since_jan_1900
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B) {
         buf.put_u16(self.since_jan_1900);
     }

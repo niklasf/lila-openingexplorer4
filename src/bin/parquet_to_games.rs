@@ -44,9 +44,12 @@ struct Args {
     /// Zstd level for scratch chunks, or 0 for no compression.
     #[clap(long, default_value = "1", value_parser = zstd_level())]
     scratch_zstd_level: i32,
-    /// Directory for the final SST files.
+    /// Directory for the final SST files (which must be empty or missing).
     #[clap(long)]
     out: PathBuf,
+    /// Skip the first row groups of the inputs.
+    #[clap(long, default_value = "0", help_heading = "Benchmarking")]
+    skip_row_groups: usize,
     /// Only process the first row groups of the inputs.
     #[clap(long, help_heading = "Benchmarking")]
     row_groups: Option<usize>,
@@ -125,6 +128,7 @@ fn main() {
         io_depth: args.io_depth,
         direct_io: !args.no_direct_io,
         scratch_zstd_level: args.scratch_zstd_level,
+        skip_row_groups: args.skip_row_groups,
         row_groups: args.row_groups,
         scatter_only: args.scatter_only,
         overlap: !args.no_overlap,

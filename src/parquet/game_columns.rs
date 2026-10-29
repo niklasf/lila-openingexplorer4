@@ -11,7 +11,9 @@ use parquet::{
     },
     schema::types::{ColumnPath, Type, TypePtr},
 };
-use shakmaty::{ByColor, KnownOutcome, Outcome, packed::PackedSetup, variant::VariantPosition};
+use shakmaty::{
+    ByColor, Color, KnownOutcome, Outcome, packed::PackedSetup, variant::VariantPosition,
+};
 use thiserror::Error;
 
 use crate::{
@@ -149,7 +151,7 @@ pub enum InvalidGameRow {
     InvalidSetup,
 }
 
-impl GameRow<'_> {
+impl<'a> GameRow<'a> {
     pub fn ratings(&self) -> Result<ByColor<Rating>, InvalidGameRow> {
         self.players.as_ref().try_map(|player| {
             Rating::try_from(player.rating.ok_or(InvalidGameRow::MissingRating)?)
@@ -195,38 +197,61 @@ impl GameRow<'_> {
         initial_position(self.initial_setup()?.as_ref()).map_err(|_| InvalidGameRow::InvalidSetup)
     }
 
+    pub fn prepare(&self) -> Result<PreparedGame<'a>, InvalidGameRow> {
+        Ok(PreparedGame {
+            players: self
+                .players
+                .as_ref()
+                .map(|player| (player.title.unwrap_or(b""), player.name)),
+            ratings: self.ratings()?,
+            date: LaxDate::from_ymd(
+                u32::try_from(self.date_year.ok_or(InvalidGameRow::MissingDate)?)
+                    .map_err(|_| InvalidGameRow::InvalidDate)?,
+                optional_u8(self.date_month)?,
+                optional_u8(self.date_day)?,
+            )
+            .map_err(|_| InvalidGameRow::InvalidDate)?,
+            outcome: self.outcome()?,
+            speed: self.speed()?,
+            rating_mode: RatingMode::from_ascii(self.rating_mode)
+                .map_err(|_| InvalidGameRow::InvalidRatingMode)?,
+            setup: self.setup.unwrap_or(b""),
+            moves: self.moves,
+        })
+    }
+
     pub fn pack_lichess_game<B: BufMut>(&self, buf: &mut B) -> Result<(), InvalidGameRow> {
-        let ratings = self.ratings()?;
-
-        let date = LaxDate::from_ymd(
-            u32::try_from(self.date_year.ok_or(InvalidGameRow::MissingDate)?)
-                .map_err(|_| InvalidGameRow::InvalidDate)?,
-            optional_u8(self.date_month)?,
-            optional_u8(self.date_day)?,
-        )
-        .map_err(|_| InvalidGameRow::InvalidDate)?;
-
-        let outcome = self.outcome()?;
-
-        let speed = self.speed()?;
-
-        let rating_mode = RatingMode::from_ascii(self.rating_mode)
-            .map_err(|_| InvalidGameRow::InvalidRatingMode)?;
-
-        for (player, rating) in [
-            (&self.players.white, ratings.white),
-            (&self.players.black, ratings.black),
-        ] {
-            pack_bytes(buf, player.title.unwrap_or(b""));
-            pack_bytes(buf, player.name);
-            rating.pack(buf);
-        }
-        date.pack(buf);
-        buf.put_u8(outcome_bits(outcome));
-        pack_speed_and_rating_mode(buf, speed, rating_mode);
-        pack_bytes(buf, self.setup.unwrap_or(b""));
-        buf.put_slice(self.moves);
+        self.prepare()?.pack(buf);
         Ok(())
+    }
+}
+
+pub struct PreparedGame<'a> {
+    /// Title and name of each player.
+    players: ByColor<(&'a [u8], &'a [u8])>,
+    ratings: ByColor<Rating>,
+    date: LaxDate,
+    outcome: Outcome,
+    speed: Speed,
+    rating_mode: RatingMode,
+    setup: &'a [u8],
+    moves: &'a [u8],
+}
+
+impl PreparedGame<'_> {
+    /// Packs the game like `LichessGame::pack_entire`.
+    pub fn pack<B: BufMut>(&self, buf: &mut B) {
+        for color in Color::ALL {
+            let &(title, name) = self.players.get(color);
+            pack_bytes(buf, title);
+            pack_bytes(buf, name);
+            self.ratings.get(color).pack(buf);
+        }
+        self.date.pack(buf);
+        buf.put_u8(outcome_bits(self.outcome));
+        pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
+        pack_bytes(buf, self.setup);
+        buf.put_slice(self.moves);
     }
 }
 

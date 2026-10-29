@@ -1,4 +1,4 @@
-use std::{ffi::CString, mem, path::Path};
+use std::{ffi::CString, fs, io, mem, path::Path};
 
 /// Total physical memory in bytes.
 pub fn total_memory() -> Option<u64> {
@@ -20,4 +20,31 @@ pub fn free_space(path: &Path) -> Option<u64> {
         return None;
     }
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// Creates a directory, unless it already exists.
+pub fn create_dir(dir: &Path) -> io::Result<()> {
+    match fs::create_dir(dir) {
+        Err(err) if err.kind() != io::ErrorKind::AlreadyExists => Err(io::Error::new(
+            err.kind(),
+            format!("{}: {err}", dir.display()),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Creates a directory like `create_dir`, and fails if it is not empty.
+pub fn create_empty_dir(dir: &Path) -> io::Result<()> {
+    create_dir(dir)?;
+    if fs::read_dir(dir)
+        .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", dir.display())))?
+        .next()
+        .is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{}: not empty", dir.display()),
+        ));
+    }
+    Ok(())
 }

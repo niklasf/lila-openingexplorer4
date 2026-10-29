@@ -32,12 +32,14 @@ const RANGES_PER_THREAD: usize = 4;
 /// size estimate of a range is far off.
 const MAX_FILE_SIZE_FACTOR: u64 = 2;
 
-/// Initial guesses for SST bytes per record, used until measured.
-const INITIAL_COLD_BYTES_PER_RECORD: f64 = 9.0;
-const INITIAL_POSITIONS_BYTES_PER_RECORD: f64 = 2.0;
+/// Initial guesses for SST bytes per record (of both column families),
+/// used until measured. From the full run at 50 plies.
+const INITIAL_COLD_BYTES_PER_RECORD: f64 = 4.3;
+const INITIAL_POSITIONS_BYTES_PER_RECORD: f64 = 3.8;
 
 pub struct SstContext<'a> {
-    pub opts: &'a Options,
+    pub cold_opts: &'a Options,
+    pub positions_opts: &'a Options,
     pub env_opts: &'a EnvOptions,
     pub out: &'a Path,
     /// Approximate size of the SST files.
@@ -173,12 +175,12 @@ fn write_range(
     packer: &mut EntryPacker,
     buf: &mut Vec<u8>,
 ) -> Result<OutputStats, rocksdb::Error> {
-    let dir = match family {
-        Family::Cold => COLD_DIR,
-        Family::Positions => POSITIONS_DIR,
+    let (dir, opts) = match family {
+        Family::Cold => (COLD_DIR, sst.cold_opts),
+        Family::Positions => (POSITIONS_DIR, sst.positions_opts),
     };
     let mut writer = RollingSstWriter::new(
-        sst.opts,
+        opts,
         sst.env_opts,
         sst.out.join(dir).join(name),
         MAX_FILE_SIZE_FACTOR * sst.target_size,
@@ -228,10 +230,8 @@ fn write_range(
                         .is_none_or(|(key, _)| key[..Zobrist96::SIZE] != *hash),
                     "hot hash in partition records"
                 );
-                for records in run.chunk_by(|a, b| a.key() == b.key()) {
-                    packer.pack_sorted(records, buf);
-                    writer.put(records[0].key(), buf)?;
-                }
+                packer.pack_sorted(run, buf);
+                writer.put(run[0].key(), buf)?;
                 position_records += run.len() as u64;
             }
         }

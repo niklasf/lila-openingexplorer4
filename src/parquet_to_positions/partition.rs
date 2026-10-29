@@ -191,13 +191,13 @@ mod tests {
             let memory_partitions: usize = u.int_in_range(1..=5000)?;
             let p = u.int_in_range(0..=memory_partitions - 1)?;
             // Prefixes mapped to memory partition p.
-            let lo = ((p as u128) << 64).div_ceil(memory_partitions as u128);
-            let hi = (((p + 1) as u128) << 64).div_ceil(memory_partitions as u128);
+            let lo = ((p as u64) << 32).div_ceil(memory_partitions as u64);
+            let hi = (((p + 1) as u64) << 32).div_ceil(memory_partitions as u64);
             let mut records: Vec<IntermediateEntry> = Vec::new();
             for _ in 0..u.int_in_range(0..=2000)? {
                 let mut bytes: [u8; IntermediateEntry::SIZE] = u.arbitrary()?;
-                let prefix = (lo + u.int_in_range(0..=hi - lo - 1)?) as u64;
-                bytes[..8].copy_from_slice(&prefix.to_be_bytes());
+                let prefix = (lo + u.int_in_range(0..=hi - lo - 1)?) as u32;
+                bytes[..ColdKey::PREFIX_SIZE].copy_from_slice(&prefix.to_be_bytes());
                 assert_eq!(
                     memory_partition(IntermediateEntry(bytes).key(), memory_partitions),
                     p
