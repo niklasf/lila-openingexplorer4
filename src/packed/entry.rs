@@ -54,23 +54,21 @@ impl RatingGroup {
         }
     }
 
-    /// A typical rating of the group, as `Rating::offset()`. Rating sums are
-    /// packed relative to it, to keep them small.
-    fn typical_offset(self) -> i64 {
-        let typical = match self {
-            RatingGroup::Low => 800,
-            RatingGroup::Group1000 => 1100,
-            RatingGroup::Group1200 => 1300,
-            RatingGroup::Group1400 => 1500,
-            RatingGroup::Group1600 => 1700,
-            RatingGroup::Group1800 => 1900,
-            RatingGroup::Group2000 => 2100,
-            RatingGroup::Group2200 => 2350,
-            RatingGroup::Group2500 => 2650,
-            RatingGroup::Group2800 => 3000,
-            RatingGroup::Group3200 => 3300,
-        };
-        i64::from(Rating::try_from(typical).expect("typical rating").offset())
+    fn typical_rating(self) -> Rating {
+        Rating::try_from(match self {
+            RatingGroup::Low => 884,
+            RatingGroup::Group1000 => 1111,
+            RatingGroup::Group1200 => 1307,
+            RatingGroup::Group1400 => 1504,
+            RatingGroup::Group1600 => 1701,
+            RatingGroup::Group1800 => 1896,
+            RatingGroup::Group2000 => 2089,
+            RatingGroup::Group2200 => 2310,
+            RatingGroup::Group2500 => 2600,
+            RatingGroup::Group2800 => 2925,
+            RatingGroup::Group3200 => 3269,
+        })
+        .expect("typical rating")
     }
 }
 
@@ -208,7 +206,8 @@ impl SubStats {
         }
         pack_int(
             buf,
-            self.rating_offset_sum - self.games() as i64 * rating_group.typical_offset(),
+            self.rating_offset_sum
+                - self.games() as i64 * i64::from(rating_group.typical_rating().offset()),
         );
     }
 
@@ -225,8 +224,8 @@ impl SubStats {
                 stats.black = unpack_uint(buf);
             }
         }
-        stats.rating_offset_sum =
-            unpack_int(buf) + stats.games() as i64 * rating_group.typical_offset();
+        stats.rating_offset_sum = unpack_int(buf)
+            + stats.games() as i64 * i64::from(rating_group.typical_rating().offset());
         stats
     }
 }
