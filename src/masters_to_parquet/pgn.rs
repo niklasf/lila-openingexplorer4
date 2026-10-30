@@ -11,7 +11,9 @@ use shakmaty::{
 
 use crate::{
     masters_to_parquet::id::{IdInput, push_uci},
-    packed::{GameId, GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode},
+    packed::{
+        EventInfo, GameId, GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode,
+    },
 };
 
 pub struct MastersVisitor;
@@ -27,15 +29,6 @@ pub struct ParsedMastersGame {
     result: Option<Outcome>,
     fen: Option<Fen>,
     moves: Vec<San>,
-}
-
-/// A masters game with its event tags.
-pub struct MastersGame {
-    pub game_id: GameId,
-    pub game: LichessGame,
-    pub event: String,
-    pub site: String,
-    pub round: String,
 }
 
 fn invalid(msg: String) -> io::Error {
@@ -104,7 +97,7 @@ impl ParsedMastersGame {
         )
     }
 
-    pub fn into_game(self) -> io::Result<MastersGame> {
+    pub fn into_game(self) -> io::Result<(GameId, LichessGame)> {
         let context = self.context();
         let required = |name: &str, value: Option<String>| {
             value.ok_or_else(|| invalid(format!("missing {name} tag @ {context}")))
@@ -177,9 +170,9 @@ impl ParsedMastersGame {
                 .map_err(|err| invalid(format!("invalid elo {elo}: {err} @ {context}")))
         };
 
-        Ok(MastersGame {
+        Ok((
             game_id,
-            game: LichessGame {
+            LichessGame {
                 players: ByColor {
                     white: GamePlayer {
                         title: None,
@@ -197,12 +190,10 @@ impl ParsedMastersGame {
                 speed: None,
                 rating_mode: RatingMode::Rated,
                 setup,
+                event: Some(EventInfo { event, site, round }),
                 moves: encoder.finish(),
             },
-            event,
-            site,
-            round,
-        })
+        ))
     }
 }
 

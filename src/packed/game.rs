@@ -44,12 +44,53 @@ pub fn outcome_from_bits(bits: u8) -> Option<KnownOutcome> {
 }
 
 /// Event tags of a game from an external collection (like the masters
-/// database), which are not part of the `LichessGame` record.
+/// database).
+#[derive(Arbitrary, Debug, Clone, PartialEq, Eq)]
+pub struct EventInfo {
+    pub event: String,
+    pub site: String,
+    pub round: String,
+}
+
+impl EventInfo {
+    pub fn as_borrowed(&self) -> BorrowedEventInfo<'_> {
+        BorrowedEventInfo {
+            event: &self.event,
+            site: &self.site,
+            round: &self.round,
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct EventInfo<'a> {
+pub struct BorrowedEventInfo<'a> {
     pub event: &'a str,
     pub site: &'a str,
     pub round: &'a str,
+}
+
+impl<'a> BorrowedEventInfo<'a> {
+    fn pack<B: BufMut>(&self, buf: &mut B) {
+        pack_string(buf, self.event);
+        pack_string(buf, self.site);
+        pack_string(buf, self.round);
+    }
+
+    fn unpack(buf: &mut &'a [u8]) -> Self {
+        BorrowedEventInfo {
+            event: unpack_string(buf),
+            site: unpack_string(buf),
+            round: unpack_string(buf),
+        }
+    }
+
+    pub fn into_owned(self) -> EventInfo {
+        EventInfo {
+            event: self.event.to_owned(),
+            site: self.site.to_owned(),
+            round: self.round.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,24 +253,29 @@ impl RatingMode {
 #[error("invalid rating mode")]
 pub struct InvalidRatingMode;
 
-/// Packs the speed into the low 3 bits (0 if missing), and the rating mode
-/// into the next bit.
-pub fn pack_speed_and_rating_mode<B: BufMut>(
+/// Packs the speed into the low 3 bits (0 if missing), the rating mode
+/// into the next bit, and whether event tags follow into the bit after
+/// that.
+pub fn pack_game_flags<B: BufMut>(
     buf: &mut B,
     speed: Option<Speed>,
     rating_mode: RatingMode,
+    has_event: bool,
 ) {
-    buf.put_u8(speed.map_or(0, Speed::bits) | (rating_mode.bits() << 3));
+    buf.put_u8(
+        speed.map_or(0, Speed::bits) | (rating_mode.bits() << 3) | (u8::from(has_event) << 4),
+    );
 }
 
-pub fn unpack_speed_and_rating_mode<B: Buf>(buf: &mut B) -> (Option<Speed>, RatingMode) {
+pub fn unpack_game_flags<B: Buf>(buf: &mut B) -> (Option<Speed>, RatingMode, bool) {
     let packed = buf.get_u8();
     let speed = match packed & 0b111 {
         0 => None,
         bits => Some(Speed::from_bits(bits).expect("valid speed")),
     };
-    let rating_mode = RatingMode::from_bits(packed >> 3).expect("valid rating mode");
-    (speed, rating_mode)
+    let rating_mode = RatingMode::from_bits((packed >> 3) & 1).expect("valid rating mode");
+    let has_event = (packed >> 4) & 1 != 0;
+    (speed, rating_mode, has_event)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +286,7 @@ pub struct LichessGame {
     pub speed: Option<Speed>,
     pub rating_mode: RatingMode,
     pub setup: Option<PackedSetup>,
+    pub event: Option<EventInfo>,
     pub moves: PackedMoves,
 }
 
@@ -252,6 +299,7 @@ impl LichessGame {
             speed: self.speed,
             rating_mode: self.rating_mode,
             setup: self.setup.as_ref().map(PackedSetup::as_bytes),
+            event: self.event.as_ref().map(EventInfo::as_borrowed),
             moves: &self.moves.0,
         }
     }
@@ -297,6 +345,7 @@ impl Arbitrary<'_> for LichessGame {
                 )
                 .expect("packed setup")
             }),
+            event: u.arbitrary()?,
             moves: packed_moves.finish(),
         })
     }
@@ -344,6 +393,7 @@ pub struct BorrowedLichessGame<'a> {
     pub rating_mode: RatingMode,
     /// `PackedSetup`, decoded by `initial_position()`.
     pub setup: Option<&'a [u8]>,
+    pub event: Option<BorrowedEventInfo<'a>>,
     /// `PackedMoves`.
     pub moves: &'a [u8],
 }
@@ -357,8 +407,9 @@ impl<'a> BorrowedLichessGame<'a> {
         };
         let date = LaxDate::unpack(&mut buf);
         let outcome = outcome_from_bits(buf.get_u8()).expect("valid outcome");
-        let (speed, rating_mode) = unpack_speed_and_rating_mode(&mut buf);
+        let (speed, rating_mode, has_event) = unpack_game_flags(&mut buf);
         let setup = Some(unpack_bytes(&mut buf)).filter(|setup| !setup.is_empty());
+        let event = has_event.then(|| BorrowedEventInfo::unpack(&mut buf));
         BorrowedLichessGame {
             players,
             date,
@@ -366,6 +417,7 @@ impl<'a> BorrowedLichessGame<'a> {
             speed,
             rating_mode,
             setup,
+            event,
             moves: buf,
         }
     }
@@ -380,6 +432,7 @@ impl<'a> BorrowedLichessGame<'a> {
             setup: self
                 .setup
                 .map(|bytes| PackedSetup::try_from_bytes(bytes).expect("valid setup")),
+            event: self.event.map(BorrowedEventInfo::into_owned),
             moves: PackedMoves(self.moves.to_vec()),
         }
     }
@@ -396,8 +449,11 @@ impl<'a> BorrowedLichessGame<'a> {
         self.players.black.pack(buf);
         self.date.pack(buf);
         buf.put_u8(outcome_bits(self.outcome));
-        pack_speed_and_rating_mode(buf, self.speed, self.rating_mode);
+        pack_game_flags(buf, self.speed, self.rating_mode, self.event.is_some());
         pack_bytes(buf, self.setup.unwrap_or(b""));
+        if let Some(event) = self.event {
+            event.pack(buf);
+        }
         buf.put_slice(self.moves);
     }
 }

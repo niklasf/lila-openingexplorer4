@@ -15,7 +15,7 @@ use shakmaty::{ByColor, KnownOutcome};
 
 use crate::{
     packed::{
-        BorrowedGamePlayer, BorrowedLichessGame, EventInfo, GameId, GamePlayer, LaxDate,
+        BorrowedEventInfo, BorrowedGamePlayer, BorrowedLichessGame, GameId, GamePlayer, LaxDate,
         LichessGame, Rating, RatingMode, Speed,
     },
     parquet::{OptionalColumn, RequiredColumn},
@@ -193,9 +193,7 @@ impl GameColumns {
         self.round.append(&mut other.round);
     }
 
-    pub fn rows(
-        &self,
-    ) -> impl Iterator<Item = (GameId, BorrowedLichessGame<'_>, Option<EventInfo<'_>>)> {
+    pub fn rows(&self) -> impl Iterator<Item = (GameId, BorrowedLichessGame<'_>)> {
         let mut game_id = self.game_id.iter();
         let mut white = self.players.white.rows();
         let mut black = self.players.black.rows();
@@ -246,26 +244,26 @@ impl GameColumns {
                         .expect("setup")
                         .map(ByteArray::data)
                         .filter(|bytes| !bytes.is_empty()),
+                    event: match (
+                        event.next().expect("event"),
+                        site.next().expect("site"),
+                        round.next().expect("round"),
+                    ) {
+                        (Some(event), Some(site), Some(round)) => Some(BorrowedEventInfo {
+                            event: utf8(event),
+                            site: utf8(site),
+                            round: utf8(round),
+                        }),
+                        (None, None, None) => None,
+                        _ => panic!("partial event info"),
+                    },
                     moves: moves.next().expect("moves").data(),
-                },
-                match (
-                    event.next().expect("event"),
-                    site.next().expect("site"),
-                    round.next().expect("round"),
-                ) {
-                    (Some(event), Some(site), Some(round)) => Some(EventInfo {
-                        event: utf8(event),
-                        site: utf8(site),
-                        round: utf8(round),
-                    }),
-                    (None, None, None) => None,
-                    _ => panic!("partial event info"),
                 },
             ))
         })
     }
 
-    pub fn push(&mut self, game_id: GameId, game: LichessGame, event: Option<EventInfo<'_>>) {
+    pub fn push(&mut self, game_id: GameId, game: LichessGame) {
         self.game_id
             .push(FixedLenByteArray::from(game_id.to_bytes().to_vec()));
 
@@ -292,12 +290,21 @@ impl GameColumns {
 
         self.moves.push(ByteArray::from(game.moves.0));
 
-        self.event
-            .push(event.map(|event| ByteArray::from(event.event)));
-        self.site
-            .push(event.map(|event| ByteArray::from(event.site)));
-        self.round
-            .push(event.map(|event| ByteArray::from(event.round)));
+        match game.event {
+            Some(event) => {
+                self.event
+                    .push(Some(ByteArray::from(event.event.into_bytes())));
+                self.site
+                    .push(Some(ByteArray::from(event.site.into_bytes())));
+                self.round
+                    .push(Some(ByteArray::from(event.round.into_bytes())));
+            }
+            None => {
+                self.event.push(None);
+                self.site.push(None);
+                self.round.push(None);
+            }
+        }
     }
 
     pub fn write_row_group<W>(
@@ -503,17 +510,11 @@ mod tests {
             let game_id: GameId = u.arbitrary()?;
             let game: LichessGame = u.arbitrary()?;
 
-            let event = u.arbitrary::<bool>()?.then_some(EventInfo {
-                event: "Event",
-                site: "Site",
-                round: "1.2",
-            });
-
             let mut columns = GameColumns::default();
-            columns.push(game_id, game.clone(), event);
+            columns.push(game_id, game.clone());
             assert_eq!(
                 columns.rows().next().expect("row"),
-                (game_id, game.as_borrowed(), event)
+                (game_id, game.as_borrowed())
             );
 
             Ok(())

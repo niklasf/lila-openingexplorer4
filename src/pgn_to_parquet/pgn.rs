@@ -295,6 +295,7 @@ impl ParsedGame {
             speed: self.speed,
             rating_mode: RatingMode::Rated, // always rated for monthly export
             setup,
+            event: None,
             moves,
         };
 

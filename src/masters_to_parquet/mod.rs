@@ -18,12 +18,12 @@ use parquet::{
     basic::{Compression, ZstdLevel},
     file::writer::SerializedFileWriter,
 };
-pub use pgn::{MastersGame, MastersVisitor};
+pub use pgn::MastersVisitor;
 use pgn_reader::Reader as PgnReader;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    packed::{EventInfo, GameId},
+    packed::{GameId, LichessGame},
     parquet::GameColumns,
 };
 
@@ -104,7 +104,7 @@ pub fn collect_pgns(paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
 }
 
 struct Parsed {
-    games: Vec<MastersGame>,
+    games: Vec<(GameId, LichessGame)>,
     stats: Stats,
     errors: Vec<String>,
 }
@@ -230,13 +230,13 @@ pub fn convert(
                 total.unplayed += parsed.stats.unplayed;
                 total.invalid += parsed.stats.invalid;
 
-                for game in parsed.games {
-                    let game_id = match legacy_ids.get(&game.game_id) {
+                for (deterministic_id, game) in parsed.games {
+                    let game_id = match legacy_ids.get(&deterministic_id) {
                         Some(&legacy_id) => {
                             total.legacy += 1;
                             legacy_id
                         }
-                        None => game.game_id,
+                        None => deterministic_id,
                     };
                     if !seen.insert(game_id) {
                         total.duplicates += 1;
@@ -245,23 +245,15 @@ pub fn convert(
                                 "{}: skipping duplicate {} ({} - {}, {})",
                                 pgns[next].display(),
                                 game_id,
-                                game.game.players.white.name,
-                                game.game.players.black.name,
-                                game.event,
+                                game.players.white.name,
+                                game.players.black.name,
+                                game.event.as_ref().expect("masters event").event,
                             )
                         });
                         continue;
                     }
                     total.games += 1;
-                    columns.push(
-                        game_id,
-                        game.game,
-                        Some(EventInfo {
-                            event: &game.event,
-                            site: &game.site,
-                            round: &game.round,
-                        }),
-                    );
+                    columns.push(game_id, game);
                 }
 
                 if columns.len() >= config.row_group_len {

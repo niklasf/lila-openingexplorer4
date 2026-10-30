@@ -17,9 +17,9 @@ pub use entry::{
     GroupHeader, LichessEntry, RatingGroup, SubStats,
 };
 pub use game::{
-    BorrowedGamePlayer, BorrowedLichessGame, EventInfo, GamePlayer, InvalidRatingMode,
-    InvalidSpeed, LichessGame, RatingMode, Speed, initial_position, outcome_bits,
-    outcome_from_bits, pack_speed_and_rating_mode, unpack_uci_move,
+    BorrowedEventInfo, BorrowedGamePlayer, BorrowedLichessGame, EventInfo, GamePlayer,
+    InvalidRatingMode, InvalidSpeed, LichessGame, RatingMode, Speed, initial_position,
+    outcome_bits, outcome_from_bits, pack_game_flags, unpack_game_flags, unpack_uci_move,
 };
 pub use game_id::{GameId, InvalidGameId};
 pub use int::{pack_int, pack_uint, unpack_int, unpack_uint};

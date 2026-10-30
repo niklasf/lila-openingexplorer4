@@ -20,7 +20,8 @@ use parquet::{
 use shakmaty::{ByColor, KnownOutcome};
 
 use crate::packed::{
-    BorrowedGamePlayer, BorrowedLichessGame, EventInfo, GameId, LaxDate, Rating, RatingMode, Speed,
+    BorrowedEventInfo, BorrowedGamePlayer, BorrowedLichessGame, GameId, LaxDate, Rating,
+    RatingMode, Speed,
 };
 
 const DICTIONARY_COLUMNS: [&str; 5] = [
@@ -234,14 +235,10 @@ impl GameBatch {
         let columns = BatchColumns::new(&self.0);
         (0..self.len()).map(move |i| columns.get(i))
     }
-
-    /// Event tags, if the file has the columns.
-    pub fn events(&self) -> Option<EventColumns<'_>> {
-        EventColumns::new(&self.0)
-    }
 }
 
-pub struct EventColumns<'a> {
+/// Event tag columns, missing from files without them.
+struct EventColumns<'a> {
     event: &'a StringArray,
     site: &'a StringArray,
     round: &'a StringArray,
@@ -259,8 +256,8 @@ impl<'a> EventColumns<'a> {
 
     /// Event tags of the game at index `i`, if it has any.
     #[inline]
-    pub fn get(&self, i: usize) -> Option<EventInfo<'a>> {
-        self.event.is_valid(i).then(|| EventInfo {
+    fn get(&self, i: usize) -> Option<BorrowedEventInfo<'a>> {
+        self.event.is_valid(i).then(|| BorrowedEventInfo {
             event: self.event.value(i),
             site: self.site.value(i),
             round: self.round.value(i),
@@ -332,6 +329,7 @@ struct BatchColumns<'a> {
     speed: DictionaryColumn<'a, Speed>,
     rating_mode: DictionaryColumn<'a, RatingMode>,
     setup: &'a BinaryArray,
+    event: Option<EventColumns<'a>>,
     moves: &'a BinaryArray,
 }
 
@@ -354,6 +352,7 @@ impl<'a> BatchColumns<'a> {
                 RatingMode::from_ascii(s.as_bytes()).ok()
             }),
             setup: column(batch, "setup").as_binary(),
+            event: EventColumns::new(batch),
             moves: column(batch, "moves").as_binary(),
         }
     }
@@ -378,6 +377,7 @@ impl<'a> BatchColumns<'a> {
             // Empty setups are treated like missing setups.
             setup: Some(self.setup.value(i))
                 .filter(|bytes| self.setup.is_valid(i) && !bytes.is_empty()),
+            event: self.event.as_ref().and_then(|event| event.get(i)),
             moves: self.moves.value(i),
         };
         (GameId::unpack(&mut self.game_id.value(i)), game)
@@ -403,11 +403,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        packed::{GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode, Speed},
+        packed::{
+            EventInfo, GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode, Speed,
+        },
         parquet::GameColumns,
     };
 
-    fn game(title: Option<&str>, speed: Option<Speed>) -> LichessGame {
+    fn game(title: Option<&str>, speed: Option<Speed>, event: Option<EventInfo>) -> LichessGame {
         LichessGame {
             players: ByColor {
                 white: GamePlayer {
@@ -426,6 +428,7 @@ mod tests {
             speed,
             rating_mode: RatingMode::Rated,
             setup: None,
+            event,
             moves: PackedMoves(vec![0x12, 0x34]),
         }
     }
@@ -434,16 +437,16 @@ mod tests {
     fn test_rows_match_generic_reader() {
         let mut columns = GameColumns::default();
         let event = EventInfo {
-            event: "Event",
-            site: "Site",
-            round: "1",
+            event: "Event".to_owned(),
+            site: "Site".to_owned(),
+            round: "1".to_owned(),
         };
         for (game_id, title, speed, event) in [
             ("abcdefgh", Some("GM"), Some(Speed::Blitz), None),
             ("12345678", None, None, Some(event)),
             ("ABCDEFGH", Some("FM"), Some(Speed::Classical), None),
         ] {
-            columns.push(game_id.parse().unwrap(), game(title, speed), event);
+            columns.push(game_id.parse().unwrap(), game(title, speed, event));
         }
 
         let mut file = Vec::new();
@@ -462,20 +465,9 @@ mod tests {
         let batch = reader.read_games(0).unwrap();
         assert_eq!(batch.len(), 3);
 
-        let expected: Vec<_> = columns
-            .rows()
-            .map(|(game_id, game, _)| (game_id, game))
-            .collect();
+        let expected: Vec<_> = columns.rows().collect();
         let actual: Vec<_> = batch.rows().collect();
         assert_eq!(actual, expected);
-        let events = batch.events().unwrap();
-        assert_eq!(
-            (0..3).map(|i| events.get(i)).collect::<Vec<_>>(),
-            columns
-                .rows()
-                .map(|(_, _, event)| event)
-                .collect::<Vec<_>>()
-        );
 
         let fetched = reader.fetch_row_group(0).unwrap();
         assert!(fetched.len() < file_len);
@@ -483,7 +475,7 @@ mod tests {
         let actual: Vec<_> = batch.rows().collect();
         assert_eq!(actual, expected);
 
-        let game_ids: Vec<GameId> = columns.rows().map(|(game_id, _, _)| game_id).collect();
+        let game_ids: Vec<GameId> = columns.rows().map(|(game_id, _)| game_id).collect();
         assert_eq!(reader.read_game_ids(0).unwrap(), game_ids);
     }
 }
