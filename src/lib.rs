@@ -1,4 +1,5 @@
 pub mod intermediate;
+pub mod masters_to_parquet;
 pub mod packed;
 pub mod parquet;
 pub mod parquet_to_games;

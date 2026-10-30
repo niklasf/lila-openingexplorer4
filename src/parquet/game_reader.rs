@@ -20,7 +20,7 @@ use parquet::{
 use shakmaty::{ByColor, KnownOutcome};
 
 use crate::packed::{
-    BorrowedGamePlayer, BorrowedLichessGame, GameId, LaxDate, Rating, RatingMode, Speed,
+    BorrowedGamePlayer, BorrowedLichessGame, EventInfo, GameId, LaxDate, Rating, RatingMode, Speed,
 };
 
 const DICTIONARY_COLUMNS: [&str; 5] = [
@@ -234,16 +234,48 @@ impl GameBatch {
         let columns = BatchColumns::new(&self.0);
         (0..self.len()).map(move |i| columns.get(i))
     }
+
+    /// Event tags, if the file has the columns.
+    pub fn events(&self) -> Option<EventColumns<'_>> {
+        EventColumns::new(&self.0)
+    }
+}
+
+pub struct EventColumns<'a> {
+    event: &'a StringArray,
+    site: &'a StringArray,
+    round: &'a StringArray,
+}
+
+impl<'a> EventColumns<'a> {
+    fn new(batch: &'a RecordBatch) -> Option<EventColumns<'a>> {
+        let string = |name| Some(batch.column_by_name(name)?.as_string::<i32>());
+        Some(EventColumns {
+            event: string("event")?,
+            site: string("site")?,
+            round: string("round")?,
+        })
+    }
+
+    /// Event tags of the game at index `i`, if it has any.
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<EventInfo<'a>> {
+        self.event.is_valid(i).then(|| EventInfo {
+            event: self.event.value(i),
+            site: self.site.value(i),
+            round: self.round.value(i),
+        })
+    }
 }
 
 /// A dictionary encoded column, with the dictionary decoded once per batch.
 struct DictionaryColumn<'a, T> {
     keys: &'a Int32Array,
-    values: Vec<T>,
+    values: Vec<Option<T>>,
 }
 
 impl<'a, T: Copy> DictionaryColumn<'a, T> {
-    fn new(batch: &'a RecordBatch, name: &str, decode: impl Fn(&'a str) -> T) -> Self {
+    fn new(batch: &'a RecordBatch, name: &str, decode: impl Fn(&'a str) -> Option<T>) -> Self {
         let array: &DictionaryArray<Int32Type> = column(batch, name).as_dictionary();
         DictionaryColumn {
             keys: array.keys(),
@@ -251,7 +283,7 @@ impl<'a, T: Copy> DictionaryColumn<'a, T> {
                 .values()
                 .as_string::<i32>()
                 .iter()
-                .map(|value| decode(value.expect("dictionary value")))
+                .map(|value| value.and_then(&decode))
                 .collect(),
         }
     }
@@ -260,7 +292,7 @@ impl<'a, T: Copy> DictionaryColumn<'a, T> {
     fn get(&self, i: usize) -> Option<T> {
         self.keys
             .is_valid(i)
-            .then(|| self.values[self.keys.value(i) as usize])
+            .then(|| self.values[self.keys.value(i) as usize].expect("valid dictionary value"))
     }
 }
 
@@ -273,7 +305,7 @@ struct PlayerColumns<'a> {
 impl<'a> PlayerColumns<'a> {
     fn new(batch: &'a RecordBatch, color: &str) -> PlayerColumns<'a> {
         PlayerColumns {
-            title: DictionaryColumn::new(batch, &format!("{color}_title"), |title| title),
+            title: DictionaryColumn::new(batch, &format!("{color}_title"), Some),
             name: column(batch, &format!("{color}_name")).as_string(),
             rating: column(batch, &format!("{color}_rating")).as_primitive(),
         }
@@ -315,13 +347,11 @@ impl<'a> BatchColumns<'a> {
             date_month: column(batch, "date_month").as_primitive(),
             date_day: column(batch, "date_day").as_primitive(),
             outcome: DictionaryColumn::new(batch, "outcome", |s| {
-                KnownOutcome::from_ascii(s.as_bytes()).expect("known outcome")
+                KnownOutcome::from_ascii(s.as_bytes()).ok()
             }),
-            speed: DictionaryColumn::new(batch, "speed", |s| {
-                Speed::from_ascii(s.as_bytes()).expect("valid speed")
-            }),
+            speed: DictionaryColumn::new(batch, "speed", |s| Speed::from_ascii(s.as_bytes()).ok()),
             rating_mode: DictionaryColumn::new(batch, "rating_mode", |s| {
-                RatingMode::from_ascii(s.as_bytes()).expect("valid rating mode")
+                RatingMode::from_ascii(s.as_bytes()).ok()
             }),
             setup: column(batch, "setup").as_binary(),
             moves: column(batch, "moves").as_binary(),
@@ -403,12 +433,17 @@ mod tests {
     #[test]
     fn test_rows_match_generic_reader() {
         let mut columns = GameColumns::default();
-        for (game_id, title, speed) in [
-            ("abcdefgh", Some("GM"), Some(Speed::Blitz)),
-            ("12345678", None, None),
-            ("ABCDEFGH", Some("FM"), Some(Speed::Classical)),
+        let event = EventInfo {
+            event: "Event",
+            site: "Site",
+            round: "1",
+        };
+        for (game_id, title, speed, event) in [
+            ("abcdefgh", Some("GM"), Some(Speed::Blitz), None),
+            ("12345678", None, None, Some(event)),
+            ("ABCDEFGH", Some("FM"), Some(Speed::Classical), None),
         ] {
-            columns.push(game_id.parse().unwrap(), game(title, speed));
+            columns.push(game_id.parse().unwrap(), game(title, speed), event);
         }
 
         let mut file = Vec::new();
@@ -427,9 +462,20 @@ mod tests {
         let batch = reader.read_games(0).unwrap();
         assert_eq!(batch.len(), 3);
 
-        let expected: Vec<_> = columns.rows().collect();
+        let expected: Vec<_> = columns
+            .rows()
+            .map(|(game_id, game, _)| (game_id, game))
+            .collect();
         let actual: Vec<_> = batch.rows().collect();
         assert_eq!(actual, expected);
+        let events = batch.events().unwrap();
+        assert_eq!(
+            (0..3).map(|i| events.get(i)).collect::<Vec<_>>(),
+            columns
+                .rows()
+                .map(|(_, _, event)| event)
+                .collect::<Vec<_>>()
+        );
 
         let fetched = reader.fetch_row_group(0).unwrap();
         assert!(fetched.len() < file_len);
@@ -437,7 +483,7 @@ mod tests {
         let actual: Vec<_> = batch.rows().collect();
         assert_eq!(actual, expected);
 
-        let game_ids: Vec<GameId> = columns.rows().map(|(game_id, _)| game_id).collect();
+        let game_ids: Vec<GameId> = columns.rows().map(|(game_id, _, _)| game_id).collect();
         assert_eq!(reader.read_game_ids(0).unwrap(), game_ids);
     }
 }

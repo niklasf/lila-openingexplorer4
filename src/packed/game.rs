@@ -43,6 +43,15 @@ pub fn outcome_from_bits(bits: u8) -> Option<KnownOutcome> {
     })
 }
 
+/// Event tags of a game from an external collection (like the masters
+/// database), which are not part of the `LichessGame` record.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct EventInfo<'a> {
+    pub event: &'a str,
+    pub site: &'a str,
+    pub round: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GamePlayer {
     pub title: Option<String>,

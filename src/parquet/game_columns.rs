@@ -15,8 +15,8 @@ use shakmaty::{ByColor, KnownOutcome};
 
 use crate::{
     packed::{
-        BorrowedGamePlayer, BorrowedLichessGame, GameId, GamePlayer, LaxDate, LichessGame, Rating,
-        RatingMode, Speed,
+        BorrowedGamePlayer, BorrowedLichessGame, EventInfo, GameId, GamePlayer, LaxDate,
+        LichessGame, Rating, RatingMode, Speed,
     },
     parquet::{OptionalColumn, RequiredColumn},
 };
@@ -123,7 +123,15 @@ pub struct GameColumns {
     rating_mode: RequiredColumn<ByteArrayType>,     // 12
     setup: OptionalColumn<ByteArrayType>,           // 13
     moves: RequiredColumn<ByteArrayType>,           // 14
+    // Event tags, only for external collections like the masters database.
+    // Missing entirely from older files.
+    event: OptionalColumn<ByteArrayType>, // 15
+    site: OptionalColumn<ByteArrayType>,  // 16
+    round: OptionalColumn<ByteArrayType>, // 17
 }
+
+/// Number of columns of files without event tags.
+const COLUMNS_WITHOUT_EVENT: usize = 15;
 
 impl GameColumns {
     pub fn is_empty(&self) -> bool {
@@ -146,6 +154,9 @@ impl GameColumns {
         self.rating_mode.clear();
         self.setup.clear();
         self.moves.clear();
+        self.event.clear();
+        self.site.clear();
+        self.round.clear();
     }
 
     pub fn reserve(&mut self, additional: usize) {
@@ -160,6 +171,9 @@ impl GameColumns {
         self.rating_mode.reserve(additional);
         self.setup.reserve(additional);
         self.moves.reserve(additional);
+        self.event.reserve(additional);
+        self.site.reserve(additional);
+        self.round.reserve(additional);
     }
 
     pub fn append(&mut self, other: &mut GameColumns) {
@@ -174,9 +188,14 @@ impl GameColumns {
         self.rating_mode.append(&mut other.rating_mode);
         self.setup.append(&mut other.setup);
         self.moves.append(&mut other.moves);
+        self.event.append(&mut other.event);
+        self.site.append(&mut other.site);
+        self.round.append(&mut other.round);
     }
 
-    pub fn rows(&self) -> impl Iterator<Item = (GameId, BorrowedLichessGame<'_>)> {
+    pub fn rows(
+        &self,
+    ) -> impl Iterator<Item = (GameId, BorrowedLichessGame<'_>, Option<EventInfo<'_>>)> {
         let mut game_id = self.game_id.iter();
         let mut white = self.players.white.rows();
         let mut black = self.players.black.rows();
@@ -188,6 +207,9 @@ impl GameColumns {
         let mut rating_mode = self.rating_mode.iter();
         let mut setup = self.setup.iter();
         let mut moves = self.moves.iter();
+        let mut event = self.event.iter();
+        let mut site = self.site.iter();
+        let mut round = self.round.iter();
         iter::from_fn(move || {
             Some((
                 GameId::unpack(&mut game_id.next()?.data()),
@@ -226,11 +248,24 @@ impl GameColumns {
                         .filter(|bytes| !bytes.is_empty()),
                     moves: moves.next().expect("moves").data(),
                 },
+                match (
+                    event.next().expect("event"),
+                    site.next().expect("site"),
+                    round.next().expect("round"),
+                ) {
+                    (Some(event), Some(site), Some(round)) => Some(EventInfo {
+                        event: utf8(event),
+                        site: utf8(site),
+                        round: utf8(round),
+                    }),
+                    (None, None, None) => None,
+                    _ => panic!("partial event info"),
+                },
             ))
         })
     }
 
-    pub fn push(&mut self, game_id: GameId, game: LichessGame) {
+    pub fn push(&mut self, game_id: GameId, game: LichessGame, event: Option<EventInfo<'_>>) {
         self.game_id
             .push(FixedLenByteArray::from(game_id.to_bytes().to_vec()));
 
@@ -256,6 +291,13 @@ impl GameColumns {
             .push(game.setup.map(|setup| ByteArray::from(setup.as_bytes())));
 
         self.moves.push(ByteArray::from(game.moves.0));
+
+        self.event
+            .push(event.map(|event| ByteArray::from(event.event)));
+        self.site
+            .push(event.map(|event| ByteArray::from(event.site)));
+        self.round
+            .push(event.map(|event| ByteArray::from(event.round)));
     }
 
     pub fn write_row_group<W>(
@@ -277,6 +319,9 @@ impl GameColumns {
         self.rating_mode.write_column(&mut row_group)?;
         self.setup.write_column(&mut row_group)?;
         self.moves.write_column(&mut row_group)?;
+        self.event.write_column(&mut row_group)?;
+        self.site.write_column(&mut row_group)?;
+        self.round.write_column(&mut row_group)?;
         row_group.close()?;
         Ok(())
     }
@@ -293,6 +338,17 @@ impl GameColumns {
         self.rating_mode.read_column(reader, 12)?;
         self.setup.read_column(reader, 13)?;
         self.moves.read_column(reader, 14)?;
+        if reader.num_columns() > COLUMNS_WITHOUT_EVENT {
+            self.event.read_column(reader, 15)?;
+            self.site.read_column(reader, 16)?;
+            self.round.read_column(reader, 17)?;
+        } else {
+            for _ in 0..self.moves.len() {
+                self.event.push(None);
+                self.site.push(None);
+                self.round.push(None);
+            }
+        }
         Ok(())
     }
 
@@ -331,6 +387,12 @@ impl GameColumns {
             .scatter(&partitions, &mut project(targets, |t| &mut t.setup));
         self.moves
             .scatter(&partitions, &mut project(targets, |t| &mut t.moves));
+        self.event
+            .scatter(&partitions, &mut project(targets, |t| &mut t.event));
+        self.site
+            .scatter(&partitions, &mut project(targets, |t| &mut t.site));
+        self.round
+            .scatter(&partitions, &mut project(targets, |t| &mut t.round));
     }
 
     pub fn schema() -> TypePtr {
@@ -352,6 +414,9 @@ impl GameColumns {
                     string("rating_mode", Repetition::REQUIRED),
                     binary("setup", Repetition::OPTIONAL),
                     binary("moves", Repetition::REQUIRED),
+                    string("event", Repetition::OPTIONAL),
+                    string("site", Repetition::OPTIONAL),
+                    string("round", Repetition::OPTIONAL),
                 ])
                 .build()
                 .expect("group type"),
@@ -371,6 +436,10 @@ impl GameColumns {
             .set_column_dictionary_enabled(ColumnPath::from("setup"), false)
             .set_column_statistics_enabled(ColumnPath::from("setup"), EnabledStatistics::None)
     }
+}
+
+fn utf8(bytes: &ByteArray) -> &str {
+    str::from_utf8(bytes.data()).expect("valid utf-8")
 }
 
 fn project<'a, 'b: 'a, S: 'b, T>(
@@ -434,11 +503,17 @@ mod tests {
             let game_id: GameId = u.arbitrary()?;
             let game: LichessGame = u.arbitrary()?;
 
+            let event = u.arbitrary::<bool>()?.then_some(EventInfo {
+                event: "Event",
+                site: "Site",
+                round: "1.2",
+            });
+
             let mut columns = GameColumns::default();
-            columns.push(game_id, game.clone());
+            columns.push(game_id, game.clone(), event);
             assert_eq!(
                 columns.rows().next().expect("row"),
-                (game_id, game.as_borrowed())
+                (game_id, game.as_borrowed(), event)
             );
 
             Ok(())

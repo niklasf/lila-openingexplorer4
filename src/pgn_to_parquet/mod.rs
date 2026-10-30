@@ -293,7 +293,7 @@ fn encode_chunk(
         match game.into_game() {
             Ok((game_id, game)) => {
                 game_ids.push(game_id);
-                columns.push(game_id, game);
+                columns.push(game_id, game, None);
                 stats.games += 1;
             }
             Err(err) => {
