@@ -23,6 +23,12 @@ impl SstConfig {
     /// Options for SST files that serve point lookups. Use a `filter` if
     /// lookups often miss and the keys are sparse.
     pub fn options(&self, filter: bool) -> Options {
+        self.options_with_table(&self.table_options(filter))
+    }
+
+    /// Column family options with the given table options, which should be
+    /// based on `table_options()`.
+    pub fn options_with_table(&self, table_opts: &BlockBasedOptions) -> Options {
         let mut opts = Options::default();
         if self.zstd_level == 0 {
             opts.set_compression_type(DBCompressionType::None);
@@ -33,6 +39,13 @@ impl SstConfig {
                 opts.set_zstd_max_train_bytes(self.zstd_dict * 100);
             }
         }
+        opts.set_block_based_table_factory(table_opts);
+        opts
+    }
+
+    /// Table options for SST files that serve point lookups. Readers must
+    /// use the same filter policy to make use of the filters.
+    pub fn table_options(&self, filter: bool) -> BlockBasedOptions {
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_size(self.block_size);
         // Hash lookup within data blocks, instead of binary search.
@@ -47,8 +60,7 @@ impl SstConfig {
             table_opts.set_partition_filters(true);
             table_opts.set_optimize_filters_for_memory(true);
         }
-        opts.set_block_based_table_factory(&table_opts);
-        opts
+        table_opts
     }
 
     pub fn env_options(&self) -> EnvOptions {
