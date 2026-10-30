@@ -101,7 +101,7 @@ struct ServeArgs {
     #[arg(long, help_heading = "Server")]
     blocking_threads: Option<usize>,
     /// Entries of the response cache.
-    #[arg(long, default_value = "40000", help_heading = "Server")]
+    #[arg(long, default_value = "100000", help_heading = "Server")]
     response_cache: u64,
     /// Seconds after which cached responses expire.
     #[arg(long, default_value = "7200", help_heading = "Server")]
@@ -117,6 +117,13 @@ struct ServeArgs {
     /// Do not load opening names at all.
     #[arg(long, help_heading = "Server")]
     no_openings: bool,
+    /// Packed entries of at least this size (the busiest positions) are
+    /// kept decoded in memory, for fast aggregation. Accepts units.
+    #[arg(long, default_value = "4m", help_heading = "Server")]
+    decode_threshold: ByteSize,
+    /// Memory for decoded entries. Accepts units, like 4g.
+    #[arg(long, default_value = "8g", help_heading = "Server")]
+    decoded_cache: ByteSize,
 }
 
 fn db_config(
@@ -218,6 +225,8 @@ fn run(kind: Kind, args: ServeArgs) {
         masters_top_candidates: args.masters_top_candidates,
         openings_dir: args.openings_dir,
         no_openings: args.no_openings,
+        decode_threshold: u64::from(args.decode_threshold) as usize,
+        decoded_cache_bytes: args.decoded_cache.into(),
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

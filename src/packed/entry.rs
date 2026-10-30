@@ -559,6 +559,18 @@ pub struct CellGames<'a> {
     buf: &'a [u8],
 }
 
+impl<'a> CellGames<'a> {
+    /// Views packed games (as found in `CellView::games`).
+    pub fn from_bytes(buf: &'a [u8]) -> CellGames<'a> {
+        CellGames { buf }
+    }
+
+    /// The packed bytes of the games.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.buf
+    }
+}
+
 impl Iterator for CellGames<'_> {
     type Item = (u64, GameId);
 

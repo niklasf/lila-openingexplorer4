@@ -1,5 +1,6 @@
 use std::{
     net::SocketAddr,
+    ops::Deref,
     path::PathBuf,
     sync::{
         Arc, RwLock,
@@ -17,6 +18,7 @@ use axum::{
     routing::get,
 };
 use moka::future::Cache;
+use rocksdb::DBPinnableSlice;
 use shakmaty::{
     san::{San, SanPlus},
     variant::VariantPosition,
@@ -26,11 +28,14 @@ use tokio::{net::TcpListener, sync::Semaphore, task, time};
 use crate::{
     packed::{
         BorrowedLichessGame, CellKey, EntryView, GameId, GameSeq, GroupHeader, LichessEntry,
-        Rating, RatingGroup,
+        Rating, RatingGroup, Zobrist96,
     },
     server::{
         db::Database,
-        explore::{GameRef, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess, prepare_masters},
+        explore::{
+            DecodedEntry, GameRef, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
+            prepare_masters,
+        },
         metrics::Metrics,
         openings::Openings,
         pgn::masters_pgn,
@@ -70,6 +75,10 @@ pub struct AppConfig {
     pub openings_dir: Option<PathBuf>,
     /// Do not load opening names at all.
     pub no_openings: bool,
+    /// Packed entries of at least this size are kept decoded in memory.
+    pub decode_threshold: usize,
+    /// Memory for decoded entries.
+    pub decoded_cache_bytes: u64,
 }
 
 /// Error response.
@@ -117,6 +126,8 @@ pub struct AppState {
     openings: RwLock<Openings>,
     lichess_cache: ResponseCache<LichessQuery>,
     masters_cache: ResponseCache<MastersQuery>,
+    /// Large entries, decoded once.
+    decoded: moka::sync::Cache<Zobrist96, Arc<DecodedEntry>>,
     semaphore: Semaphore,
     metrics: Metrics,
     /// For sampling which deep positions fill the block cache.
@@ -143,12 +154,23 @@ impl AppState {
 
     /// The packed entry of a position: from the positions column family,
     /// or synthesized from the single game that reached it.
-    fn entry(&self, pos: &VariantPosition, ply: u32) -> Result<Option<Vec<u8>>, Error> {
+    fn entry(&self, pos: &VariantPosition, ply: u32) -> Result<Option<Entry<'_>>, Error> {
         let hash = position_hash(pos);
         let fill_cache = self.fill_cache(ply);
+        if let Some(decoded) = self.decoded.get(&hash) {
+            Metrics::inc(&self.metrics.positions_hits);
+            Metrics::inc(&self.metrics.decoded_hits);
+            return Ok(Some(Entry::Decoded(decoded)));
+        }
         if let Some(entry) = self.db.positions_entry(&hash, fill_cache)? {
             Metrics::inc(&self.metrics.positions_hits);
-            return Ok(Some(entry.to_vec()));
+            if entry.len() >= self.config.decode_threshold {
+                let decoded = self
+                    .decoded
+                    .get_with(hash, || Arc::new(DecodedEntry::new(&entry)));
+                return Ok(Some(Entry::Decoded(decoded)));
+            }
+            return Ok(Some(Entry::Packed(EntryBytes::Pinned(entry))));
         }
         let candidates = self.db.cold_candidates(&hash, fill_cache)?;
         if candidates.is_empty() {
@@ -191,7 +213,7 @@ impl AppState {
             Metrics::inc(&self.metrics.cold_hits);
             let mut buf = Vec::new();
             entry.pack_entire(&mut buf);
-            Ok(Some(buf))
+            Ok(Some(Entry::Packed(EntryBytes::Owned(buf))))
         } else {
             Metrics::inc(&self.metrics.misses);
             Ok(None)
@@ -271,12 +293,23 @@ impl AppState {
     fn lichess(&self, query: &LichessQuery, play: PlayPosition) -> Result<Bytes, Error> {
         let PlayPosition { pos, opening, ply } = play;
         let entry = self.entry(&pos, ply)?;
-        let prepared = prepare_lichess(
-            EntryView::unpack_entire(entry.as_deref().unwrap_or(&[])),
-            &query.filter,
-            &query.limits,
-            query.history,
-        );
+        let prepared = match &entry {
+            Some(Entry::Decoded(decoded)) => {
+                prepare_lichess(&**decoded, &query.filter, &query.limits, query.history)
+            }
+            Some(Entry::Packed(bytes)) => prepare_lichess(
+                &EntryView::unpack_entire(bytes),
+                &query.filter,
+                &query.limits,
+                query.history,
+            ),
+            None => prepare_lichess(
+                &EntryView::unpack_entire(&[]),
+                &query.filter,
+                &query.limits,
+                query.history,
+            ),
+        };
 
         let mut ids = Vec::new();
         let mut moves = self.explorer_moves(&pos, prepared.moves, &mut ids);
@@ -321,12 +354,25 @@ impl AppState {
     fn masters(&self, query: &MastersQuery, play: PlayPosition) -> Result<Bytes, Error> {
         let PlayPosition { pos, opening, ply } = play;
         let entry = self.entry(&pos, ply)?;
-        let prepared = prepare_masters(
-            EntryView::unpack_entire(entry.as_deref().unwrap_or(&[])),
-            &query.filter(),
-            &query.limits,
-            self.config.masters_top_candidates,
-        );
+        let filter = query.filter();
+        let candidates = self.config.masters_top_candidates;
+        let prepared = match &entry {
+            Some(Entry::Decoded(decoded)) => {
+                prepare_masters(&**decoded, &filter, &query.limits, candidates)
+            }
+            Some(Entry::Packed(bytes)) => prepare_masters(
+                &EntryView::unpack_entire(bytes),
+                &filter,
+                &query.limits,
+                candidates,
+            ),
+            None => prepare_masters(
+                &EntryView::unpack_entire(&[]),
+                &filter,
+                &query.limits,
+                candidates,
+            ),
+        };
 
         let mut ids = Vec::new();
         let mut moves = self.explorer_moves(&pos, prepared.moves, &mut ids);
@@ -389,6 +435,29 @@ impl AppState {
         match self.db.game(id, true)? {
             Some(game) => Ok(masters_pgn(id, &BorrowedLichessGame::unpack_entire(&game))),
             None => Err(Error::NotFound),
+        }
+    }
+}
+
+/// An entry of a position.
+enum Entry<'a> {
+    Packed(EntryBytes<'a>),
+    Decoded(Arc<DecodedEntry>),
+}
+
+/// A packed entry, borrowed from the block cache or synthesized.
+enum EntryBytes<'a> {
+    Pinned(DBPinnableSlice<'a>),
+    Owned(Vec<u8>),
+}
+
+impl Deref for EntryBytes<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            EntryBytes::Pinned(slice) => slice,
+            EntryBytes::Owned(vec) => vec,
         }
     }
 }
@@ -557,6 +626,8 @@ async fn monitor(State(state): State<Shared>) -> String {
             "masters_cache={}u",
             state.masters_cache.entry_count()
         ));
+        fields.push(format!("decoded_entries={}u", state.decoded.entry_count()));
+        fields.push(format!("decoded_bytes={}u", state.decoded.weighted_size()));
         fields.push(format!("block_cache_usage={}u", state.db.cache_usage()));
         fields.push(format!(
             "block_cache_pinned={}u",
@@ -664,6 +735,10 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         masters_cache: Cache::builder()
             .max_capacity(config.cache_entries)
             .time_to_live(config.cache_ttl)
+            .build(),
+        decoded: moka::sync::Cache::builder()
+            .max_capacity(config.decoded_cache_bytes)
+            .weigher(|_, entry: &Arc<DecodedEntry>| entry.weight().min(u32::MAX as usize) as u32)
             .build(),
         semaphore: Semaphore::new(config.blocking_threads),
         openings: RwLock::new(openings),

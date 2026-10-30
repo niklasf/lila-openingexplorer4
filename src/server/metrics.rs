@@ -55,6 +55,8 @@ pub struct Metrics {
     pub bad_requests: AtomicU64,
     /// Positions found in the positions column family.
     pub positions_hits: AtomicU64,
+    /// Of those, served from the decoded entry cache.
+    pub decoded_hits: AtomicU64,
     /// Positions validated from a cold candidate.
     pub cold_hits: AtomicU64,
     /// Cold candidates loaded and replayed.
@@ -90,6 +92,10 @@ impl Metrics {
             format!(
                 "positions_hits={}u",
                 self.positions_hits.load(Ordering::Relaxed)
+            ),
+            format!(
+                "decoded_hits={}u",
+                self.decoded_hits.load(Ordering::Relaxed)
             ),
             format!("cold_hits={}u", self.cold_hits.load(Ordering::Relaxed)),
             format!(
