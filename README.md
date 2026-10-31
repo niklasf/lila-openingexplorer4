@@ -18,7 +18,7 @@ chess games (currently ~10 B rated games across all variants, growing fast).
 
 ```
 # Once: link the SST files into a RocksDB directory (same file system,
-# no copies, ~40 s for the full lichess set).
+# no copies, about a second for the full lichess set).
 explorer ingest --db db_lichess --games sst --positions sst_positions
 explorer ingest --db db_masters --games masters_sst/games --positions masters_sst
 
@@ -26,6 +26,19 @@ explorer ingest --db db_masters --games masters_sst/games --positions masters_ss
 explorer lichess --db db_lichess --cache 32g --bind 0.0.0.0:9002
 explorer masters --db db_masters --max-ply 0 --cache 2g --bind 0.0.0.0:9003
 ```
+
+Next to each `.sst` file the writers leave a small `.sst.info` sidecar with
+the file's key range and table properties (RocksDB's `PreparedFileInfo`,
+written before the file is renamed from its `.tmp` name, so a directory
+can be copied at any time), which lets `ingest` link the files without
+opening them. SST sets built before the sidecars existed get them from
+`explorer prepare DIR...` (reads the first and last key of each file);
+without sidecars, `ingest` falls back to opening every file, which costs
+minutes on hard disks. RocksDB also fsyncs every linked file, one after
+the other within an ingest call, so `ingest` splits the files of each
+column family over `--file-opening-threads` concurrent calls and the
+file system can batch the journal flushes (on a busy hard disk RAID a
+single fsync waits up to a second).
 
 `--max-ply` must match the `parquet_to_positions` run (50 for lichess, 0 for
 masters, which indexes all plies). Tuning on a 186 GB machine with the SST

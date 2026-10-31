@@ -173,28 +173,58 @@ pub fn ingest(
                 Ok::<_, io::Error>(staged)
             })
             .collect::<Result<_, _>>()?;
-        let mut ingest_opts = IngestExternalFileOptions::default();
-        ingest_opts.set_move_files(true);
-        ingest_opts.set_snapshot_consistency(false);
-        ingest_opts.set_allow_blocking_flush(false);
-        let cf = db.cf_handle(cf_name).expect("column family");
-        match read_infos(&files, config.file_opening_threads)? {
-            Some(infos) => {
-                log::info!(
-                    "read {} ingestion metadata sidecars of {cf_name} in {:.1?}",
-                    infos.len(),
-                    started.elapsed()
-                );
-                db.ingest_external_file_cf_opts_prepared(cf, &ingest_opts, staged, &infos)?;
-            }
-            None => {
-                log::warn!(
-                    "{}: not all files have a {INFO_SUFFIX} sidecar (see explorer prepare), ingestion has to read the files",
-                    dir.display()
-                );
-                db.ingest_external_file_cf_opts(cf, &ingest_opts, staged)?;
-            }
+        let infos = read_infos(&files, config.file_opening_threads)?;
+        match &infos {
+            Some(infos) => log::info!(
+                "read {} ingestion metadata sidecars of {cf_name} in {:.1?}",
+                infos.len(),
+                started.elapsed()
+            ),
+            None => log::warn!(
+                "{}: not all files have a {INFO_SUFFIX} sidecar (see explorer prepare), ingestion has to read the files",
+                dir.display()
+            ),
         }
+        // Ingest in concurrent batches: RocksDB fsyncs every linked file
+        // (and without sidecars reads every file) sequentially within a
+        // call, which on hard disks takes a second per file when the disks
+        // are busy, while concurrent fsyncs share the journal flushes.
+        let threads = config.file_opening_threads.clamp(1, 64);
+        let batch = staged.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| -> Result<(), DbError> {
+            let handles: Vec<_> = staged
+                .chunks(batch)
+                .enumerate()
+                .map(|(i, paths)| {
+                    let db = &db;
+                    let infos = infos
+                        .as_ref()
+                        .map(|infos| &infos[i * batch..i * batch + paths.len()]);
+                    scope.spawn(move || -> Result<(), rocksdb::Error> {
+                        let mut ingest_opts = IngestExternalFileOptions::default();
+                        ingest_opts.set_move_files(true);
+                        ingest_opts.set_snapshot_consistency(false);
+                        ingest_opts.set_allow_blocking_flush(false);
+                        let cf = db.cf_handle(cf_name).expect("column family");
+                        match infos {
+                            Some(infos) => db.ingest_external_file_cf_opts_prepared(
+                                cf,
+                                &ingest_opts,
+                                paths.to_vec(),
+                                infos,
+                            ),
+                            None => {
+                                db.ingest_external_file_cf_opts(cf, &ingest_opts, paths.to_vec())
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("ingest thread")?;
+            }
+            Ok(())
+        })?;
         *count = files.len();
         log::info!(
             "ingested {} files into {cf_name} in {:.1?}",
