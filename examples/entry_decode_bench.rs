@@ -28,6 +28,7 @@ fn main() {
             statistics: false,
             file_opening_threads: 16,
             block_size: 4096,
+            pin_metadata: false,
         },
     )
     .expect("open db");

@@ -63,6 +63,8 @@ pub struct Metrics {
     pub misses: AtomicU64,
     /// Games loaded for responses.
     pub games_loaded: AtomicU64,
+    /// Games that were not in the block cache and were fetched in parallel.
+    pub games_fetched: AtomicU64,
     pub pgn_requests: AtomicU64,
     /// Time spent computing responses on the blocking pool.
     pub compute: Histogram,
@@ -100,6 +102,10 @@ impl Metrics {
             format!(
                 "games_loaded={}u",
                 self.games_loaded.load(Ordering::Relaxed)
+            ),
+            format!(
+                "games_fetched={}u",
+                self.games_fetched.load(Ordering::Relaxed)
             ),
             format!(
                 "pgn_requests={}u",

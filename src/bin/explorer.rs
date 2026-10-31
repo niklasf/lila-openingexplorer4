@@ -59,6 +59,12 @@ struct DbArgs {
     /// Threads for opening table files at startup.
     #[arg(long, default_value = "16", help_heading = "Database")]
     file_opening_threads: usize,
+    /// Load all index and filter partitions at startup and keep them in the
+    /// block cache, so that a lookup reads at most one data block from
+    /// disk. Recommended for hard disks; needs a block cache larger than
+    /// the metadata.
+    #[arg(long, help_heading = "Database")]
+    pin_metadata: bool,
 }
 
 #[derive(Args)]
@@ -142,6 +148,7 @@ fn db_config(
         statistics,
         file_opening_threads: db_opts.file_opening_threads,
         block_size: db_opts.block_size,
+        pin_metadata: db_opts.pin_metadata,
     }
 }
 
@@ -233,7 +240,8 @@ fn run(kind: Kind, args: ServeArgs) {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(blocking_threads + 16)
+        // Each request may fetch its uncached games in parallel.
+        .max_blocking_threads(blocking_threads * 8 + 16)
         .build()
         .expect("tokio runtime");
 

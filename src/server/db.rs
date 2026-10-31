@@ -5,8 +5,8 @@ use std::{
 };
 
 use rocksdb::{
-    Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBPinnableSlice, IngestExternalFileOptions,
-    Options, ReadOptions,
+    BlockBasedTablePinningTier, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBPinnableSlice,
+    ErrorKind, IngestExternalFileOptions, Options, ReadOptions, ReadTier,
     statistics::{StatsLevel, Ticker},
 };
 use thiserror::Error;
@@ -38,6 +38,9 @@ pub struct DbConfig {
     pub file_opening_threads: usize,
     /// Block size the SST files were written with.
     pub block_size: usize,
+    /// Load all index and filter partitions when opening and keep them in
+    /// the block cache, so that a lookup reads at most one data block.
+    pub pin_metadata: bool,
 }
 
 #[derive(Debug, Error)]
@@ -68,6 +71,11 @@ fn descriptors(config: &DbConfig, cache: &Cache) -> Vec<ColumnFamilyDescriptor> 
             table_opts.set_cache_index_and_filter_blocks(true);
             table_opts.set_cache_index_and_filter_blocks_with_high_priority(true);
             table_opts.set_pin_top_level_index_and_filter(true);
+            if config.pin_metadata {
+                table_opts.set_top_level_index_pinning_tier(BlockBasedTablePinningTier::All);
+                table_opts.set_partition_pinning_tier(BlockBasedTablePinningTier::All);
+                table_opts.set_unpartitioned_pinning_tier(BlockBasedTablePinningTier::All);
+            }
             let mut opts = sst.options_with_table(&table_opts);
             opts.set_disable_auto_compactions(true);
             ColumnFamilyDescriptor::new(name, opts)
@@ -269,6 +277,32 @@ impl Database {
                 &Self::read_options(fill_cache),
             )
             .into_iter()
+            .collect()
+    }
+
+    /// Packed games that are in the block cache, in the order of the ids:
+    /// `None` for games that would require reading from disk, `Some(None)`
+    /// for unknown ids.
+    ///
+    /// Uses single lookups: RocksDB's MultiGet reads data blocks that are
+    /// missing from the cache regardless of the read tier (as of 11.8, once
+    /// the index partitions are cached).
+    pub fn games_cached(
+        &self,
+        ids: &[GameId],
+        fill_cache: bool,
+    ) -> Result<Vec<Option<Option<DBPinnableSlice<'_>>>>, rocksdb::Error> {
+        let mut opts = Self::read_options(fill_cache);
+        opts.set_read_tier(ReadTier::BlockCache);
+        let cf = self.cf(GAMES_CF);
+        ids.iter()
+            .map(
+                |id| match self.db.get_pinned_cf_opt(cf, id.to_bytes(), &opts) {
+                    Ok(game) => Ok(Some(game)),
+                    Err(err) if err.kind() == ErrorKind::Incomplete => Ok(None),
+                    Err(err) => Err(err),
+                },
+            )
             .collect()
     }
 

@@ -23,7 +23,7 @@ use shakmaty::{
     san::{San, SanPlus},
     variant::VariantPosition,
 };
-use tokio::{net::TcpListener, sync::Semaphore, task, time};
+use tokio::{net::TcpListener, runtime::Handle, sync::Semaphore, task, time};
 
 use crate::{
     packed::{
@@ -150,11 +150,19 @@ impl AppState {
 
     /// The packed entry of a position: from the positions column family,
     /// or synthesized from the single game that reached it.
-    fn entry(&self, pos: &VariantPosition, ply: u32) -> Result<Option<Entry<'_>>, Error> {
+    fn entry(
+        self: &Arc<Self>,
+        pos: &VariantPosition,
+        ply: u32,
+    ) -> Result<Option<Entry<'_>>, Error> {
         self.entry_by_hash(position_hash(pos), ply)
     }
 
-    fn entry_by_hash(&self, hash: Zobrist96, ply: u32) -> Result<Option<Entry<'_>>, Error> {
+    fn entry_by_hash(
+        self: &Arc<Self>,
+        hash: Zobrist96,
+        ply: u32,
+    ) -> Result<Option<Entry<'_>>, Error> {
         let fill_cache = self.fill_cache(ply);
         if let Some(entry) = self.db.positions_entry(&hash, fill_cache)? {
             Metrics::inc(&self.metrics.positions_hits);
@@ -170,7 +178,7 @@ impl AppState {
         let mut found = false;
         for (seq, (id, game)) in candidates
             .iter()
-            .zip(self.db.games(&candidates, fill_cache)?)
+            .zip(self.load_games(&candidates, fill_cache)?)
             .enumerate()
         {
             let Some(game) = game else {
@@ -208,15 +216,59 @@ impl AppState {
         }
     }
 
-    /// Loads games by id, keeping the order.
-    fn load_games(&self, ids: &[GameId], fill_cache: bool) -> Result<Vec<Option<Vec<u8>>>, Error> {
+    /// Loads games by id, keeping the order. Games that are not in the
+    /// block cache are read in parallel, so that a response waits for one
+    /// disk seek rather than one per game.
+    fn load_games(
+        self: &Arc<Self>,
+        ids: &[GameId],
+        fill_cache: bool,
+    ) -> Result<Vec<Option<Vec<u8>>>, Error> {
         Metrics::add(&self.metrics.games_loaded, ids.len() as u64);
-        Ok(self
-            .db
-            .games(ids, fill_cache)?
-            .into_iter()
-            .map(|game| game.map(|game| game.to_vec()))
-            .collect())
+        let mut games: Vec<Option<Vec<u8>>> = Vec::with_capacity(ids.len());
+        let mut missing: Vec<(usize, GameId)> = Vec::new();
+        for (i, (id, cached)) in ids
+            .iter()
+            .zip(self.db.games_cached(ids, fill_cache)?)
+            .enumerate()
+        {
+            match cached {
+                Some(game) => games.push(game.map(|game| game.to_vec())),
+                None => {
+                    games.push(None);
+                    missing.push((i, *id));
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(games);
+        }
+        Metrics::add(&self.metrics.games_fetched, missing.len() as u64);
+        if let [(i, id)] = missing[..] {
+            games[i] = self.db.game(id, fill_cache)?.map(|game| game.to_vec());
+            return Ok(games);
+        }
+        // Called from the blocking pool, so blocking on the runtime here
+        // is fine. The fetches do not take semaphore permits, so a request
+        // holding a permit cannot wait on tasks that would need one.
+        let fetched = Handle::current().block_on(async {
+            let mut tasks = task::JoinSet::new();
+            for (i, id) in missing {
+                let state = Arc::clone(self);
+                tasks.spawn_blocking(move || {
+                    state
+                        .db
+                        .game(id, fill_cache)
+                        .map(|game| (i, game.map(|game| game.to_vec())))
+                });
+            }
+            tasks.join_all().await
+        });
+        for result in fetched {
+            let (i, game) = result?;
+            games[i] = game;
+        }
+        Ok(games)
     }
 
     fn explorer_moves(
@@ -278,7 +330,7 @@ impl AppState {
             .collect()
     }
 
-    fn lichess(&self, query: &LichessQuery, play: PlayPosition) -> Result<Bytes, Error> {
+    fn lichess(self: &Arc<Self>, query: &LichessQuery, play: PlayPosition) -> Result<Bytes, Error> {
         let PlayPosition { pos, opening, ply } = play;
         let entry = self.entry(&pos, ply)?;
         let bytes: &[u8] = entry.as_deref().unwrap_or(&[]);
@@ -324,7 +376,7 @@ impl AppState {
         ))
     }
 
-    fn masters(&self, query: &MastersQuery, play: PlayPosition) -> Result<Bytes, Error> {
+    fn masters(self: &Arc<Self>, query: &MastersQuery, play: PlayPosition) -> Result<Bytes, Error> {
         let PlayPosition { pos, opening, ply } = play;
         let entry = self.entry(&pos, ply)?;
         let bytes: &[u8] = entry.as_deref().unwrap_or(&[]);
@@ -439,7 +491,7 @@ fn attach_single_games(
 
 async fn blocking<T: Send + 'static>(
     state: &Shared,
-    f: impl FnOnce(&AppState) -> T + Send + 'static,
+    f: impl FnOnce(&Shared) -> T + Send + 'static,
 ) -> T {
     let _permit = state
         .semaphore
