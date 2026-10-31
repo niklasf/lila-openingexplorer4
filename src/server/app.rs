@@ -32,6 +32,7 @@ use crate::{
     },
     server::{
         db::Database,
+        entry_v3::{Flags, prepare_lichess_v3},
         explore::{
             DecodedEntry, GameRef, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
             prepare_masters,
@@ -305,8 +306,9 @@ impl AppState {
             Some(Entry::Decoded(decoded)) => {
                 prepare_lichess(&**decoded, &query.filter, &query.limits, query.history)
             }
-            Some(Entry::Packed(bytes)) => prepare_lichess(
-                &EntryView::unpack_entire(bytes),
+            Some(Entry::Packed(bytes)) => prepare_lichess_v3(
+                bytes,
+                Flags::PACKED,
                 &query.filter,
                 &query.limits,
                 query.history,

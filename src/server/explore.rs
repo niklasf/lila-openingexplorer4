@@ -152,7 +152,7 @@ pub struct PreparedMove {
     pub stats: SubStats,
     /// The only game, if the move was played exactly once.
     pub game: Option<GameId>,
-    latest: Option<(u64, GameId)>,
+    pub(crate) latest: Option<(u64, GameId)>,
 }
 
 /// A game referenced by an entry.
@@ -172,7 +172,7 @@ pub struct HistorySegment {
     pub stats: SubStats,
 }
 
-struct Ranked<K, T> {
+pub(crate) struct Ranked<K, T> {
     key: K,
     item: T,
 }
@@ -198,13 +198,13 @@ impl<K: Ord, T> Ord for Ranked<K, T> {
 }
 
 /// Keeps the `k` items with the largest keys (ties broken arbitrarily).
-struct TopK<K: Ord, T> {
+pub(crate) struct TopK<K: Ord, T> {
     k: usize,
     heap: BinaryHeap<Reverse<Ranked<K, T>>>,
 }
 
 impl<K: Ord, T> TopK<K, T> {
-    fn new(k: usize) -> TopK<K, T> {
+    pub(crate) fn new(k: usize) -> TopK<K, T> {
         TopK {
             k,
             heap: BinaryHeap::with_capacity(k + 1),
@@ -212,7 +212,7 @@ impl<K: Ord, T> TopK<K, T> {
     }
 
     /// Whether an item with the key would be kept.
-    fn accepts(&self, key: &K) -> bool {
+    pub(crate) fn accepts(&self, key: &K) -> bool {
         self.k > 0
             && (self.heap.len() < self.k
                 || self
@@ -221,7 +221,7 @@ impl<K: Ord, T> TopK<K, T> {
                     .is_some_and(|Reverse(worst)| worst.key < *key))
     }
 
-    fn push(&mut self, key: K, item: T) {
+    pub(crate) fn push(&mut self, key: K, item: T) {
         if !self.accepts(&key) {
             return;
         }
@@ -232,7 +232,7 @@ impl<K: Ord, T> TopK<K, T> {
     }
 
     /// The items, best first.
-    fn into_sorted(self) -> Vec<T> {
+    pub(crate) fn into_sorted(self) -> Vec<T> {
         let mut items: Vec<Ranked<K, T>> = self.heap.into_iter().map(|Reverse(r)| r).collect();
         items.sort_by(|a, b| b.key.cmp(&a.key));
         items.into_iter().map(|r| r.item).collect()
@@ -270,33 +270,38 @@ fn lower_bound(group: RatingGroup) -> i32 {
 
 /// Key of a top game: closest to the highscore of its speed, then most
 /// recent.
-fn top_key(speed: Option<Speed>, group: RatingGroup, rank: u64) -> (Reverse<i32>, u64) {
+pub(crate) fn top_key(speed: Option<Speed>, group: RatingGroup, rank: u64) -> (Reverse<i32>, u64) {
     (Reverse(highscore(speed) - lower_bound(group)), rank)
 }
 
 /// Which games of the matching cells to keep while aggregating.
-struct GameSelection {
+pub(crate) struct GameSelection {
     /// Most recent games, enough to fill the recent games after removing
     /// the top games.
-    recent: TopK<u64, GameRef>,
+    pub(crate) recent: TopK<u64, GameRef>,
     /// Best games among the top rating groups.
-    top: TopK<(Reverse<i32>, u64), GameRef>,
-    top_group: Option<RatingGroup>,
+    pub(crate) top: TopK<(Reverse<i32>, u64), GameRef>,
+    pub(crate) top_group: Option<RatingGroup>,
     /// Masters: most recent games of the highest groups.
-    candidates: TopK<(RatingGroup, u64), GameRef>,
+    pub(crate) candidates: TopK<(RatingGroup, u64), GameRef>,
 }
 
 impl GameSelection {
     /// Whether any game of a cell whose best game has the given rank could
     /// be selected.
-    fn accepts_cell(&self, speed: Option<Speed>, group: RatingGroup, max_rank: u64) -> bool {
+    pub(crate) fn accepts_cell(
+        &self,
+        speed: Option<Speed>,
+        group: RatingGroup,
+        max_rank: u64,
+    ) -> bool {
         self.recent.accepts(&max_rank)
             || (self.top_group.is_some_and(|top_group| group >= top_group)
                 && self.top.accepts(&top_key(speed, group, max_rank)))
             || self.candidates.accepts(&(group, max_rank))
     }
 
-    fn push(&mut self, g: GameRef) {
+    pub(crate) fn push(&mut self, g: GameRef) {
         self.recent.push(g.rank, g);
         if self.top_group.is_some_and(|top_group| g.group >= top_group) {
             self.top.push(top_key(g.speed, g.group, g.rank), g);
@@ -306,10 +311,10 @@ impl GameSelection {
 }
 
 #[derive(Default)]
-struct Aggregate {
-    total: SubStats,
-    moves: Vec<PreparedMove>,
-    months: BTreeMap<Month, SubStats>,
+pub(crate) struct Aggregate {
+    pub(crate) total: SubStats,
+    pub(crate) moves: Vec<PreparedMove>,
+    pub(crate) months: BTreeMap<Month, SubStats>,
 }
 
 /// Aggregates the cells of an entry that match the filter, in canonical
@@ -383,7 +388,7 @@ fn aggregate<S: CellSource>(
     agg
 }
 
-fn sort_moves_and_truncate(moves: &mut Vec<PreparedMove>, num: usize) {
+pub(crate) fn sort_moves_and_truncate(moves: &mut Vec<PreparedMove>, num: usize) {
     moves.sort_by_key(|pm| Reverse(pm.stats.games()));
     moves.truncate(num);
 }
@@ -415,6 +420,17 @@ pub fn prepare_lichess<S: CellSource>(
         limits.games_wanted().then_some(&mut games),
         history,
     );
+    finish_lichess(agg, games, filter, limits, history)
+}
+
+/// Builds the response parts from the aggregate and the selected games.
+pub(crate) fn finish_lichess(
+    agg: Aggregate,
+    games: GameSelection,
+    filter: &LichessFilter,
+    limits: &Limits,
+    history: bool,
+) -> LichessPrepared {
     let mut moves = agg.moves;
     sort_moves_and_truncate(&mut moves, limits.moves);
 
@@ -441,7 +457,10 @@ pub fn prepare_lichess<S: CellSource>(
 /// Monthly statistics from the first month (or `since`) to the last month,
 /// with gaps filled. Without `until` the last month is omitted, because it
 /// may not be completely indexed.
-fn build_history(months: BTreeMap<Month, SubStats>, filter: &LichessFilter) -> Vec<HistorySegment> {
+pub(crate) fn build_history(
+    months: BTreeMap<Month, SubStats>,
+    filter: &LichessFilter,
+) -> Vec<HistorySegment> {
     let mut segments = Vec::with_capacity(months.len());
     let mut next = filter.since;
     for (month, stats) in months {

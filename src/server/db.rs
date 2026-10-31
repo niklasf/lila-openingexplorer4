@@ -272,6 +272,18 @@ impl Database {
             .collect()
     }
 
+    /// The first entries of the positions column family (a random sample
+    /// of positions, as keys are hashes).
+    pub fn scan_positions(&self, limit: usize) -> Result<Vec<Vec<u8>>, rocksdb::Error> {
+        let mut opts = ReadOptions::default();
+        opts.fill_cache(false);
+        self.db
+            .iterator_cf_opt(self.cf(POSITIONS_CF), opts, rocksdb::IteratorMode::Start)
+            .take(limit)
+            .map(|item| item.map(|(_, value)| value.into_vec()))
+            .collect()
+    }
+
     pub fn cache_usage(&self) -> usize {
         self.cache.get_usage()
     }

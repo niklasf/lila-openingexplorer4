@@ -261,7 +261,7 @@ pub struct EntryCell<'a> {
 impl<'a> EntryCell<'a> {
     /// The games that are packed: the most recent ones, exactly
     /// `min(GAMES_PER_CELL, games of the cell)` of them.
-    fn packed_games(&self) -> &'a [(GameSeq, GameId)] {
+    pub fn packed_games(&self) -> &'a [(GameSeq, GameId)] {
         let n = self.stats.games().min(GAMES_PER_CELL as u64) as usize;
         assert!(self.games.len() >= n, "cell is missing games");
         &self.games[self.games.len() - n..]
@@ -365,6 +365,19 @@ impl LichessEntry {
         let cell = self.cells.entry(key).or_default();
         cell.stats.add(rating, outcome);
         cell.push_game(seq, game_id);
+    }
+
+    /// The cells in canonical order, with their games truncated to the
+    /// ones that would be packed.
+    pub fn cells(&mut self) -> impl Iterator<Item = EntryCell<'_>> + Clone {
+        for cell in self.cells.values_mut() {
+            cell.truncate_games();
+        }
+        self.cells.iter().map(|(key, cell)| EntryCell {
+            key: *key,
+            stats: cell.stats,
+            games: &cell.games,
+        })
     }
 
     pub fn pack_entire(&mut self, buf: &mut Vec<u8>) {
