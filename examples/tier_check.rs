@@ -28,7 +28,7 @@ fn main() {
     let entries = db.scan_positions(10).expect("scan");
     let mut ids = Vec::new();
     for entry in &entries {
-        for cell in EntryView::unpack_entire(entry).cells() {
+        for mut cell in EntryView::unpack_entire(entry).cells() {
             if let Some((_, id)) = cell.games.next() {
                 ids.push(id);
                 break;
