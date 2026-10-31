@@ -2,7 +2,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, process, thread, ti
 
 use clap::{Args, Parser, Subcommand};
 use lila_openingexplorer4::{
-    server::{AppConfig, Database, DbConfig, Kind, ingest, serve},
+    server::{AppConfig, Database, DbConfig, Kind, ingest, prepare, serve},
     util::ByteSize,
 };
 use tikv_jemallocator::Jemalloc;
@@ -28,6 +28,9 @@ struct Cli {
 enum Command {
     /// Creates a database directory from SST files.
     Ingest(IngestArgs),
+    /// Writes the ingestion metadata sidecar (.sst.info) of SST files that
+    /// were written without one, so that ingest does not have to open them.
+    Prepare(PrepareArgs),
     /// Serves /lichess from an ingested database of lichess games.
     Lichess(ServeArgs),
     /// Serves /masters and /masters/pgn/{id} from an ingested database of
@@ -47,6 +50,18 @@ struct IngestArgs {
     /// positions and cold_positions.
     #[arg(long)]
     positions: PathBuf,
+    #[command(flatten)]
+    db_opts: DbArgs,
+}
+
+#[derive(Args)]
+struct PrepareArgs {
+    /// Directories with SST files (not recursive).
+    #[arg(required = true)]
+    dirs: Vec<PathBuf>,
+    /// Files to read concurrently.
+    #[arg(long, default_value = "16")]
+    threads: usize,
     #[command(flatten)]
     db_opts: DbArgs,
 }
@@ -115,6 +130,10 @@ struct ServeArgs {
     /// Only replay the first lines of the warm-up log.
     #[arg(long, default_value = "1000000", help_heading = "Server")]
     warm_up_limit: usize,
+    /// Concurrent lookups during the warm-up. Defaults to
+    /// --blocking-threads; hard disks profit from more.
+    #[arg(long, default_value = "0", help_heading = "Server")]
+    warm_up_concurrency: usize,
     /// Entries of the response cache.
     #[arg(long, default_value = "100000", help_heading = "Server")]
     response_cache: u64,
@@ -212,6 +231,18 @@ fn main() {
                 }
             }
         }
+        Command::Prepare(args) => {
+            let config = db_config(&args.db_opts, 0, true, false, false);
+            for dir in &args.dirs {
+                match prepare(dir, &config, args.threads) {
+                    Ok(written) => println!("{}: wrote {written} sidecars", dir.display()),
+                    Err(err) => {
+                        eprintln!("error: {}: {err}", dir.display());
+                        process::exit(1);
+                    }
+                }
+            }
+        }
         Command::Lichess(args) => run(Kind::Lichess, args),
         Command::Masters(args) => run(Kind::Masters, args),
     }
@@ -243,6 +274,7 @@ fn run(kind: Kind, args: ServeArgs) {
         no_openings: args.no_openings,
         warm_up: args.warm_up,
         warm_up_limit: args.warm_up_limit,
+        warm_up_concurrency: args.warm_up_concurrency,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

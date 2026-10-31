@@ -22,6 +22,20 @@ pub enum SstError {
 /// time (only `.sst` files are complete).
 pub const TEMP_SUFFIX: &str = ".tmp";
 
+/// Suffix of the sidecar file next to each finished SST file that holds the
+/// serialized RocksDB `PreparedFileInfo` (key range and table properties),
+/// so that ingestion does not have to open the SST file. Written before
+/// the SST file is renamed into place.
+pub const INFO_SUFFIX: &str = ".info";
+
+/// Path of the sidecar file with the prepared ingestion metadata of an SST
+/// file.
+pub fn info_path(sst: &Path) -> PathBuf {
+    let mut path = sst.to_path_buf().into_os_string();
+    path.push(INFO_SUFFIX);
+    PathBuf::from(path)
+}
+
 /// An SST file being written under a temporary name.
 pub struct SstFile<'a> {
     writer: SstFileWriter<'a>,
@@ -49,9 +63,11 @@ impl<'a> SstFile<'a> {
         self.writer.file_size()
     }
 
-    /// Finishes the file and renames it into place. Returns its size.
+    /// Finishes the file, writes its ingestion metadata sidecar and renames
+    /// it into place. Returns its size.
     pub fn finish(mut self) -> Result<u64, SstError> {
-        self.writer.finish()?;
+        let info = self.writer.finish_prepared()?;
+        fs::write(info_path(&self.path), info)?;
         let mut temp = self.path.clone().into_os_string();
         temp.push(TEMP_SUFFIX);
         fs::rename(Path::new(&temp), &self.path)?;

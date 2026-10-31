@@ -21,7 +21,7 @@ moka = { version = "0.12", features = ["future", "sync"] }
 nohash-hasher = "0.2.0"
 parquet = { version = "60.0.0", default-features = false, features = ["zstd", "lz4", "arrow"] }
 pgn-reader = { version = "0.29.1", git = "https://github.com/niklasf/shakmaty.git", branch = "main" }
-rocksdb = { version = "0.25.0", git = "https://github.com/niklasf/rust-rocksdb.git", branch = "lila-openingexplorer4", features = ["lz4", "zstd", "jemalloc"], default-features = false }
+rocksdb = { version = "0.25.0", path = "../rust-rocksdb", features = ["lz4", "zstd", "jemalloc"], default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 rustc-hash = "2.1.1"
 serde = { version = "1", features = ["derive"] }

@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     packed::{ColdKey, GameId, Zobrist96},
-    sst::SstConfig,
+    sst::{INFO_SUFFIX, SstConfig, TEMP_SUFFIX, info_path},
 };
 
 pub const GAMES_CF: &str = "games";
@@ -144,6 +144,10 @@ pub fn ingest(
     let mut opts = db_options(config);
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
+    // With an unlimited table cache, RocksDB opens a table reader for every
+    // ingested file (footer, properties, index and filter) when it applies
+    // the version edit; with a limited one it only opens a few.
+    opts.set_max_open_files(64);
     let db = DB::open_cf_descriptors(&opts, path, descriptors(config, &cache))?;
     let staging = path.join(STAGING_DIR);
     fs::create_dir_all(&staging)?;
@@ -174,7 +178,23 @@ pub fn ingest(
         ingest_opts.set_snapshot_consistency(false);
         ingest_opts.set_allow_blocking_flush(false);
         let cf = db.cf_handle(cf_name).expect("column family");
-        db.ingest_external_file_cf_opts(cf, &ingest_opts, staged)?;
+        match read_infos(&files, config.file_opening_threads)? {
+            Some(infos) => {
+                log::info!(
+                    "read {} ingestion metadata sidecars of {cf_name} in {:.1?}",
+                    infos.len(),
+                    started.elapsed()
+                );
+                db.ingest_external_file_cf_opts_prepared(cf, &ingest_opts, staged, &infos)?;
+            }
+            None => {
+                log::warn!(
+                    "{}: not all files have a {INFO_SUFFIX} sidecar (see explorer prepare), ingestion has to read the files",
+                    dir.display()
+                );
+                db.ingest_external_file_cf_opts(cf, &ingest_opts, staged)?;
+            }
+        }
         *count = files.len();
         log::info!(
             "ingested {} files into {cf_name} in {:.1?}",
@@ -184,6 +204,76 @@ pub fn ingest(
     }
     fs::remove_dir(&staging)?;
     Ok(stats)
+}
+
+/// Runs `f` for the files, `threads` at a time, and collects the results in
+/// file order.
+fn for_each_file<T: Send>(
+    files: &[PathBuf],
+    threads: usize,
+    f: impl Fn(&Path) -> Result<T, DbError> + Sync,
+) -> Result<Vec<T>, DbError> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<Result<T, DbError>>>> =
+        files.iter().map(|_| Default::default()).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads.clamp(1, files.len().max(1)) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(file) = files.get(i) else {
+                        break;
+                    };
+                    *results[i].lock().expect("results") = Some(f(file));
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| result.into_inner().expect("results").expect("result"))
+        .collect()
+}
+
+/// The ingestion metadata sidecars of the files, or `None` if any file lacks
+/// one.
+fn read_infos(files: &[PathBuf], threads: usize) -> Result<Option<Vec<Vec<u8>>>, DbError> {
+    if !files.iter().all(|file| info_path(file).is_file()) {
+        return Ok(None);
+    }
+    Ok(Some(for_each_file(files, threads, |file| {
+        Ok(fs::read(info_path(file))?)
+    })?))
+}
+
+/// Writes the ingestion metadata sidecars for the SST files in `dir` that
+/// do not have one yet, by reading the files. Returns the number of
+/// sidecars written.
+pub fn prepare(dir: &Path, config: &DbConfig, threads: usize) -> Result<usize, DbError> {
+    let started = Instant::now();
+    let files: Vec<PathBuf> = sst_files(dir)?
+        .into_iter()
+        .filter(|file| !info_path(file).is_file())
+        .collect();
+    let opts = sst_config(config).options(false);
+    for_each_file(&files, threads, |file| {
+        let info = rocksdb::prepare_external_sst(&opts, file)?;
+        // Write under a temporary name, so that a sidecar is complete as soon
+        // as it exists.
+        let info_path = info_path(file);
+        let mut temp = info_path.clone().into_os_string();
+        temp.push(TEMP_SUFFIX);
+        fs::write(&temp, info)?;
+        fs::rename(&temp, &info_path)?;
+        Ok(())
+    })?;
+    log::info!(
+        "prepared {} files in {} in {:.1?}",
+        files.len(),
+        dir.display(),
+        started.elapsed()
+    );
+    Ok(files.len())
 }
 
 /// A read-only view of an ingested database.
@@ -284,9 +374,9 @@ impl Database {
     /// `None` for games that would require reading from disk, `Some(None)`
     /// for unknown ids.
     ///
-    /// Uses single lookups: RocksDB's MultiGet reads data blocks that are
-    /// missing from the cache regardless of the read tier (as of 11.8, once
-    /// the index partitions are cached).
+    /// Requires RocksDB >= 11.12: before facebook/rocksdb#15321, MultiGet
+    /// read data blocks that were missing from the cache regardless of the
+    /// read tier (see `examples/multiget_tier_repro.rs`).
     pub fn games_cached(
         &self,
         ids: &[GameId],
@@ -294,15 +384,15 @@ impl Database {
     ) -> Result<Vec<Option<Option<DBPinnableSlice<'_>>>>, rocksdb::Error> {
         let mut opts = Self::read_options(fill_cache);
         opts.set_read_tier(ReadTier::BlockCache);
-        let cf = self.cf(GAMES_CF);
-        ids.iter()
-            .map(
-                |id| match self.db.get_pinned_cf_opt(cf, id.to_bytes(), &opts) {
-                    Ok(game) => Ok(Some(game)),
-                    Err(err) if err.kind() == ErrorKind::Incomplete => Ok(None),
-                    Err(err) => Err(err),
-                },
-            )
+        let keys: Vec<[u8; GameId::SIZE]> = ids.iter().map(|id| id.to_bytes()).collect();
+        self.db
+            .batched_multi_get_cf_opt(self.cf(GAMES_CF), &keys, false, &opts)
+            .into_iter()
+            .map(|game| match game {
+                Ok(game) => Ok(Some(game)),
+                Err(err) if err.kind() == ErrorKind::Incomplete => Ok(None),
+                Err(err) => Err(err),
+            })
             .collect()
     }
 

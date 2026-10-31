@@ -82,6 +82,8 @@ pub struct AppConfig {
     pub warm_up: Option<PathBuf>,
     /// Only replay the first lines of the warm-up log.
     pub warm_up_limit: usize,
+    /// Concurrent lookups during the warm-up (0: `blocking_threads`).
+    pub warm_up_concurrency: usize,
 }
 
 /// Error response.
@@ -770,11 +772,19 @@ async fn warm_up(state: &Shared, path: &std::path::Path) -> Result<(), Box<dyn s
         }
     }
     let positions = hashes.len();
+    // The lookups are independent, so hard disks profit from a deeper
+    // queue than the one for requests.
+    let concurrency = match state.config.warm_up_concurrency {
+        0 => state.config.blocking_threads,
+        n => n,
+    };
+    let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = tokio::task::JoinSet::new();
     for (hash, ply) in hashes {
         let state = Arc::clone(state);
+        let semaphore = Arc::clone(&semaphore);
         tasks.spawn(async move {
-            let _permit = state.semaphore.acquire().await.expect("semaphore");
+            let _permit = semaphore.acquire_owned().await.expect("semaphore");
             let state2 = Arc::clone(&state);
             task::spawn_blocking(move || state2.entry_by_hash(hash, ply).map(|_| ()))
                 .await

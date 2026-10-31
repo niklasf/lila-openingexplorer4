@@ -12,4 +12,4 @@ pub mod replay;
 pub mod response;
 
 pub use app::{AppConfig, Kind, serve};
-pub use db::{Database, DbConfig, IngestStats, ingest};
+pub use db::{Database, DbConfig, IngestStats, ingest, prepare};
