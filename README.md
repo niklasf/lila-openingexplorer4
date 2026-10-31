@@ -49,7 +49,10 @@ response that are not cached in parallel instead of one after the other;
 have a queue to reorder; `--direct-reads` keeps the page cache from
 competing with the block cache for memory. Both `--pin-metadata` and
 `--parallel-fetch` are off by default because they cost a few percent on
-NVMe.
+NVMe. With 23 GB of pinned metadata the hyper clock cache grows well past
+its capacity (it cannot evict pinned entries and is not strict), so pair
+`--pin-metadata` with `--lru-cache`, which stays within a few percent of
+`--cache`, or budget the overshoot.
 
 Replaying the sample log (`examples/load_test.rs`, 593k lichess and 520k
 masters requests) on a 16-core machine: from NVMe, lichess serves 47-67k
