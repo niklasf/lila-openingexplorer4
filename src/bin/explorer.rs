@@ -96,10 +96,19 @@ struct ServeArgs {
     db_statistics: bool,
     #[command(flatten)]
     db_opts: DbArgs,
-    /// Concurrent database requests. Defaults to twice the available
-    /// parallelism.
+    /// Concurrent database requests. Defaults to half the available
+    /// parallelism (the physical cores on machines with SMT): more threads
+    /// do not add throughput but lengthen tail latencies.
     #[arg(long, help_heading = "Server")]
     blocking_threads: Option<usize>,
+    /// Request log (one path with query string per line, like
+    /// sample-log.txt.zst) to replay before listening, so that the hot
+    /// entries are decoded and the block cache is filled.
+    #[arg(long, help_heading = "Server")]
+    warm_up: Option<PathBuf>,
+    /// Only replay the first lines of the warm-up log.
+    #[arg(long, default_value = "1000000", help_heading = "Server")]
+    warm_up_limit: usize,
     /// Entries of the response cache.
     #[arg(long, default_value = "100000", help_heading = "Server")]
     response_cache: u64,
@@ -204,9 +213,9 @@ fn main() {
 
 fn run(kind: Kind, args: ServeArgs) {
     raise_fd_limit();
-    let blocking_threads = args
-        .blocking_threads
-        .unwrap_or_else(|| thread::available_parallelism().map_or(8, NonZeroUsize::get) * 2);
+    let blocking_threads = args.blocking_threads.unwrap_or_else(|| {
+        (thread::available_parallelism().map_or(8, NonZeroUsize::get) / 2).max(2)
+    });
     let db_config = db_config(
         &args.db_opts,
         args.cache.into(),
@@ -227,6 +236,8 @@ fn run(kind: Kind, args: ServeArgs) {
         no_openings: args.no_openings,
         decode_threshold: u64::from(args.decode_threshold) as usize,
         decoded_cache_bytes: args.decoded_cache.into(),
+        warm_up: args.warm_up,
+        warm_up_limit: args.warm_up_limit,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -79,6 +79,7 @@ pub struct DecodedEntry {
 
 impl DecodedEntry {
     pub fn new(bytes: &[u8]) -> DecodedEntry {
+        let started = std::time::Instant::now();
         let base = bytes.as_ptr() as usize;
         let cells = EntryView::unpack_entire(bytes)
             .cells()
@@ -105,10 +106,11 @@ impl DecodedEntry {
             cells,
         };
         log::debug!(
-            "decoded entry of {} bytes with {} cells ({} bytes)",
+            "decoded entry of {} bytes with {} cells ({} bytes) in {:.1?}",
             bytes.len(),
             decoded.cells.len(),
-            decoded.weight()
+            decoded.weight(),
+            started.elapsed()
         );
         decoded
     }

@@ -79,6 +79,11 @@ pub struct AppConfig {
     pub decode_threshold: usize,
     /// Memory for decoded entries.
     pub decoded_cache_bytes: u64,
+    /// Request log to replay against the database before listening, to
+    /// decode the hot entries and fill the block cache.
+    pub warm_up: Option<PathBuf>,
+    /// Only replay the first lines of the warm-up log.
+    pub warm_up_limit: usize,
 }
 
 /// Error response.
@@ -155,7 +160,10 @@ impl AppState {
     /// The packed entry of a position: from the positions column family,
     /// or synthesized from the single game that reached it.
     fn entry(&self, pos: &VariantPosition, ply: u32) -> Result<Option<Entry<'_>>, Error> {
-        let hash = position_hash(pos);
+        self.entry_by_hash(position_hash(pos), ply)
+    }
+
+    fn entry_by_hash(&self, hash: Zobrist96, ply: u32) -> Result<Option<Entry<'_>>, Error> {
         let fill_cache = self.fill_cache(ply);
         if let Some(decoded) = self.decoded.get(&hash) {
             Metrics::inc(&self.metrics.positions_hits);
@@ -706,6 +714,78 @@ async fn periodic_openings_refresh(state: Shared) {
     }
 }
 
+/// Touches the positions of the requests in a log (one path with query
+/// string per line, plain or zstd compressed), so that hot entries are
+/// decoded and cached before serving.
+async fn warm_up(state: &Shared, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let started = Instant::now();
+    let file = std::fs::File::open(path)?;
+    let reader: Box<dyn Read> = if path.extension().is_some_and(|ext| ext == "zst") {
+        Box::new(zstd::Decoder::new(file)?)
+    } else {
+        Box::new(file)
+    };
+    let prefix = match state.config.kind {
+        Kind::Lichess => "/lichess",
+        Kind::Masters => "/masters",
+    };
+    let mut hashes: std::collections::HashSet<(Zobrist96, u32)> = Default::default();
+    {
+        let openings = state.openings.read().expect("read openings");
+        for line in BufReader::new(reader)
+            .lines()
+            .take(state.config.warm_up_limit)
+        {
+            let line = line?;
+            let Some((path, query)) = line.split_once('?') else {
+                continue;
+            };
+            if path != prefix {
+                continue;
+            }
+            let Ok(raw) = serde_urlencoded::from_str::<RawQuery>(query) else {
+                continue;
+            };
+            let play = match state.config.kind {
+                Kind::Lichess => LichessQuery::parse(&raw).map(|q| q.play),
+                Kind::Masters => MastersQuery::parse(&raw).map(|q| q.play),
+            };
+            if let Ok(play) = play
+                && let Ok(play) = play.position(&openings)
+            {
+                hashes.insert((position_hash(&play.pos), play.ply));
+            }
+        }
+    }
+    let positions = hashes.len();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (hash, ply) in hashes {
+        let state = Arc::clone(state);
+        tasks.spawn(async move {
+            let _permit = state.semaphore.acquire().await.expect("semaphore");
+            let state2 = Arc::clone(&state);
+            task::spawn_blocking(move || state2.entry_by_hash(hash, ply).map(|_| ()))
+                .await
+                .expect("blocking task")
+        });
+    }
+    let mut errors = 0;
+    while let Some(result) = tasks.join_next().await {
+        if result.expect("warm-up task").is_err() {
+            errors += 1;
+        }
+    }
+    log::info!(
+        "warmed up {positions} positions ({} decoded entries, {} errors) in {:.1?}",
+        state.decoded.entry_count(),
+        errors,
+        started.elapsed()
+    );
+    Ok(())
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     log::info!("shutting down");
@@ -774,6 +854,10 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
     } else {
         app
     };
+
+    if let Some(path) = state.config.warm_up.clone() {
+        warm_up(&state, &path).await?;
+    }
 
     let listener = TcpListener::bind(state.config.bind).await?;
     log::info!("listening on {}", state.config.bind);

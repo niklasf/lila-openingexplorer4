@@ -39,7 +39,15 @@ cache (the database is 3.3 GB) and `--decode-threshold 64k`. Replaying the
 sample log with `examples/load_test.rs` at 32 concurrent clients: lichess
 30k requests/s (mean 1.0 ms, p99 5.6 ms) on first contact, masters 100k
 requests/s (p99 1.1 ms). `examples/log_entry_sizes.rs` prints the entry
-size distribution of logged requests, to size the decoded cache.
+size distribution of logged requests, to size the decoded cache, and
+`examples/entry_decode_bench.rs` times the stages of serving a large entry
+(the biggest, 12 MB with 1.2 M games, decodes in 6 ms single-threaded; under
+load that stretches to 15-40 ms from CPU contention). `--blocking-threads`
+defaults to half the available parallelism: more threads add no throughput
+but lengthen tail latencies. `--warm-up sample-log.txt.zst` replays a request
+log before listening (89k positions in 4 s), so that hot entries are decoded
+off the serving path: the full sample log then runs at 43k requests/s with
+p99 3.1 ms and a maximum of 20 ms.
 
 Semantics that differ from the current explorer: rating groups use the
 rating of the side to move instead of the average of both players (as
