@@ -16,7 +16,7 @@ use crate::{
         hot::HotEntry,
         partition::{BUCKETS, Partition, bucket},
     },
-    sst::{RollingSstWriter, SstStats},
+    sst::{RollingSstWriter, SstError, SstStats},
 };
 
 /// Subdirectory of the output for the cold positions column family.
@@ -174,7 +174,7 @@ fn write_range(
     name: &str,
     packer: &mut EntryPacker,
     buf: &mut Vec<u8>,
-) -> Result<OutputStats, rocksdb::Error> {
+) -> Result<OutputStats, SstError> {
     let (dir, opts) = match family {
         Family::Cold => (COLD_DIR, sst.cold_opts),
         Family::Positions => (POSITIONS_DIR, sst.positions_opts),

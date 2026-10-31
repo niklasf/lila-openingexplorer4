@@ -1,9 +1,63 @@
-use std::path::PathBuf;
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use rocksdb::{
     BlockBasedIndexType, BlockBasedOptions, DBCompressionType, DataBlockIndexType, EnvOptions,
     Options, SstFileWriter,
 };
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum SstError {
+    #[error("rocksdb: {0}")]
+    RocksDb(#[from] rocksdb::Error),
+    #[error("io: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Suffix of SST files that are still being written. Finished files are
+/// renamed into place, so that an output directory can be copied at any
+/// time (only `.sst` files are complete).
+pub const TEMP_SUFFIX: &str = ".tmp";
+
+/// An SST file being written under a temporary name.
+pub struct SstFile<'a> {
+    writer: SstFileWriter<'a>,
+    path: PathBuf,
+}
+
+impl<'a> SstFile<'a> {
+    pub fn create(
+        opts: &'a Options,
+        env_opts: &'a EnvOptions,
+        path: PathBuf,
+    ) -> Result<SstFile<'a>, SstError> {
+        let writer = SstFileWriter::create_with_env_options(opts, env_opts);
+        let mut temp = path.clone().into_os_string();
+        temp.push(TEMP_SUFFIX);
+        writer.open(temp)?;
+        Ok(SstFile { writer, path })
+    }
+
+    pub fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<(), SstError> {
+        Ok(self.writer.put(key, value)?)
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.writer.file_size()
+    }
+
+    /// Finishes the file and renames it into place. Returns its size.
+    pub fn finish(mut self) -> Result<u64, SstError> {
+        self.writer.finish()?;
+        let mut temp = self.path.clone().into_os_string();
+        temp.push(TEMP_SUFFIX);
+        fs::rename(Path::new(&temp), &self.path)?;
+        Ok(self.writer.file_size())
+    }
+}
 
 /// Bloom-equivalent bits per key of filters, for about 1% false positives.
 const FILTER_BITS_PER_KEY: f64 = 10.0;
@@ -120,7 +174,7 @@ pub struct RollingSstWriter<'a> {
     prefix: PathBuf,
     target_size: u64,
     seq: usize,
-    writer: Option<SstFileWriter<'a>>,
+    writer: Option<SstFile<'a>>,
     keys_in_file: u64,
     raw_in_file: u64,
     stats: SstStats,
@@ -146,14 +200,13 @@ impl<'a> RollingSstWriter<'a> {
         }
     }
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), rocksdb::Error> {
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), SstError> {
         let w = match &mut self.writer {
             Some(w) => w,
             None => {
-                let w = SstFileWriter::create_with_env_options(self.opts, self.env_opts);
                 let mut path = self.prefix.clone().into_os_string();
                 path.push(format!("_{:04}.sst", self.seq));
-                w.open(path)?;
+                let w = SstFile::create(self.opts, self.env_opts, path.into())?;
                 self.seq += 1;
                 self.writer.insert(w)
             }
@@ -168,18 +221,18 @@ impl<'a> RollingSstWriter<'a> {
     }
 
     /// Finishes the current file, if any. The next key starts a new file.
-    pub fn finish_file(&mut self) -> Result<(), rocksdb::Error> {
-        if let Some(mut w) = self.writer.take() {
-            w.finish()?;
+    pub fn finish_file(&mut self) -> Result<(), SstError> {
+        if let Some(w) = self.writer.take() {
+            let size = w.finish()?;
             self.stats
-                .add_file(self.keys_in_file, w.file_size(), self.raw_in_file);
+                .add_file(self.keys_in_file, size, self.raw_in_file);
             self.keys_in_file = 0;
             self.raw_in_file = 0;
         }
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<SstStats, rocksdb::Error> {
+    pub fn finish(mut self) -> Result<SstStats, SstError> {
         self.finish_file()?;
         Ok(self.stats)
     }
