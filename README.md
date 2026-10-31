@@ -38,7 +38,8 @@ minutes on hard disks. RocksDB also fsyncs every linked file, one after
 the other within an ingest call, so `ingest` splits the files of each
 column family over `--file-opening-threads` concurrent calls and the
 file system can batch the journal flushes (on a busy hard disk RAID a
-single fsync waits up to a second).
+single fsync waits up to a second; with sidecars and 64 calls the lichess
+set links in 3.5 min there, down from 18.5 min).
 
 `--max-ply` must match the `parquet_to_positions` run (50 for lichess, 0 for
 masters, which indexes all plies). Tuning on a 186 GB machine with the SST
@@ -48,8 +49,9 @@ level); masters needs no more than 2 GB of block cache (the database is
 3.3 GB). `--blocking-threads` defaults to half the available parallelism:
 more threads add no throughput but lengthen tail latencies. `--warm-up
 sample-log.txt.zst` replays a request log before listening (281k positions
-in 7-14 s on NVMe, 12.5 min on hard disks), so that the block cache holds
-the hot entries from the start.
+in 7-14 s on NVMe, 12 min on hard disks with `--warm-up-concurrency 64`,
+which keeps the disk queues full), so that the block cache holds the hot
+entries from the start.
 
 On hard disks every lookup that misses the block cache costs a seek, so
 the aim is to need as few seeks per request as possible and to issue them
@@ -76,9 +78,12 @@ about 3.3 seeks (one position block, two game blocks, sometimes a cold
 block), so cold traffic runs at 170-200 req/s however many threads or
 clients there are; after the warm-up the full log replays at 390 req/s
 with p50 170 ms and p99 480 ms, and 80% of the remaining disk reads are
-games. Opening the lichess database with direct reads takes about 70 s on
-hard disks (footers and properties of 7601 files; 5 s with buffered
-reads from a warm page cache), and `--pin-metadata` loads 23 GB.
+games. With the disks fully saturated by another reader (1-1.5k r/s per
+disk) the same runs drop to 150 and 260 req/s, and `--parallel-fetch`
+is worth 50% instead of nothing. Opening the lichess database with direct
+reads takes 70-100 s on hard disks (footers and properties of 7601 files,
+not helped by more `--file-opening-threads`; 5 s with buffered reads
+from a warm page cache), and `--pin-metadata` loads 23 GB.
 
 Serving reads entries in place, without decoding them: groups (move, speed
 and rating group) that the query does not select are skipped by their byte
