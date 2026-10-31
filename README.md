@@ -34,8 +34,9 @@ sets on NVMe: lichess `--cache 32g` plus the page cache (buffered reads;
 level); masters needs no more than 2 GB of block cache (the database is
 3.3 GB). `--blocking-threads` defaults to half the available parallelism:
 more threads add no throughput but lengthen tail latencies. `--warm-up
-sample-log.txt.zst` replays a request log before listening (89k positions in
-4 s), so that the block cache holds the hot entries from the start.
+sample-log.txt.zst` replays a request log before listening (281k positions
+in 7-14 s on NVMe, 12.5 min on hard disks), so that the block cache holds
+the hot entries from the start.
 
 On hard disks every lookup that misses the block cache costs a seek, so
 the aim is to need as few seeks per request as possible and to issue them
@@ -49,6 +50,19 @@ have a queue to reorder; `--direct-reads` keeps the page cache from
 competing with the block cache for memory. Both `--pin-metadata` and
 `--parallel-fetch` are off by default because they cost a few percent on
 NVMe.
+
+Replaying the sample log (`examples/load_test.rs`, 593k lichess and 520k
+masters requests) on a 16-core machine: from NVMe, lichess serves 47-67k
+req/s with p99 2-4 ms after warm-up (the lower number with a cold page
+cache) and masters 115k req/s with p99 1 ms. From a RAID 5 of four hard
+disks that was also carrying a sync, an uncached lichess request costs
+about 3.3 seeks (one position block, two game blocks, sometimes a cold
+block), so cold traffic runs at 170-200 req/s however many threads or
+clients there are; after the warm-up the full log replays at 390 req/s
+with p50 170 ms and p99 480 ms, and 80% of the remaining disk reads are
+games. Opening the lichess database with direct reads takes about 70 s on
+hard disks (footers and properties of 7601 files; 5 s with buffered
+reads from a warm page cache), and `--pin-metadata` loads 23 GB.
 
 Serving reads entries in place, without decoding them: groups (move, speed
 and rating group) that the query does not select are skipped by their byte
