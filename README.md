@@ -37,6 +37,19 @@ more threads add no throughput but lengthen tail latencies. `--warm-up
 sample-log.txt.zst` replays a request log before listening (89k positions in
 4 s), so that the block cache holds the hot entries from the start.
 
+On hard disks every lookup that misses the block cache costs a seek, so
+the aim is to need as few seeks per request as possible and to issue them
+concurrently: `--pin-metadata` loads all index and filter partitions at
+startup and keeps them in the block cache (the lichess set has about 27 GB
+of them, so give it `--cache 64g`), which leaves at most one data block
+read per position or game lookup; `--parallel-fetch` reads the games of a
+response that are not cached in parallel instead of one after the other;
+`--blocking-threads 64` oversubscribes the cores so that the disks always
+have a queue to reorder; `--direct-reads` keeps the page cache from
+competing with the block cache for memory. Both `--pin-metadata` and
+`--parallel-fetch` are off by default because they cost a few percent on
+NVMe.
+
 Serving reads entries in place, without decoding them: groups (move, speed
 and rating group) that the query does not select are skipped by their byte
 length, the subtotal of a group stands in for its months when the query has
