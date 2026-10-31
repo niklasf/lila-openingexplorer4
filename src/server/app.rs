@@ -27,16 +27,12 @@ use tokio::{net::TcpListener, sync::Semaphore, task, time};
 
 use crate::{
     packed::{
-        BorrowedLichessGame, CellKey, EntryView, GameId, GameSeq, GroupHeader, LichessEntry,
-        Rating, RatingGroup, Zobrist96,
+        BorrowedLichessGame, CellKey, GameId, GameSeq, GroupHeader, LichessEntry, Rating,
+        RatingGroup, Zobrist96,
     },
     server::{
         db::Database,
-        entry_v3::{Flags, prepare_lichess_v3},
-        explore::{
-            DecodedEntry, GameRef, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
-            prepare_masters,
-        },
+        explore::{GameRef, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess, prepare_masters},
         metrics::Metrics,
         openings::Openings,
         pgn::masters_pgn,
@@ -76,12 +72,8 @@ pub struct AppConfig {
     pub openings_dir: Option<PathBuf>,
     /// Do not load opening names at all.
     pub no_openings: bool,
-    /// Packed entries of at least this size are kept decoded in memory.
-    pub decode_threshold: usize,
-    /// Memory for decoded entries.
-    pub decoded_cache_bytes: u64,
     /// Request log to replay against the database before listening, to
-    /// decode the hot entries and fill the block cache.
+    /// fill the block cache.
     pub warm_up: Option<PathBuf>,
     /// Only replay the first lines of the warm-up log.
     pub warm_up_limit: usize,
@@ -132,8 +124,6 @@ pub struct AppState {
     openings: RwLock<Openings>,
     lichess_cache: ResponseCache<LichessQuery>,
     masters_cache: ResponseCache<MastersQuery>,
-    /// Large entries, decoded once.
-    decoded: moka::sync::Cache<Zobrist96, Arc<DecodedEntry>>,
     semaphore: Semaphore,
     metrics: Metrics,
     /// For sampling which deep positions fill the block cache.
@@ -166,20 +156,9 @@ impl AppState {
 
     fn entry_by_hash(&self, hash: Zobrist96, ply: u32) -> Result<Option<Entry<'_>>, Error> {
         let fill_cache = self.fill_cache(ply);
-        if let Some(decoded) = self.decoded.get(&hash) {
-            Metrics::inc(&self.metrics.positions_hits);
-            Metrics::inc(&self.metrics.decoded_hits);
-            return Ok(Some(Entry::Decoded(decoded)));
-        }
         if let Some(entry) = self.db.positions_entry(&hash, fill_cache)? {
             Metrics::inc(&self.metrics.positions_hits);
-            if entry.len() >= self.config.decode_threshold {
-                let decoded = self
-                    .decoded
-                    .get_with(hash, || Arc::new(DecodedEntry::new(&entry)));
-                return Ok(Some(Entry::Decoded(decoded)));
-            }
-            return Ok(Some(Entry::Packed(EntryBytes::Pinned(entry))));
+            return Ok(Some(Entry::Pinned(entry)));
         }
         let candidates = self.db.cold_candidates(&hash, fill_cache)?;
         if candidates.is_empty() {
@@ -222,7 +201,7 @@ impl AppState {
             Metrics::inc(&self.metrics.cold_hits);
             let mut buf = Vec::new();
             entry.pack_entire(&mut buf);
-            Ok(Some(Entry::Packed(EntryBytes::Owned(buf))))
+            Ok(Some(Entry::Owned(buf)))
         } else {
             Metrics::inc(&self.metrics.misses);
             Ok(None)
@@ -302,24 +281,8 @@ impl AppState {
     fn lichess(&self, query: &LichessQuery, play: PlayPosition) -> Result<Bytes, Error> {
         let PlayPosition { pos, opening, ply } = play;
         let entry = self.entry(&pos, ply)?;
-        let prepared = match &entry {
-            Some(Entry::Decoded(decoded)) => {
-                prepare_lichess(&**decoded, &query.filter, &query.limits, query.history)
-            }
-            Some(Entry::Packed(bytes)) => prepare_lichess_v3(
-                bytes,
-                Flags::PACKED,
-                &query.filter,
-                &query.limits,
-                query.history,
-            ),
-            None => prepare_lichess(
-                &EntryView::unpack_entire(&[]),
-                &query.filter,
-                &query.limits,
-                query.history,
-            ),
-        };
+        let bytes: &[u8] = entry.as_deref().unwrap_or(&[]);
+        let prepared = prepare_lichess(bytes, &query.filter, &query.limits, query.history);
 
         let mut ids = Vec::new();
         let mut moves = self.explorer_moves(&pos, prepared.moves, &mut ids);
@@ -364,25 +327,13 @@ impl AppState {
     fn masters(&self, query: &MastersQuery, play: PlayPosition) -> Result<Bytes, Error> {
         let PlayPosition { pos, opening, ply } = play;
         let entry = self.entry(&pos, ply)?;
-        let filter = query.filter();
-        let candidates = self.config.masters_top_candidates;
-        let prepared = match &entry {
-            Some(Entry::Decoded(decoded)) => {
-                prepare_masters(&**decoded, &filter, &query.limits, candidates)
-            }
-            Some(Entry::Packed(bytes)) => prepare_masters(
-                &EntryView::unpack_entire(bytes),
-                &filter,
-                &query.limits,
-                candidates,
-            ),
-            None => prepare_masters(
-                &EntryView::unpack_entire(&[]),
-                &filter,
-                &query.limits,
-                candidates,
-            ),
-        };
+        let bytes: &[u8] = entry.as_deref().unwrap_or(&[]);
+        let prepared = prepare_masters(
+            bytes,
+            &query.filter(),
+            &query.limits,
+            self.config.masters_top_candidates,
+        );
 
         let mut ids = Vec::new();
         let mut moves = self.explorer_moves(&pos, prepared.moves, &mut ids);
@@ -449,25 +400,19 @@ impl AppState {
     }
 }
 
-/// An entry of a position.
-enum Entry<'a> {
-    Packed(EntryBytes<'a>),
-    Decoded(Arc<DecodedEntry>),
-}
-
 /// A packed entry, borrowed from the block cache or synthesized.
-enum EntryBytes<'a> {
+enum Entry<'a> {
     Pinned(DBPinnableSlice<'a>),
     Owned(Vec<u8>),
 }
 
-impl Deref for EntryBytes<'_> {
+impl Deref for Entry<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
         match self {
-            EntryBytes::Pinned(slice) => slice,
-            EntryBytes::Owned(vec) => vec,
+            Entry::Pinned(slice) => slice,
+            Entry::Owned(vec) => vec,
         }
     }
 }
@@ -636,8 +581,6 @@ async fn monitor(State(state): State<Shared>) -> String {
             "masters_cache={}u",
             state.masters_cache.entry_count()
         ));
-        fields.push(format!("decoded_entries={}u", state.decoded.entry_count()));
-        fields.push(format!("decoded_bytes={}u", state.decoded.weighted_size()));
         fields.push(format!("block_cache_usage={}u", state.db.cache_usage()));
         fields.push(format!(
             "block_cache_pinned={}u",
@@ -717,8 +660,8 @@ async fn periodic_openings_refresh(state: Shared) {
 }
 
 /// Touches the positions of the requests in a log (one path with query
-/// string per line, plain or zstd compressed), so that hot entries are
-/// decoded and cached before serving.
+/// string per line, plain or zstd compressed), so that the block cache
+/// holds the hot entries before serving.
 async fn warm_up(state: &Shared, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{BufRead, BufReader, Read};
 
@@ -780,9 +723,7 @@ async fn warm_up(state: &Shared, path: &std::path::Path) -> Result<(), Box<dyn s
         }
     }
     log::info!(
-        "warmed up {positions} positions ({} decoded entries, {} errors) in {:.1?}",
-        state.decoded.entry_count(),
-        errors,
+        "warmed up {positions} positions ({errors} errors) in {:.1?}",
         started.elapsed()
     );
     Ok(())
@@ -817,10 +758,6 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         masters_cache: Cache::builder()
             .max_capacity(config.cache_entries)
             .time_to_live(config.cache_ttl)
-            .build(),
-        decoded: moka::sync::Cache::builder()
-            .max_capacity(config.decoded_cache_bytes)
-            .weigher(|_, entry: &Arc<DecodedEntry>| entry.weight().min(u32::MAX as usize) as u32)
             .build(),
         semaphore: Semaphore::new(config.blocking_threads),
         openings: RwLock::new(openings),

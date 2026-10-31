@@ -102,8 +102,8 @@ struct ServeArgs {
     #[arg(long, help_heading = "Server")]
     blocking_threads: Option<usize>,
     /// Request log (one path with query string per line, like
-    /// sample-log.txt.zst) to replay before listening, so that the hot
-    /// entries are decoded and the block cache is filled.
+    /// sample-log.txt.zst) to replay before listening, so that the block
+    /// cache is filled.
     #[arg(long, help_heading = "Server")]
     warm_up: Option<PathBuf>,
     /// Only replay the first lines of the warm-up log.
@@ -126,13 +126,6 @@ struct ServeArgs {
     /// Do not load opening names at all.
     #[arg(long, help_heading = "Server")]
     no_openings: bool,
-    /// Packed entries of at least this size (the busiest positions) are
-    /// kept decoded in memory, for fast aggregation. Accepts units.
-    #[arg(long, default_value = "4m", help_heading = "Server")]
-    decode_threshold: ByteSize,
-    /// Memory for decoded entries. Accepts units, like 4g.
-    #[arg(long, default_value = "8g", help_heading = "Server")]
-    decoded_cache: ByteSize,
 }
 
 fn db_config(
@@ -234,8 +227,6 @@ fn run(kind: Kind, args: ServeArgs) {
         masters_top_candidates: args.masters_top_candidates,
         openings_dir: args.openings_dir,
         no_openings: args.no_openings,
-        decode_threshold: u64::from(args.decode_threshold) as usize,
-        decoded_cache_bytes: args.decoded_cache.into(),
         warm_up: args.warm_up,
         warm_up_limit: args.warm_up_limit,
     };

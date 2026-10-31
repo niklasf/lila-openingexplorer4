@@ -6,7 +6,7 @@ use std::{
 use shakmaty::packed::PackedUciMove;
 
 use crate::{
-    packed::{CellGames, CellKey, EntryView, GameId, Month, RatingGroup, Speed, SubStats},
+    packed::{EntryView, GameId, Month, RatingGroup, Speed, SubStats},
     server::query::{LichessFilter, Limits},
 };
 
@@ -17,134 +17,6 @@ pub const MAX_TOP_GAMES: usize = 4;
 /// Most top games of a masters response.
 pub const MAX_MASTERS_GAMES: usize = 15;
 
-/// A cell of an entry, from a packed or a decoded entry.
-pub struct CellRef<'a> {
-    pub key: CellKey,
-    pub stats: SubStats,
-    pub games: CellGames<'a>,
-    /// Highest rank among the games and its game, if known in advance.
-    pub last: Option<(u64, GameId)>,
-}
-
-/// Source of the cells of an entry, in canonical order.
-pub trait CellSource {
-    fn cells(&self) -> impl Iterator<Item = CellRef<'_>>;
-}
-
-impl CellSource for EntryView<'_> {
-    fn cells(&self) -> impl Iterator<Item = CellRef<'_>> {
-        EntryView::cells(self).map(|cell| CellRef {
-            key: cell.key,
-            stats: cell.stats,
-            games: cell.games,
-            last: None,
-        })
-    }
-}
-
-/// A cell header, compact (48 bytes).
-#[derive(Debug, Clone)]
-struct DecodedCell {
-    key: CellKey,
-    white: u32,
-    draws: u32,
-    black: u32,
-    rating_offset_sum: i64,
-    /// Offset and length of the packed games in the entry bytes.
-    games_start: u32,
-    games_len: u16,
-    /// Rank and id of the most recent game.
-    last_rank: u32,
-    last_id: [u8; GameId::SIZE],
-}
-
-impl DecodedCell {
-    fn stats(&self) -> SubStats {
-        SubStats {
-            rating_offset_sum: self.rating_offset_sum,
-            white: u64::from(self.white),
-            black: u64::from(self.black),
-            draws: u64::from(self.draws),
-        }
-    }
-}
-
-/// An entry with the cell headers decoded, for fast repeated aggregation
-/// of large entries. Games are only decoded when a cell is selected.
-#[derive(Debug)]
-pub struct DecodedEntry {
-    bytes: Vec<u8>,
-    cells: Vec<DecodedCell>,
-}
-
-impl DecodedEntry {
-    pub fn new(bytes: &[u8]) -> DecodedEntry {
-        let started = std::time::Instant::now();
-        let base = bytes.as_ptr() as usize;
-        let cells = EntryView::unpack_entire(bytes)
-            .cells()
-            .map(|cell| {
-                let games = cell.games.as_bytes();
-                // Games of a cell are packed in chronological order.
-                let (last_rank, last_id) = cell.games.last().expect("cell has games");
-                let stats = cell.stats;
-                DecodedCell {
-                    key: cell.key,
-                    white: u32::try_from(stats.white).expect("cell count"),
-                    draws: u32::try_from(stats.draws).expect("cell count"),
-                    black: u32::try_from(stats.black).expect("cell count"),
-                    rating_offset_sum: stats.rating_offset_sum,
-                    games_start: (games.as_ptr() as usize - base) as u32,
-                    games_len: u16::try_from(games.len()).expect("games of a cell"),
-                    last_rank: u32::try_from(last_rank).expect("rank"),
-                    last_id: last_id.to_bytes(),
-                }
-            })
-            .collect();
-        let decoded = DecodedEntry {
-            bytes: bytes.to_vec(),
-            cells,
-        };
-        log::debug!(
-            "decoded entry of {} bytes with {} cells ({} bytes) in {:.1?}",
-            bytes.len(),
-            decoded.cells.len(),
-            decoded.weight(),
-            started.elapsed()
-        );
-        decoded
-    }
-
-    /// Approximate memory use in bytes.
-    pub fn weight(&self) -> usize {
-        self.bytes.len() + self.cells.len() * std::mem::size_of::<DecodedCell>()
-    }
-
-    pub fn len(&self) -> usize {
-        self.cells.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
-    }
-}
-
-impl CellSource for DecodedEntry {
-    fn cells(&self) -> impl Iterator<Item = CellRef<'_>> {
-        self.cells.iter().map(|cell| CellRef {
-            key: cell.key,
-            stats: cell.stats(),
-            games: CellGames::from_bytes(
-                &self.bytes[cell.games_start as usize..][..usize::from(cell.games_len)],
-            ),
-            last: Some((
-                u64::from(cell.last_rank),
-                GameId::try_from(cell.last_id).expect("valid game id"),
-            )),
-        })
-    }
-}
-
 /// Statistics of a move, aggregated over the matching cells.
 #[derive(Debug, Clone)]
 pub struct PreparedMove {
@@ -152,7 +24,38 @@ pub struct PreparedMove {
     pub stats: SubStats,
     /// The only game, if the move was played exactly once.
     pub game: Option<GameId>,
-    pub(crate) latest: Option<(u64, GameId)>,
+    /// Highest rank seen among the games of the move, and its game.
+    latest: Option<(u64, GameId)>,
+}
+
+impl PreparedMove {
+    fn new(m: PackedUciMove) -> PreparedMove {
+        PreparedMove {
+            m,
+            stats: SubStats::default(),
+            game: None,
+            latest: None,
+        }
+    }
+
+    fn see_game(&mut self, rank: u64, id: GameId) {
+        if self.latest.is_none_or(|(latest, _)| latest < rank) {
+            self.latest = Some((rank, id));
+        }
+    }
+
+    /// Finishes the move, once all its cells are aggregated: whether it has
+    /// any games, and which game is the only one.
+    fn finish(mut self) -> Option<PreparedMove> {
+        if self.stats.games() == 0 {
+            return None;
+        }
+        self.game = self
+            .latest
+            .filter(|_| self.stats.games() == 1)
+            .map(|(_, id)| id);
+        Some(self)
+    }
 }
 
 /// A game referenced by an entry.
@@ -311,80 +214,103 @@ impl GameSelection {
 }
 
 #[derive(Default)]
-pub(crate) struct Aggregate {
-    pub(crate) total: SubStats,
-    pub(crate) moves: Vec<PreparedMove>,
-    pub(crate) months: BTreeMap<Month, SubStats>,
+struct Aggregate {
+    total: SubStats,
+    moves: Vec<PreparedMove>,
+    months: BTreeMap<Month, SubStats>,
 }
 
-/// Aggregates the cells of an entry that match the filter, in canonical
-/// order.
-fn aggregate<S: CellSource>(
-    entry: &S,
+impl Aggregate {
+    fn add(&mut self, pm: &mut PreparedMove, month: Month, stats: &SubStats, collect_months: bool) {
+        pm.stats.merge(stats);
+        self.total.merge(stats);
+        if collect_months {
+            self.months.entry(month).or_default().merge(stats);
+        }
+    }
+}
+
+/// Aggregates the cells of a packed entry that match the filter, reading
+/// as little as the format allows: groups that the filter does not select
+/// are skipped, the subtotal of a group stands in for its cells when there
+/// is no month range, and the cells of a group (newest first) are left
+/// once they are older than `since`, or once their games can no longer be
+/// selected and the subtotal already counted them.
+fn aggregate(
+    bytes: &[u8],
     filter: &LichessFilter,
-    games: Option<&mut GameSelection>,
+    mut games: Option<&mut GameSelection>,
     collect_months: bool,
 ) -> Aggregate {
     let mut agg = Aggregate::default();
-    let mut games = games;
-    for cell in entry.cells() {
-        let header = cell.key.group_header();
-        let month = cell.key.month();
+    let no_range = filter.since.is_none() && filter.until.is_none();
+    let mut current: Option<PreparedMove> = None;
+    for group in EntryView::unpack_entire(bytes).groups() {
+        let m = group.uci_move();
+        if current.as_ref().is_none_or(|pm| pm.m != m) {
+            agg.moves
+                .extend(current.take().and_then(PreparedMove::finish));
+            current = Some(PreparedMove::new(m));
+        }
+        let pm = current.as_mut().expect("current move");
+        let header = group.header;
         if !filter.contains_speed(header.speed)
             || !filter.contains_rating_group(header.rating_group)
-            || !filter.contains_month(month)
         {
             continue;
         }
 
-        let m = cell.key.uci_move();
-        let current = match agg.moves.last_mut() {
-            Some(current) if current.m == m => current,
-            _ => {
-                agg.moves.push(PreparedMove {
-                    m,
-                    stats: SubStats::default(),
-                    game: None,
-                    latest: None,
-                });
-                agg.moves.last_mut().expect("just pushed")
-            }
-        };
-        current.stats.merge(&cell.stats);
-        agg.total.merge(&cell.stats);
-        if collect_months {
-            agg.months.entry(month).or_default().merge(&cell.stats);
+        let subtotal = group.subtotal.filter(|_| no_range && !collect_months);
+        if let Some(subtotal) = subtotal {
+            agg.add(pm, group.newest_month, &subtotal, false);
         }
-        let Some(games) = games.as_deref_mut() else {
-            continue;
-        };
-        if let Some((max_rank, last_id)) = cell.last {
-            if current.latest.is_none_or(|(latest, _)| latest < max_rank) {
-                current.latest = Some((max_rank, last_id));
+
+        let mut games_done = games.is_none();
+        let mut cells = group.cells();
+        while let Some(cell) = cells.next_cell() {
+            let month = cell.key.month();
+            if filter.since.is_some_and(|since| month < since) {
+                break;
             }
-            if !games.accepts_cell(header.speed, header.rating_group, max_rank) {
+            if subtotal.is_some() && games_done {
+                break;
+            }
+            if !filter.contains_month(month) {
                 continue;
             }
-        }
-        for (rank, id) in cell.games {
-            if current.latest.is_none_or(|(latest, _)| latest < rank) {
-                current.latest = Some((rank, id));
+            if subtotal.is_none() {
+                agg.add(pm, month, &cell.stats, collect_months);
             }
-            games.push(GameRef {
+            if games_done {
+                continue;
+            }
+            let games = games.as_deref_mut().expect("games wanted");
+            let Some((rank, id)) = cells.next_game() else {
+                continue;
+            };
+            pm.see_game(rank, id);
+            if !games.accepts_cell(header.speed, header.rating_group, rank) {
+                games_done = true;
+                continue;
+            }
+            let game_ref = GameRef {
                 group: header.rating_group,
                 speed: header.speed,
                 rank,
                 m,
                 id,
-            });
+            };
+            games.push(game_ref);
+            while let Some((rank, id)) = cells.next_game() {
+                games.push(GameRef {
+                    rank,
+                    id,
+                    ..game_ref
+                });
+            }
         }
     }
-    for pm in &mut agg.moves {
-        pm.game = pm
-            .latest
-            .filter(|_| pm.stats.games() == 1)
-            .map(|(_, id)| id);
-    }
+    agg.moves.extend(current.and_then(PreparedMove::finish));
     agg
 }
 
@@ -402,8 +328,24 @@ pub struct LichessPrepared {
     pub history: Option<Vec<HistorySegment>>,
 }
 
-pub fn prepare_lichess<S: CellSource>(
-    entry: &S,
+/// Prepares a lichess response from a packed entry.
+pub fn prepare_lichess(
+    bytes: &[u8],
+    filter: &LichessFilter,
+    limits: &Limits,
+    history: bool,
+) -> LichessPrepared {
+    prepare_lichess_with(
+        |games, collect_months| aggregate(bytes, filter, games, collect_months),
+        filter,
+        limits,
+        history,
+    )
+}
+
+/// Prepares a lichess response with the given aggregation function.
+fn prepare_lichess_with(
+    aggregate: impl FnOnce(Option<&mut GameSelection>, bool) -> Aggregate,
     filter: &LichessFilter,
     limits: &Limits,
     history: bool,
@@ -414,23 +356,7 @@ pub fn prepare_lichess<S: CellSource>(
         top_group: filter.top_group(),
         candidates: TopK::new(0),
     };
-    let agg = aggregate(
-        entry,
-        filter,
-        limits.games_wanted().then_some(&mut games),
-        history,
-    );
-    finish_lichess(agg, games, filter, limits, history)
-}
-
-/// Builds the response parts from the aggregate and the selected games.
-pub(crate) fn finish_lichess(
-    agg: Aggregate,
-    games: GameSelection,
-    filter: &LichessFilter,
-    limits: &Limits,
-    history: bool,
-) -> LichessPrepared {
+    let agg = aggregate(limits.games_wanted().then_some(&mut games), history);
     let mut moves = agg.moves;
     sort_moves_and_truncate(&mut moves, limits.moves);
 
@@ -496,9 +422,22 @@ pub struct MastersPrepared {
 /// entries only keep the most recent games of each cell, so the candidates
 /// are the most recent games of the highest rating groups, up to
 /// `max_candidates`, to be ranked by their actual ratings.
-pub fn prepare_masters<S: CellSource>(
-    entry: &S,
+pub fn prepare_masters(
+    bytes: &[u8],
     filter: &LichessFilter,
+    limits: &Limits,
+    max_candidates: usize,
+) -> MastersPrepared {
+    prepare_masters_with(
+        |games, collect_months| aggregate(bytes, filter, games, collect_months),
+        limits,
+        max_candidates,
+    )
+}
+
+/// Prepares a masters response with the given aggregation function.
+fn prepare_masters_with(
+    aggregate: impl FnOnce(Option<&mut GameSelection>, bool) -> Aggregate,
     limits: &Limits,
     max_candidates: usize,
 ) -> MastersPrepared {
@@ -508,12 +447,7 @@ pub fn prepare_masters<S: CellSource>(
         top_group: None,
         candidates: TopK::new(max_candidates),
     };
-    let agg = aggregate(
-        entry,
-        filter,
-        (limits.top_games > 0).then_some(&mut games),
-        false,
-    );
+    let agg = aggregate((limits.top_games > 0).then_some(&mut games), false);
     let mut moves = agg.moves;
     sort_moves_and_truncate(&mut moves, limits.moves);
     MastersPrepared {
@@ -529,7 +463,7 @@ mod tests {
     use shakmaty::{Color, KnownOutcome, uci::UciMove};
 
     use super::*;
-    use crate::packed::{GameSeq, GroupHeader, LichessEntry, Rating};
+    use crate::packed::{CellKey, GameSeq, GroupHeader, LichessEntry, Rating};
 
     fn id(n: u64) -> GameId {
         GameId::unpack(&mut &n.to_be_bytes()[2..])
@@ -601,8 +535,7 @@ mod tests {
     #[test]
     fn test_prepare_lichess() {
         let buf = entry();
-        let view = EntryView::unpack_entire(&buf);
-        let prepared = prepare_lichess(&view, &all(), &limits(), true);
+        let prepared = prepare_lichess(&buf, &all(), &limits(), true);
         assert_eq!(prepared.total.games(), 4);
         assert_eq!(prepared.moves.len(), 2);
         assert_eq!(prepared.moves[0].stats.games(), 3);
@@ -625,7 +558,7 @@ mod tests {
             speeds: Some(1 << Speed::Blitz.bits()),
             ..all()
         };
-        let prepared = prepare_lichess(&view, &filter, &limits(), false);
+        let prepared = prepare_lichess(&buf, &filter, &limits(), false);
         assert_eq!(prepared.total.games(), 2);
         assert_eq!(prepared.moves.len(), 1);
         assert_eq!(prepared.recent_games.len(), 2);
@@ -636,7 +569,7 @@ mod tests {
             until: Some(Month::from_year_and_month(2020, 3).unwrap()),
             ..all()
         };
-        let prepared = prepare_lichess(&view, &filter, &limits(), true);
+        let prepared = prepare_lichess(&buf, &filter, &limits(), true);
         assert_eq!(prepared.total.games(), 2);
         assert_eq!(prepared.top_games.len(), 2);
         assert!(prepared.recent_games.is_empty());
@@ -647,7 +580,7 @@ mod tests {
             recent_games: 0,
             moves: 1,
         };
-        let prepared = prepare_lichess(&view, &all(), &no_games, false);
+        let prepared = prepare_lichess(&buf, &all(), &no_games, false);
         assert_eq!(prepared.moves.len(), 1);
         assert!(prepared.top_games.is_empty() && prepared.recent_games.is_empty());
     }
@@ -655,7 +588,7 @@ mod tests {
     #[test]
     fn test_prepare_masters() {
         let buf = entry();
-        let prepared = prepare_masters(&EntryView::unpack_entire(&buf), &all(), &limits(), 2);
+        let prepared = prepare_masters(&buf, &all(), &limits(), 2);
         assert_eq!(prepared.total.games(), 4);
         let candidates: Vec<GameId> = prepared.candidates.iter().map(|g| g.id).collect();
         assert_eq!(candidates, vec![id(3), id(4)]);
@@ -665,40 +598,165 @@ mod tests {
         games.iter().map(|g| g.id).collect()
     }
 
-    /// Decoded entries with pruning give the same results as packed entries.
+    /// Reference aggregation: every cell of the entry, nothing skipped.
+    fn aggregate_naive(
+        bytes: &[u8],
+        filter: &LichessFilter,
+        mut games: Option<&mut GameSelection>,
+        collect_months: bool,
+    ) -> Aggregate {
+        let mut agg = Aggregate::default();
+        let mut by_move: BTreeMap<[u8; 2], PreparedMove> = BTreeMap::new();
+        for cell in EntryView::unpack_entire(bytes).cells() {
+            let header = cell.key.group_header();
+            let month = cell.key.month();
+            if !filter.contains_speed(header.speed)
+                || !filter.contains_rating_group(header.rating_group)
+                || !filter.contains_month(month)
+            {
+                continue;
+            }
+            let m = cell.key.uci_move();
+            let pm = by_move
+                .entry(m.to_bytes())
+                .or_insert_with(|| PreparedMove::new(m));
+            agg.add(pm, month, &cell.stats, collect_months);
+            if let Some(games) = games.as_deref_mut() {
+                for (rank, id) in cell.games {
+                    pm.see_game(rank, id);
+                    games.push(GameRef {
+                        group: header.rating_group,
+                        speed: header.speed,
+                        rank,
+                        m,
+                        id,
+                    });
+                }
+            }
+        }
+        agg.moves = by_move
+            .into_values()
+            .filter_map(PreparedMove::finish)
+            .collect();
+        agg
+    }
+
+    fn moves(moves: &[PreparedMove]) -> Vec<(PackedUciMove, SubStats, Option<GameId>)> {
+        moves.iter().map(|pm| (pm.m, pm.stats, pm.game)).collect()
+    }
+
+    /// An entry with few moves and groups but many months, so that groups
+    /// have subtotals and early stops matter.
+    fn dense_entry(u: &mut arbitrary::Unstructured) -> arbitrary::Result<LichessEntry> {
+        let mut entry = LichessEntry::new();
+        let moves = ["e2e4", "d2d4", "c2c4"];
+        for seq in 0..u.int_in_range(0..=400)? {
+            let uci: UciMove = moves[u.int_in_range(0..=2)?].parse().unwrap();
+            let speed = if u.arbitrary()? {
+                Speed::Blitz
+            } else {
+                Speed::Rapid
+            };
+            let rating = Rating::try_from(u.int_in_range(1500..=2600)? / 500 * 500).unwrap();
+            let outcome: KnownOutcome = u.arbitrary()?;
+            let month = Month::from_months_since_jan_1900(u.int_in_range(1400..=1460)?);
+            entry.add_game(
+                CellKey::new(
+                    PackedUciMove::pack(uci),
+                    GroupHeader {
+                        speed: Some(speed),
+                        rating_group: RatingGroup::select(rating),
+                    },
+                    month,
+                ),
+                rating,
+                outcome,
+                GameSeq(seq),
+                id(seq + 1),
+            );
+        }
+        Ok(entry)
+    }
+
+    /// Skipping groups, using subtotals and stopping early gives the same
+    /// results as aggregating every cell.
     #[test]
-    fn test_decoded_matches_packed() {
+    fn test_matches_naive() {
         arbtest(|u| {
-            let mut entry: LichessEntry = u.arbitrary()?;
+            let mut entry: LichessEntry = if u.arbitrary()? {
+                u.arbitrary()?
+            } else {
+                dense_entry(u)?
+            };
             let mut buf = Vec::new();
             entry.pack_entire(&mut buf);
-            let view = EntryView::unpack_entire(&buf);
-            let decoded = DecodedEntry::new(&buf);
+            let subtotals = EntryView::unpack_entire(&buf)
+                .groups()
+                .filter(|g| g.subtotal.is_some())
+                .count();
+            SUBTOTALS_SEEN.fetch_add(subtotals, std::sync::atomic::Ordering::Relaxed);
+            let month = |u: &mut arbitrary::Unstructured| {
+                Ok(Month::from_months_since_jan_1900(
+                    u.int_in_range(1400..=1600)?,
+                ))
+            };
             let filter = LichessFilter {
                 speeds: u.arbitrary()?,
                 ratings: u.arbitrary()?,
-                since: None,
-                until: None,
+                since: if u.arbitrary()? {
+                    Some(month(u)?)
+                } else {
+                    None
+                },
+                until: if u.arbitrary()? {
+                    Some(month(u)?)
+                } else {
+                    None
+                },
             };
             let limits = Limits {
                 moves: 12,
                 top_games: u.int_in_range(0..=4)?,
                 recent_games: u.int_in_range(0..=8)?,
             };
-            let a = prepare_lichess(&view, &filter, &limits, true);
-            let b = prepare_lichess(&decoded, &filter, &limits, true);
+            let history: bool = u.arbitrary()?;
+            let a = prepare_lichess(&buf, &filter, &limits, history);
+            let b = prepare_lichess_with(
+                |games, collect_months| aggregate_naive(&buf, &filter, games, collect_months),
+                &filter,
+                &limits,
+                history,
+            );
             assert_eq!(a.total, b.total);
-            assert_eq!(a.moves.len(), b.moves.len());
-            for (x, y) in a.moves.iter().zip(&b.moves) {
-                assert_eq!((x.m, x.stats, x.game), (y.m, y.stats, y.game));
-            }
+            assert_eq!(moves(&a.moves), moves(&b.moves));
             // Ties in rank do not occur: ranks are unique within an entry.
             assert_eq!(game_ids(&a.top_games), game_ids(&b.top_games));
             assert_eq!(game_ids(&a.recent_games), game_ids(&b.recent_games));
-            let a = prepare_masters(&view, &filter, &limits, 5);
-            let b = prepare_masters(&decoded, &filter, &limits, 5);
+            let segments = |p: &LichessPrepared| {
+                p.history
+                    .as_ref()
+                    .map(|h| h.iter().map(|s| (s.month, s.stats)).collect::<Vec<_>>())
+            };
+            assert_eq!(segments(&a), segments(&b));
+
+            let candidates = u.int_in_range(0..=5)?;
+            let a = prepare_masters(&buf, &filter, &limits, candidates);
+            let b = prepare_masters_with(
+                |games, collect_months| aggregate_naive(&buf, &filter, games, collect_months),
+                &limits,
+                candidates,
+            );
+            assert_eq!(a.total, b.total);
+            assert_eq!(moves(&a.moves), moves(&b.moves));
             assert_eq!(game_ids(&a.candidates), game_ids(&b.candidates));
             Ok(())
-        });
+        })
+        .budget_ms(2000);
+        assert!(
+            SUBTOTALS_SEEN.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "subtotals exercised"
+        );
     }
+
+    static SUBTOTALS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 }

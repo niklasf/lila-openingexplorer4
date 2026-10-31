@@ -1,6 +1,6 @@
 // Times the stages of serving a large entry: the RocksDB get, iterating
-// cells, iterating games, building a DecodedEntry, and aggregating from the
-// packed and the decoded entry.
+// groups, cells and games, and aggregating with the query's filter and
+// with all groups selected.
 //
 // usage: entry_decode_bench <db> <play moves, comma separated>...
 
@@ -10,9 +10,9 @@ use lila_openingexplorer4::{
     packed::EntryView,
     server::{
         Database, DbConfig,
-        explore::{DecodedEntry, prepare_lichess},
+        explore::prepare_lichess,
         openings::Openings,
-        query::{LichessQuery, RawQuery},
+        query::{LichessFilter, LichessQuery, RawQuery},
         replay::position_hash,
     },
 };
@@ -51,6 +51,10 @@ fn main() {
         let bytes: &[u8] = &entry;
 
         let t = Instant::now();
+        let groups = EntryView::unpack_entire(bytes).groups().count();
+        let iter_groups = t.elapsed();
+
+        let t = Instant::now();
         let cells = EntryView::unpack_entire(bytes).cells().count();
         let iter_cells = t.elapsed();
 
@@ -67,27 +71,24 @@ fn main() {
         drop(copy);
 
         let t = Instant::now();
-        let decoded = DecodedEntry::new(bytes);
-        let decode = t.elapsed();
+        let filtered = prepare_lichess(bytes, &query.filter, &query.limits, false);
+        let agg_filtered = t.elapsed();
 
         let t = Instant::now();
-        let packed = prepare_lichess(
-            &EntryView::unpack_entire(bytes),
-            &query.filter,
-            &query.limits,
-            false,
-        );
-        let agg_packed = t.elapsed();
-
-        let t = Instant::now();
-        let dec = prepare_lichess(&decoded, &query.filter, &query.limits, false);
-        let agg_decoded = t.elapsed();
-        assert_eq!(packed.total, dec.total);
+        let all = LichessFilter {
+            speeds: None,
+            ratings: None,
+            since: None,
+            until: None,
+        };
+        let unfiltered = prepare_lichess(bytes, &all, &query.limits, false);
+        let agg_all = t.elapsed();
 
         println!(
-            "{play}: {} bytes, {cells} cells, {games} games, weight {}\n  get {get1:.1?} (again {get2:.1?}), cells {iter_cells:.1?}, games {iter_games:.1?}, memcpy {memcpy:.1?}, decode {decode:.1?}, aggregate packed {agg_packed:.1?} / decoded {agg_decoded:.1?}",
+            "{play}: {} bytes, {groups} groups, {cells} cells, {games} games, {} / {} games selected\n  get {get1:.1?} (again {get2:.1?}), groups {iter_groups:.1?}, cells {iter_cells:.1?}, games {iter_games:.1?}, memcpy {memcpy:.1?}, aggregate filtered {agg_filtered:.1?} / all {agg_all:.1?}",
             bytes.len(),
-            decoded.weight(),
+            filtered.total.games(),
+            unfiltered.total.games(),
         );
     }
 }

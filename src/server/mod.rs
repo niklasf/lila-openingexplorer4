@@ -3,7 +3,6 @@
 
 pub mod app;
 pub mod db;
-pub mod entry_v3;
 pub mod explore;
 pub mod metrics;
 pub mod openings;

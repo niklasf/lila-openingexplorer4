@@ -370,8 +370,10 @@ impl MastersQuery {
         LichessFilter {
             speeds: None,
             ratings: None,
-            since: Some(Month::from_year_and_month(self.since, 1).expect("valid since")),
-            until: Some(Month::from_year_and_month(self.until, 12).expect("valid until")),
+            since: (self.since > MIN_YEAR)
+                .then(|| Month::from_year_and_month(self.since, 1).expect("valid since")),
+            until: (self.until < MAX_YEAR)
+                .then(|| Month::from_year_and_month(self.until, 12).expect("valid until")),
         }
     }
 }

@@ -24,30 +24,31 @@ explorer ingest --db db_masters --games masters_sst/games --positions masters_ss
 
 # Serve (opens the databases strictly read-only).
 explorer lichess --db db_lichess --cache 32g --bind 0.0.0.0:9002
-explorer masters --db db_masters --max-ply 0 --cache 2g \
-    --decode-threshold 64k --decoded-cache 1g --bind 0.0.0.0:9003
+explorer masters --db db_masters --max-ply 0 --cache 2g --bind 0.0.0.0:9003
 ```
 
 `--max-ply` must match the `parquet_to_positions` run (50 for lichess, 0 for
 masters, which indexes all plies). Tuning on a 186 GB machine with the SST
 sets on NVMe: lichess `--cache 32g` plus the page cache (buffered reads;
 `--direct-reads` performs the same but loses the page cache as a second
-level), `--decoded-cache 8g` with the default `--decode-threshold 4m` (the
-568 positions with entries of 4 MB and more receive 28% of the requests in
-`sample-log.txt.zst`, ~300 each); masters needs no more than 2 GB of block
-cache (the database is 3.3 GB) and `--decode-threshold 64k`. Replaying the
-sample log with `examples/load_test.rs` at 32 concurrent clients: lichess
-30k requests/s (mean 1.0 ms, p99 5.6 ms) on first contact, masters 100k
-requests/s (p99 1.1 ms). `examples/log_entry_sizes.rs` prints the entry
-size distribution of logged requests, to size the decoded cache, and
-`examples/entry_decode_bench.rs` times the stages of serving a large entry
-(the biggest, 12 MB with 1.2 M games, decodes in 6 ms single-threaded; under
-load that stretches to 15-40 ms from CPU contention). `--blocking-threads`
-defaults to half the available parallelism: more threads add no throughput
-but lengthen tail latencies. `--warm-up sample-log.txt.zst` replays a request
-log before listening (89k positions in 4 s), so that hot entries are decoded
-off the serving path: the full sample log then runs at 43k requests/s with
-p99 3.1 ms and a maximum of 20 ms.
+level); masters needs no more than 2 GB of block cache (the database is
+3.3 GB). `--blocking-threads` defaults to half the available parallelism:
+more threads add no throughput but lengthen tail latencies. `--warm-up
+sample-log.txt.zst` replays a request log before listening (89k positions in
+4 s), so that the block cache holds the hot entries from the start.
+
+Serving reads entries in place, without decoding them: groups (move, speed
+and rating group) that the query does not select are skipped by their byte
+length, the subtotal of a group stands in for its months when the query has
+no month range, and months and games are stored newest first, so that the
+scan of a group stops as soon as no more games can make it into the response.
+On the sample log this takes aggregation of the busiest entries (4-12 MB)
+from 3 ms to 0.15 ms per request, which made an in-memory cache of decoded
+entries unnecessary. `examples/entry_decode_bench.rs` times the stages of
+serving a large entry, `examples/log_entry_sizes.rs` prints the entry size
+distribution of logged requests, and `examples/load_test.rs` replays a
+request log against a running server and reports throughput, latency
+percentiles and response validity.
 
 Semantics that differ from the current explorer: rating groups use the
 rating of the side to move instead of the average of both players (as
