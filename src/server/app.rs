@@ -67,6 +67,11 @@ pub struct AppConfig {
     /// Masters: most recent games of the highest rating groups to load and
     /// rank by rating, for the top games.
     pub masters_top_candidates: usize,
+    /// Fetch the games of a response that are not in the block cache in
+    /// parallel on the blocking pool, instead of one multi get. Pays off
+    /// when a read takes milliseconds (hard disks), costs a little on
+    /// flash.
+    pub parallel_fetch: bool,
     /// Directory with a.tsv to e.tsv of chess-openings, instead of
     /// downloading them.
     pub openings_dir: Option<PathBuf>,
@@ -225,6 +230,14 @@ impl AppState {
         fill_cache: bool,
     ) -> Result<Vec<Option<Vec<u8>>>, Error> {
         Metrics::add(&self.metrics.games_loaded, ids.len() as u64);
+        if !self.config.parallel_fetch {
+            return Ok(self
+                .db
+                .games(ids, fill_cache)?
+                .into_iter()
+                .map(|game| game.map(|game| game.to_vec()))
+                .collect());
+        }
         let mut games: Vec<Option<Vec<u8>>> = Vec::with_capacity(ids.len());
         let mut missing: Vec<(usize, GameId)> = Vec::new();
         for (i, (id, cached)) in ids

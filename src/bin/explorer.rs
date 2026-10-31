@@ -125,6 +125,12 @@ struct ServeArgs {
     /// are loaded and ranked by their actual ratings for the top games.
     #[arg(long, default_value = "128", help_heading = "Server")]
     masters_top_candidates: usize,
+    /// Fetch the games of a response that are not in the block cache in
+    /// parallel, one blocking task per game, instead of one multi get.
+    /// Recommended for hard disks, where it overlaps the seeks; on flash
+    /// the task overhead costs a few percent.
+    #[arg(long, help_heading = "Server")]
+    parallel_fetch: bool,
     /// Directory with a.tsv to e.tsv of lichess-org/chess-openings, to be
     /// loaded instead of downloading the current names from GitHub.
     #[arg(long, help_heading = "Server")]
@@ -232,6 +238,7 @@ fn run(kind: Kind, args: ServeArgs) {
         blocking_threads,
         max_ply: (args.max_ply > 0).then_some(args.max_ply),
         masters_top_candidates: args.masters_top_candidates,
+        parallel_fetch: args.parallel_fetch,
         openings_dir: args.openings_dir,
         no_openings: args.no_openings,
         warm_up: args.warm_up,
