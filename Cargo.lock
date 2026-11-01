@@ -726,8 +726,8 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "librocksdb-sys"
-version = "0.19.0+11.8.1"
-source = "git+https://github.com/niklasf/rust-rocksdb.git?branch=lila-openingexplorer4#48ac3dfd8530d48e65b25ce8fdb99b94a59191c4"
+version = "0.20.0+11.13.2"
+source = "git+https://github.com/niklasf/rust-rocksdb.git?branch=lila-openingexplorer4#9d7babff1c7207de6ef1517f991212969117fa2d"
 dependencies = [
  "bindgen",
  "bzip2-sys",
@@ -1000,7 +1000,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rocksdb"
 version = "0.25.0"
-source = "git+https://github.com/niklasf/rust-rocksdb.git?branch=lila-openingexplorer4#48ac3dfd8530d48e65b25ce8fdb99b94a59191c4"
+source = "git+https://github.com/niklasf/rust-rocksdb.git?branch=lila-openingexplorer4#9d7babff1c7207de6ef1517f991212969117fa2d"
 dependencies = [
  "libc",
  "librocksdb-sys",

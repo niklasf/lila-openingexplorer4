@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use arbitrary::{Arbitrary, Unstructured};
+use bitflags::bitflags;
 use bytes::{Buf, BufMut};
 use shakmaty::{Color, KnownOutcome, packed::PackedUciMove};
 
@@ -135,6 +136,21 @@ impl GroupHeader {
 
 /// Set in the packed header of the last group of a move.
 const LAST_GROUP_OF_MOVE: u8 = 0x80;
+
+/// Groups with at least this many months store the statistics of the whole
+/// group before their cells.
+pub const SUBTOTAL_MIN_MONTHS: usize = 16;
+
+bitflags! {
+    /// Low bits of the tag of a group.
+    #[derive(Debug, Clone, Copy)]
+    struct GroupFlags: u64 {
+        /// More than one month, the body is length prefixed.
+        const MULTI_MONTH = 1;
+        /// The body starts with a subtotal.
+        const HAS_SUBTOTAL = 2;
+    }
+}
 
 /// Tag in the low bits of the first count of `SubStats`: the stats of more
 /// (or less) than one game follow. Tags 0, 1 and 2 are a single game won by
@@ -295,25 +311,30 @@ impl Cell {
 /// Statistics and recent games of the moves played from a position, by
 /// speed, rating group and month.
 ///
-/// Packed format, in canonical order (moves by packed bytes, groups by
-/// header byte, months ascending):
+/// Packed format, moves by packed bytes and groups by header byte (the
+/// canonical order), but months within a group and games within a cell
+/// newest first, so that readers can stop early:
 ///
 /// ```text
-/// entry     := (move group+)*
-/// move      := PackedUciMove (2 bytes)
-/// group     := header month_rec+
-/// header    := GroupHeader::to_byte() | LAST_GROUP_OF_MOVE if last group of the move
-/// month_rec := uint(month delta << 1 | 1 if another month_rec follows)
-///              SubStats
-///              game*
-/// game      := uint(rank) GameId (6 bytes)
+/// entry  := (move group+)*
+/// move   := PackedUciMove (2 bytes)
+/// group  := header tag (cell | uint(byte length of multi) multi)
+/// header := GroupHeader::to_byte() | LAST_GROUP_OF_MOVE if last group of the move
+/// tag    := uint(newest month << 2 | GroupFlags)
+/// multi  := [SubStats of all cells of the group] cell (uint(month delta) cell)*
+/// cell   := SubStats game*
+/// game   := uint(rank) GameId (6 bytes)
 /// ```
 ///
-/// Each month_rec is a cell: the games of a month for a move and group. The
-/// first month delta of a group is relative to 1900-01. Each cell has
-/// exactly `min(GAMES_PER_CELL, games of the cell)` games, the most recent
-/// ones. The rank of a game is its chronological position (by month, then
-/// `GameSeq`) among all packed games of the entry.
+/// A cell holds the games of a month for a move and group. Months are
+/// counted since 1900-01, and each month delta is subtracted from the
+/// month of the previous cell. A group of a single month has neither a
+/// length nor a subtotal; a group of `SUBTOTAL_MIN_MONTHS` or more months
+/// has a subtotal. Each cell has exactly
+/// `min(GAMES_PER_CELL, games of the cell)` games, the most recent ones, so
+/// that the first game of a cell has the highest rank. The rank of a game
+/// is its chronological position (by month, then `GameSeq`) among all
+/// packed games of the entry.
 ///
 /// Merging is associative: within a month, the games of a merged entry are
 /// considered more recent than the games of the entry it is merged into.
@@ -415,50 +436,103 @@ impl LichessEntry {
             })
             .collect();
         keys.sort_unstable();
+        let rank = |month: Month, seq: GameSeq| keys.partition_point(|k| *k < (month, seq)) as u64;
 
-        let mut prev: Option<CellKey> = None;
-        let mut header_index = 0;
         let mut cells = cells.peekable();
-        while let Some(cell) = cells.next() {
-            let key = cell.key;
-            debug_assert!(prev < Some(key), "cells not in canonical order");
-            let new_move = prev.is_none_or(|prev| prev.m != key.m);
-            let prev_month = match prev {
-                Some(prev) if !new_move && prev.header == key.header => {
-                    prev.month.months_since_jan_1900()
-                }
-                _ => {
-                    if new_move {
-                        buf.put_slice(&key.m);
-                    }
-                    header_index = buf.len();
-                    buf.put_u8(key.header);
-                    0
-                }
-            };
-            prev = Some(key);
-
-            let next = cells.peek().map(|next| (next.key.m, next.key.header));
-            let more_months = next == Some((key.m, key.header));
-            if next.is_none_or(|(next_m, _)| next_m != key.m) {
-                buf[header_index] |= LAST_GROUP_OF_MOVE;
+        let mut group: Vec<EntryCell<'a>> = Vec::new();
+        let mut multi = Vec::new();
+        let mut prev: Option<CellKey> = None;
+        let mut new_move = true;
+        while let Some(first) = cells.next() {
+            group.clear();
+            group.push(first);
+            while let Some(cell) = cells
+                .next_if(|cell| cell.key.m == first.key.m && cell.key.header == first.key.header)
+            {
+                group.push(cell);
             }
-
-            let month = key.month.months_since_jan_1900();
-            pack_uint(
-                buf,
-                u64::from(month - prev_month) << 1 | u64::from(more_months),
+            debug_assert!(
+                prev < Some(first.key) && group.is_sorted_by(|a, b| a.key < b.key),
+                "cells not in canonical order"
             );
-            cell.stats.pack(buf, key.group_header().rating_group);
+            prev = group.last().map(|cell| cell.key);
 
-            let games = cell.packed_games();
-            debug_assert!(games.is_sorted_by(|a, b| a.0 < b.0), "games not in order");
-            for (seq, game_id) in games {
-                pack_uint(buf, keys.partition_point(|k| *k < (key.month, *seq)) as u64);
-                game_id.pack(buf);
+            if new_move {
+                buf.put_slice(&first.key.m);
             }
+            new_move = cells.peek().is_none_or(|next| next.key.m != first.key.m);
+            buf.put_u8(first.key.header | if new_move { LAST_GROUP_OF_MOVE } else { 0 });
+            pack_group(buf, &mut multi, &group, &rank);
         }
     }
+}
+
+/// Packs the cells of one group (ascending months), using `multi` as
+/// scratch space.
+fn pack_group(
+    buf: &mut Vec<u8>,
+    multi: &mut Vec<u8>,
+    group: &[EntryCell<'_>],
+    rank: &impl Fn(Month, GameSeq) -> u64,
+) {
+    let rating_group = group[0].key.group_header().rating_group;
+    let newest = group[group.len() - 1].key.month.months_since_jan_1900();
+    let is_multi = group.len() > 1;
+    let has_subtotal = group.len() >= SUBTOTAL_MIN_MONTHS;
+    let mut flags = GroupFlags::empty();
+    flags.set(GroupFlags::MULTI_MONTH, is_multi);
+    flags.set(GroupFlags::HAS_SUBTOTAL, has_subtotal);
+    pack_uint(buf, u64::from(newest) << 2 | flags.bits());
+    if !is_multi {
+        pack_cell(buf, &group[0], rating_group, rank);
+        return;
+    }
+
+    multi.clear();
+    if has_subtotal {
+        let mut subtotal = SubStats::default();
+        for cell in group {
+            subtotal.merge(&cell.stats);
+        }
+        subtotal.pack(multi, rating_group);
+    }
+    let mut prev_month = newest;
+    for (i, cell) in group.iter().rev().enumerate() {
+        let month = cell.key.month.months_since_jan_1900();
+        if i > 0 {
+            pack_uint(multi, u64::from(prev_month - month));
+        }
+        pack_cell(multi, cell, rating_group, rank);
+        prev_month = month;
+    }
+    pack_uint(buf, multi.len() as u64);
+    buf.extend_from_slice(multi);
+}
+
+/// Packs the statistics of a cell and its games, newest first.
+fn pack_cell(
+    buf: &mut Vec<u8>,
+    cell: &EntryCell<'_>,
+    rating_group: RatingGroup,
+    rank: &impl Fn(Month, GameSeq) -> u64,
+) {
+    cell.stats.pack(buf, rating_group);
+    let games = cell.packed_games();
+    debug_assert!(games.is_sorted_by(|a, b| a.0 < b.0), "games not in order");
+    for (seq, game_id) in games.iter().rev() {
+        pack_uint(buf, rank(cell.key.month, *seq));
+        game_id.pack(buf);
+    }
+}
+
+/// Skips a cell (statistics and games), returning its statistics.
+fn skip_cell(buf: &mut &[u8], rating_group: RatingGroup) -> SubStats {
+    let stats = SubStats::unpack(buf, rating_group);
+    for _ in 0..stats.games().min(GAMES_PER_CELL as u64) {
+        unpack_uint(buf);
+        buf.advance(GameId::SIZE);
+    }
+    stats
 }
 
 /// A packed entry (see `LichessEntry`), read in place.
@@ -473,17 +547,194 @@ impl<'a> EntryView<'a> {
         EntryView { bytes }
     }
 
-    /// The cells, in canonical order.
+    /// The groups, in canonical order.
+    pub fn groups(&self) -> GroupViews<'a> {
+        GroupViews {
+            buf: self.bytes,
+            m: [0; 2],
+            more_groups: false,
+        }
+    }
+
+    /// The cells, groups in canonical order and months newest first.
     pub fn cells(&self) -> CellViews<'a> {
         CellViews {
-            buf: self.bytes,
+            groups: self.groups(),
+            cells: GroupCells::empty(),
+        }
+    }
+}
+
+/// A group of a packed entry: the cells of a move, speed and rating group.
+#[derive(Debug, Clone)]
+pub struct GroupView<'a> {
+    m: [u8; 2],
+    header_byte: u8,
+    pub header: GroupHeader,
+    /// The month of the first cell.
+    pub newest_month: Month,
+    /// Statistics of all cells, if the group stores them.
+    pub subtotal: Option<SubStats>,
+    cells: &'a [u8],
+}
+
+impl<'a> GroupView<'a> {
+    pub fn uci_move(&self) -> PackedUciMove {
+        PackedUciMove::from_bytes(self.m)
+    }
+
+    /// The cells, newest month first.
+    pub fn cells(&self) -> GroupCells<'a> {
+        GroupCells {
+            buf: self.cells,
+            m: self.m,
+            header: self.header_byte,
+            rating_group: self.header.rating_group,
+            month: self.newest_month.months_since_jan_1900(),
+            first: true,
+            games_left: 0,
+        }
+    }
+}
+
+/// Iterator over the groups of a packed entry.
+#[derive(Debug, Clone)]
+pub struct GroupViews<'a> {
+    buf: &'a [u8],
+    m: [u8; 2],
+    more_groups: bool,
+}
+
+impl<'a> Iterator for GroupViews<'a> {
+    type Item = GroupView<'a>;
+
+    fn next(&mut self) -> Option<GroupView<'a>> {
+        if !self.more_groups {
+            if self.buf.is_empty() {
+                return None;
+            }
+            self.buf.copy_to_slice(&mut self.m);
+        }
+        let byte = self.buf.get_u8();
+        let header_byte = byte & !LAST_GROUP_OF_MOVE;
+        let header = GroupHeader::from_byte(header_byte).expect("valid group header");
+        self.more_groups = byte & LAST_GROUP_OF_MOVE == 0;
+
+        let tag = unpack_uint(&mut self.buf);
+        let newest_month =
+            Month::from_months_since_jan_1900(u16::try_from(tag >> 2).expect("valid month"));
+        let flags = GroupFlags::from_bits_truncate(tag);
+        let mut subtotal = None;
+        let cells = if flags.contains(GroupFlags::MULTI_MONTH) {
+            let len = usize::try_from(unpack_uint(&mut self.buf)).expect("group length");
+            let (mut multi, rest) = self.buf.split_at(len);
+            self.buf = rest;
+            if flags.contains(GroupFlags::HAS_SUBTOTAL) {
+                subtotal = Some(SubStats::unpack(&mut multi, header.rating_group));
+            }
+            multi
+        } else {
+            let start = self.buf;
+            skip_cell(&mut self.buf, header.rating_group);
+            &start[..start.len() - self.buf.len()]
+        };
+
+        Some(GroupView {
+            m: self.m,
+            header_byte,
+            header,
+            newest_month,
+            subtotal,
+            cells,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CellHeader {
+    pub key: CellKey,
+    pub stats: SubStats,
+}
+
+/// Cursor over the cells of a group, newest month first. Cells can be
+/// read as a whole (as an iterator of `CellView`), or incrementally with
+/// `next_cell()` and `next_game()`.
+#[derive(Debug, Clone)]
+pub struct GroupCells<'a> {
+    buf: &'a [u8],
+    m: [u8; 2],
+    header: u8,
+    rating_group: RatingGroup,
+    /// Month of the current cell.
+    month: u16,
+    /// The next cell is the first of the group, without a month delta.
+    first: bool,
+    /// Unread games of the current cell.
+    games_left: usize,
+}
+
+impl<'a> GroupCells<'a> {
+    fn empty() -> GroupCells<'static> {
+        GroupCells {
+            buf: &[],
             m: [0; 2],
             header: 0,
             rating_group: RatingGroup::Low,
             month: 0,
-            more_groups: false,
-            more_months: false,
+            first: true,
+            games_left: 0,
         }
+    }
+
+    /// Advances to the next cell, skipping the unread games of the current
+    /// one.
+    pub fn next_cell(&mut self) -> Option<CellHeader> {
+        while self.next_game().is_some() {}
+        if self.buf.is_empty() {
+            return None;
+        }
+        if !self.first {
+            self.month -= u16::try_from(unpack_uint(&mut self.buf)).expect("valid month delta");
+        }
+        self.first = false;
+        let stats = SubStats::unpack(&mut self.buf, self.rating_group);
+        self.games_left = stats.games().min(GAMES_PER_CELL as u64) as usize;
+        Some(CellHeader {
+            key: CellKey {
+                m: self.m,
+                header: self.header,
+                month: Month::from_months_since_jan_1900(self.month),
+            },
+            stats,
+        })
+    }
+
+    /// The next game of the current cell, with its rank in the entry. Games
+    /// are newest first, so the first game of a cell has the highest rank.
+    pub fn next_game(&mut self) -> Option<(u64, GameId)> {
+        if self.games_left == 0 {
+            return None;
+        }
+        self.games_left -= 1;
+        let rank = unpack_uint(&mut self.buf);
+        Some((rank, GameId::unpack(&mut self.buf)))
+    }
+}
+
+impl<'a> Iterator for GroupCells<'a> {
+    type Item = CellView<'a>;
+
+    fn next(&mut self) -> Option<CellView<'a>> {
+        let CellHeader { key, stats } = self.next_cell()?;
+        let start = self.buf;
+        while self.next_game().is_some() {}
+        Some(CellView {
+            key,
+            stats,
+            games: CellGames {
+                buf: &start[..start.len() - self.buf.len()],
+            },
+        })
     }
 }
 
@@ -493,67 +744,32 @@ pub struct CellView<'a> {
     pub key: CellKey,
     pub stats: SubStats,
     /// The most recent `min(GAMES_PER_CELL, games of the cell)` games, with
-    /// their rank in the entry.
+    /// their rank in the entry, newest first.
     pub games: CellGames<'a>,
 }
 
 /// Iterator over the cells of a packed entry.
 #[derive(Debug, Clone)]
 pub struct CellViews<'a> {
-    buf: &'a [u8],
-    m: [u8; 2],
-    header: u8,
-    rating_group: RatingGroup,
-    month: u16,
-    more_groups: bool,
-    more_months: bool,
+    groups: GroupViews<'a>,
+    cells: GroupCells<'a>,
 }
 
 impl<'a> Iterator for CellViews<'a> {
     type Item = CellView<'a>;
 
     fn next(&mut self) -> Option<CellView<'a>> {
-        if !self.more_months {
-            if !self.more_groups {
-                if self.buf.is_empty() {
-                    return None;
-                }
-                self.buf.copy_to_slice(&mut self.m);
+        loop {
+            if let Some(cell) = self.cells.next() {
+                return Some(cell);
             }
-            let byte = self.buf.get_u8();
-            self.header = byte & !LAST_GROUP_OF_MOVE;
-            self.rating_group = GroupHeader::from_byte(self.header)
-                .expect("valid group header")
-                .rating_group;
-            self.more_groups = byte & LAST_GROUP_OF_MOVE == 0;
-            self.month = 0;
+            self.cells = self.groups.next()?.cells();
         }
-
-        let tagged = unpack_uint(&mut self.buf);
-        self.month += u16::try_from(tagged >> 1).expect("valid month");
-        self.more_months = tagged & 1 != 0;
-        let stats = SubStats::unpack(&mut self.buf, self.rating_group);
-
-        let start = self.buf;
-        for _ in 0..stats.games().min(GAMES_PER_CELL as u64) {
-            unpack_uint(&mut self.buf);
-            self.buf.advance(GameId::SIZE);
-        }
-        let games = &start[..start.len() - self.buf.len()];
-
-        Some(CellView {
-            key: CellKey {
-                m: self.m,
-                header: self.header,
-                month: Month::from_months_since_jan_1900(self.month),
-            },
-            stats,
-            games: CellGames { buf: games },
-        })
     }
 }
 
-/// Iterator over the packed games of a cell, with their rank in the entry.
+/// Iterator over the packed games of a cell, newest first, with their rank
+/// in the entry.
 #[derive(Debug, Clone)]
 pub struct CellGames<'a> {
     buf: &'a [u8],
@@ -608,16 +824,19 @@ mod tests {
         );
     }
 
-    /// Statistics of all cells, and their packed games in chronological
-    /// order.
+    /// Statistics of all cells in canonical order, and their packed games
+    /// in chronological order.
     #[allow(clippy::type_complexity)]
     fn view(bytes: &[u8]) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameId)>) {
-        let cells: Vec<_> = EntryView::unpack_entire(bytes).cells().collect();
+        let view = EntryView::unpack_entire(bytes);
+        let cells: Vec<_> = view.cells().collect();
         let mut games: Vec<_> = cells
             .iter()
             .flat_map(|cell| {
-                cell.games
-                    .clone()
+                let ranks: Vec<_> = cell.games.clone().collect();
+                assert!(ranks.is_sorted_by(|a, b| a.0 > b.0), "games newest first");
+                ranks
+                    .into_iter()
                     .map(|(rank, game_id)| (rank, cell.key, game_id))
             })
             .collect();
@@ -628,8 +847,37 @@ mod tests {
                 .enumerate()
                 .all(|(i, (rank, ..))| i as u64 == *rank)
         );
+
+        // Groups are in canonical order and consistent with the cells.
+        let mut group_cells = Vec::new();
+        let mut prev_group = None;
+        for group in view.groups() {
+            let group_key = (group.uci_move().to_bytes(), group.header.to_byte());
+            assert!(prev_group < Some(group_key), "groups in canonical order");
+            prev_group = Some(group_key);
+            let cells: Vec<_> = group.cells().collect();
+            assert!(
+                cells.is_sorted_by(|a, b| a.key > b.key),
+                "months newest first"
+            );
+            assert_eq!(cells[0].key.month(), group.newest_month);
+            let mut subtotal = SubStats::default();
+            for cell in &cells {
+                assert_eq!(cell.key.group_header(), group.header);
+                subtotal.merge(&cell.stats);
+            }
+            assert_eq!(
+                group.subtotal,
+                (cells.len() >= SUBTOTAL_MIN_MONTHS).then_some(subtotal)
+            );
+            group_cells.extend(cells.iter().map(|cell| (cell.key, cell.stats)));
+        }
+        let mut cells: Vec<_> = cells.iter().map(|cell| (cell.key, cell.stats)).collect();
+        assert_eq!(cells, group_cells);
+        cells.sort_unstable_by_key(|(key, _)| *key);
+
         (
-            cells.iter().map(|cell| (cell.key, cell.stats)).collect(),
+            cells,
             games
                 .into_iter()
                 .map(|(_, key, game_id)| (key, game_id))
@@ -706,6 +954,68 @@ mod tests {
             assert_eq!(pack(&unpacked), buf);
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_subtotal() {
+        // One group with many months, and one with a single month.
+        let mut entry = LichessEntry::new();
+        let rating = Rating::try_from(1500).unwrap();
+        for seq in 0..2 * SUBTOTAL_MIN_MONTHS as u64 {
+            let game: Game = (
+                "e2e4".parse().unwrap(),
+                Some(Speed::Blitz),
+                rating,
+                KnownOutcome::Draw,
+                Month::from_months_since_jan_1900(1400 + 3 * seq as u16),
+                GameId::unpack(&mut &[0, 0, 0, 0, 0, seq as u8][..]),
+            );
+            add(&mut entry, game, seq);
+        }
+        let game: Game = (
+            "e2e4".parse().unwrap(),
+            Some(Speed::Bullet),
+            rating,
+            KnownOutcome::Draw,
+            Month::from_months_since_jan_1900(1400),
+            GameId::unpack(&mut &[0, 0, 0, 0, 1, 0][..]),
+        );
+        add(&mut entry, game, 1000);
+
+        let buf = pack(&entry);
+        let groups: Vec<_> = EntryView::unpack_entire(&buf).groups().collect();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].header.speed, Some(Speed::Bullet));
+        assert_eq!(groups[0].subtotal, None);
+        assert_eq!(groups[0].cells().count(), 1);
+        assert_eq!(groups[1].header.speed, Some(Speed::Blitz));
+        let subtotal = groups[1].subtotal.unwrap();
+        assert_eq!(subtotal.draws, 2 * SUBTOTAL_MIN_MONTHS as u64);
+        assert_eq!(
+            subtotal.rating_offset_sum,
+            2 * SUBTOTAL_MIN_MONTHS as i64 * i64::from(rating.offset())
+        );
+        assert_eq!(
+            groups[1].newest_month,
+            Month::from_months_since_jan_1900(1400 + 3 * (2 * SUBTOTAL_MIN_MONTHS as u16 - 1))
+        );
+
+        // Incremental reading, stopping early.
+        let mut cells = groups[1].cells();
+        let first = cells.next_cell().unwrap();
+        assert_eq!(first.key.month(), groups[1].newest_month);
+        assert_eq!(first.stats.games(), 1);
+        let (rank, _) = cells.next_game().unwrap();
+        assert_eq!(rank, 2 * SUBTOTAL_MIN_MONTHS as u64);
+        assert_eq!(cells.next_game(), None);
+        let second = cells.next_cell().unwrap();
+        assert_eq!(
+            second.key.month(),
+            Month::from_months_since_jan_1900(1400 + 3 * (2 * SUBTOTAL_MIN_MONTHS as u16 - 2))
+        );
+        // Unread games are skipped.
+        assert!(cells.next_cell().is_some());
+        assert_eq!(view(&buf), expected_view(&entry));
     }
 
     #[test]

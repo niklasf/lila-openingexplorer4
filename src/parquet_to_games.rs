@@ -11,7 +11,7 @@ use std::{
 
 use crossbeam::channel;
 use indicatif::{MultiProgress, ProgressBar};
-use rocksdb::{EnvOptions, Options, SstFileWriter};
+use rocksdb::{EnvOptions, Options};
 
 use crate::{
     packed::{BorrowedLichessGame, GameId},
@@ -20,7 +20,7 @@ use crate::{
         ChunkWriterConfig, ChunkWriterTimes, Layout, RESIDENT_PARTITIONS_PER_PASS, ScratchFile,
         spawn_chunk_writers,
     },
-    sst::SstConfig,
+    sst::{SstConfig, SstError, SstFile},
     util::{Gauge, create_dir, create_empty_dir, log_above, progress_bar, timed, timed_seconds},
 };
 
@@ -923,31 +923,34 @@ fn write_sst_range(
     index: &[(GameId, u64)],
     sst: &SstContext<'_>,
     prefix: &str,
-) -> Result<(), rocksdb::Error> {
+) -> Result<(), SstError> {
     let mut seq = 0;
-    let mut writer: Option<SstFileWriter<'_>> = None;
+    let mut writer: Option<SstFile<'_>> = None;
     let mut games_in_file = 0;
     let mut raw_in_file = 0;
 
-    let finish = |writer: &mut Option<SstFileWriter<'_>>, games: &mut u64, raw: &mut u64| {
-        if let Some(mut w) = writer.take() {
-            w.finish()?;
+    let finish = |writer: &mut Option<SstFile<'_>>, games: &mut u64, raw: &mut u64| {
+        if let Some(w) = writer.take() {
+            let size = w.finish()?;
             sst.stats
                 .lock()
                 .expect("lock stats")
-                .add_file(*games, w.file_size(), *raw);
+                .add_file(*games, size, *raw);
             *games = 0;
             *raw = 0;
         }
-        Ok::<_, rocksdb::Error>(())
+        Ok::<_, SstError>(())
     };
 
     for &(game_id, offset) in index {
         let w = match &mut writer {
             Some(w) => w,
             None => {
-                let w = SstFileWriter::create_with_env_options(sst.opts, sst.env_opts);
-                w.open(sst.out.join(format!("{prefix}_{seq}.sst")))?;
+                let w = SstFile::create(
+                    sst.opts,
+                    sst.env_opts,
+                    sst.out.join(format!("{prefix}_{seq}.sst")),
+                )?;
                 seq += 1;
                 writer.insert(w)
             }
