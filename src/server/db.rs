@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     packed::{ColdKey, GameId, PositionKey},
-    sst::SstConfig,
+    sst::read_table_options,
 };
 
 pub const GAMES_CF: &str = "games";
@@ -24,7 +24,7 @@ pub const COLD_CF: &str = "cold_positions";
 /// to be ingested.
 const STAGING_DIR: &str = "staging";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DbConfig {
     /// Size of the shared block cache in bytes.
     pub cache_bytes: u64,
@@ -36,8 +36,6 @@ pub struct DbConfig {
     pub statistics: bool,
     /// Threads for opening table files at startup.
     pub file_opening_threads: usize,
-    /// Block size the SST files were written with.
-    pub block_size: usize,
 }
 
 #[derive(Debug, Error)]
@@ -48,27 +46,17 @@ pub enum DbError {
     Io(#[from] io::Error),
 }
 
-fn sst_config(config: &DbConfig) -> SstConfig {
-    SstConfig {
-        block_size: config.block_size,
-        // Only relevant for writing. Readers detect compression per block.
-        zstd_level: 3,
-        zstd_dict: 0,
-        direct_io: false,
-    }
-}
-
-fn descriptors(config: &DbConfig, cache: &Cache) -> Vec<ColumnFamilyDescriptor> {
-    let sst = sst_config(config);
+fn descriptors(cache: &Cache) -> Vec<ColumnFamilyDescriptor> {
     [(GAMES_CF, false), (POSITIONS_CF, true), (COLD_CF, false)]
         .into_iter()
         .map(|(name, filter)| {
-            let mut table_opts = sst.table_options(filter);
+            let mut table_opts = read_table_options(filter);
             table_opts.set_block_cache(cache);
             table_opts.set_cache_index_and_filter_blocks(true);
             table_opts.set_cache_index_and_filter_blocks_with_high_priority(true);
             table_opts.set_pin_top_level_index_and_filter(true);
-            let mut opts = sst.options_with_table(&table_opts);
+            let mut opts = Options::default();
+            opts.set_block_based_table_factory(&table_opts);
             opts.set_disable_auto_compactions(true);
             ColumnFamilyDescriptor::new(name, opts)
         })
@@ -127,20 +115,21 @@ pub fn ingest(
     games: &Path,
     positions: &Path,
     cold: &Path,
-    config: &DbConfig,
 ) -> Result<IngestStats, DbError> {
-    let cache = make_cache(&DbConfig {
+    let config = DbConfig {
         cache_bytes: 64 << 20,
-        ..config.clone()
-    });
-    let mut opts = db_options(config);
+        lru_cache: true,
+        ..DbConfig::default()
+    };
+    let cache = make_cache(&config);
+    let mut opts = db_options(&config);
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
     // With an unlimited table cache, RocksDB opens a table reader for every
     // ingested file (footer, properties, index and filter) when it applies
     // the version edit; with a limited one it only opens a few.
     opts.set_max_open_files(64);
-    let db = DB::open_cf_descriptors(&opts, path, descriptors(config, &cache))?;
+    let db = DB::open_cf_descriptors(&opts, path, descriptors(&cache))?;
     let staging = path.join(STAGING_DIR);
     fs::create_dir_all(&staging)?;
 
@@ -198,8 +187,7 @@ impl Database {
         let started = Instant::now();
         let cache = make_cache(config);
         let opts = db_options(config);
-        let db =
-            DB::open_cf_descriptors_read_only(&opts, path, descriptors(config, &cache), false)?;
+        let db = DB::open_cf_descriptors_read_only(&opts, path, descriptors(&cache), false)?;
         log::info!(
             "opened {} read-only in {:.1?}",
             path.display(),

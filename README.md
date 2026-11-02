@@ -27,6 +27,8 @@ Critical performance work:
 * [ ] Recheck parallel game loading
 * [ ] Determine best disk layout and migration strategy
 * [ ] Document recommended options for each workload
+* [ ] Consider --lru-cache utility
+* [ ] Make cold optional
 
 Minor things:
 

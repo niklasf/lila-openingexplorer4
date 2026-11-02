@@ -16,6 +16,9 @@ pub const MAX_LICHESS_GAMES: usize = 8;
 pub const MAX_TOP_GAMES: usize = 4;
 /// Most top games of a masters response.
 pub const MAX_MASTERS_GAMES: usize = 15;
+/// Masters: most recent games of the highest rating groups that are loaded
+/// and ranked by their actual ratings, for the top games.
+pub const MASTERS_TOP_CANDIDATES: usize = 128;
 
 /// Statistics of a move, aggregated over the matching cells.
 #[derive(Debug, Clone)]

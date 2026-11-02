@@ -47,18 +47,42 @@ struct IngestArgs {
     /// positions and cold_positions.
     #[arg(long)]
     positions: PathBuf,
-    #[command(flatten)]
-    db_opts: DbArgs,
 }
 
 #[derive(Args)]
+#[command(next_help_heading = "Database")]
 struct DbArgs {
-    /// Block size the SST files were written with.
-    #[arg(long, default_value = "4096", help_heading = "Database")]
-    block_size: usize,
+    /// Size of the RocksDB block cache. Accepts units, like 32g. The page
+    /// cache serves as a second level unless --direct-reads is given, so
+    /// leave memory for it.
+    #[arg(long, default_value = "4g")]
+    cache: ByteSize,
+    /// Use an LRU block cache instead of the (more scalable) hyper clock
+    /// cache.
+    #[arg(long)]
+    lru_cache: bool,
+    /// Read SST files with O_DIRECT, bypassing the page cache.
+    #[arg(long)]
+    direct_reads: bool,
+    /// Collect RocksDB statistics (tickers in /monitor). Costs a few
+    /// percent of CPU.
+    #[arg(long)]
+    db_statistics: bool,
     /// Threads for opening table files at startup.
-    #[arg(long, default_value = "16", help_heading = "Database")]
+    #[arg(long, default_value = "16")]
     file_opening_threads: usize,
+}
+
+impl From<DbArgs> for DbConfig {
+    fn from(args: DbArgs) -> DbConfig {
+        DbConfig {
+            cache_bytes: args.cache.into(),
+            lru_cache: args.lru_cache,
+            direct_reads: args.direct_reads,
+            statistics: args.db_statistics,
+            file_opening_threads: args.file_opening_threads,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -78,22 +102,6 @@ struct ServeArgs {
     /// found (or missed) inconsistently.
     #[arg(long, default_value = "50")]
     max_ply: usize,
-    /// Size of the RocksDB block cache. Accepts units, like 32g. The page
-    /// cache serves as a second level unless --direct-reads is given, so
-    /// leave memory for it.
-    #[arg(long, default_value = "4g", help_heading = "Database")]
-    cache: ByteSize,
-    /// Use an LRU block cache instead of the (more scalable) hyper clock
-    /// cache.
-    #[arg(long, help_heading = "Database")]
-    lru_cache: bool,
-    /// Read SST files with O_DIRECT, bypassing the page cache.
-    #[arg(long, help_heading = "Database")]
-    direct_reads: bool,
-    /// Collect RocksDB statistics (tickers in /monitor). Costs a few
-    /// percent of CPU.
-    #[arg(long, help_heading = "Database")]
-    db_statistics: bool,
     #[command(flatten)]
     db_opts: DbArgs,
     /// Concurrent database requests. Defaults to half the available
@@ -107,34 +115,13 @@ struct ServeArgs {
     /// Seconds after which cached responses expire.
     #[arg(long, default_value = "7200", help_heading = "Server")]
     response_cache_ttl: u64,
-    /// Masters only: most recent games of the highest rating groups that
-    /// are loaded and ranked by their actual ratings for the top games.
-    #[arg(long, default_value = "128", help_heading = "Server")]
-    masters_top_candidates: usize,
     /// Directory with a.tsv to e.tsv of lichess-org/chess-openings, to be
     /// loaded instead of downloading the current names from GitHub.
-    #[arg(long, help_heading = "Server")]
+    #[arg(long, help_heading = "Server", conflicts_with = "no_openings")]
     openings_dir: Option<PathBuf>,
     /// Do not load opening names at all.
     #[arg(long, help_heading = "Server")]
     no_openings: bool,
-}
-
-fn db_config(
-    db_opts: &DbArgs,
-    cache_bytes: u64,
-    lru_cache: bool,
-    direct_reads: bool,
-    statistics: bool,
-) -> DbConfig {
-    DbConfig {
-        cache_bytes,
-        lru_cache,
-        direct_reads,
-        statistics,
-        file_opening_threads: db_opts.file_opening_threads,
-        block_size: db_opts.block_size,
-    }
 }
 
 fn raise_fd_limit() {
@@ -166,7 +153,6 @@ fn main() {
 
     match Cli::parse().command {
         Command::Ingest(args) => {
-            let config = db_config(&args.db_opts, 0, true, false, false);
             if args.db.exists() {
                 eprintln!("error: {} already exists", args.db.display());
                 process::exit(1);
@@ -176,7 +162,6 @@ fn main() {
                 &args.games,
                 &args.positions.join("positions"),
                 &args.positions.join("cold_positions"),
-                &config,
             ) {
                 Ok(stats) => println!(
                     "ingested {} games files, {} positions files, {} cold_positions files into {}",
@@ -201,13 +186,7 @@ fn run(kind: Kind, args: ServeArgs) {
     let blocking_threads = args.blocking_threads.unwrap_or_else(|| {
         (thread::available_parallelism().map_or(8, NonZeroUsize::get) / 2).max(2)
     });
-    let db_config = db_config(
-        &args.db_opts,
-        args.cache.into(),
-        args.lru_cache,
-        args.direct_reads,
-        args.db_statistics,
-    );
+    let db_config = DbConfig::from(args.db_opts);
     let config = AppConfig {
         kind,
         bind: args.bind,
@@ -216,7 +195,6 @@ fn run(kind: Kind, args: ServeArgs) {
         cache_ttl: Duration::from_secs(args.response_cache_ttl),
         blocking_threads,
         max_ply: (args.max_ply > 0).then_some(args.max_ply),
-        masters_top_candidates: args.masters_top_candidates,
         openings_dir: args.openings_dir,
         no_openings: args.no_openings,
     };

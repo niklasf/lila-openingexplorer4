@@ -32,7 +32,10 @@ use crate::{
     },
     server::{
         db::Database,
-        explore::{GameRef, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess, prepare_masters},
+        explore::{
+            GameRef, MASTERS_TOP_CANDIDATES, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
+            prepare_masters,
+        },
         metrics::{Counter, Metrics},
         openings::Openings,
         pgn::masters_pgn,
@@ -88,9 +91,6 @@ pub struct AppConfig {
     pub blocking_threads: usize,
     /// Games were indexed up to this ply (`None` for all plies).
     pub max_ply: Option<usize>,
-    /// Masters: most recent games of the highest rating groups to load and
-    /// rank by rating, for the top games.
-    pub masters_top_candidates: usize,
     /// Directory with a.tsv to e.tsv of chess-openings, instead of
     /// downloading them.
     pub openings_dir: Option<PathBuf>,
@@ -349,7 +349,7 @@ impl AppState {
             bytes,
             &query.filter(),
             &query.limits,
-            self.config.masters_top_candidates,
+            MASTERS_TOP_CANDIDATES,
         );
 
         let mut ids = Vec::new();

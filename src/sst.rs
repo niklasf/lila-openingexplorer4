@@ -106,7 +106,7 @@ impl SstConfig {
         table_opts.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
         table_opts.set_metadata_block_size(4096);
         if filter {
-            table_opts.set_ribbon_filter(FILTER_BITS_PER_KEY);
+            set_filter(&mut table_opts);
             table_opts.set_partition_filters(true);
             table_opts.set_optimize_filters_for_memory(true);
         }
@@ -118,6 +118,21 @@ impl SstConfig {
         env_opts.set_use_direct_writes(self.direct_io);
         env_opts
     }
+}
+
+fn set_filter(table_opts: &mut BlockBasedOptions) {
+    table_opts.set_ribbon_filter(FILTER_BITS_PER_KEY);
+}
+
+/// Table options for reading SST files written with
+/// `SstConfig::table_options()`. Block size, index type and compression are
+/// taken from the files themselves, but the filter policy must match.
+pub fn read_table_options(filter: bool) -> BlockBasedOptions {
+    let mut table_opts = BlockBasedOptions::default();
+    if filter {
+        set_filter(&mut table_opts);
+    }
+    table_opts
 }
 
 #[derive(Debug, Default, Clone)]
