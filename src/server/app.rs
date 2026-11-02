@@ -19,11 +19,13 @@ use axum::{
 };
 use moka::future::Cache;
 use rocksdb::DBPinnableSlice;
-use shakmaty::{
-    san::{San, SanPlus},
-    variant::VariantPosition,
+use shakmaty::{EnPassantMode, fen::Fen, san::SanPlus, variant::VariantPosition};
+use tokio::{
+    net::TcpListener,
+    signal::unix::{SignalKind, signal},
+    sync::Semaphore,
+    task, time,
 };
-use tokio::{net::TcpListener, sync::Semaphore, task, time};
 
 use crate::{
     packed::{
@@ -241,21 +243,24 @@ impl AppState {
         let openings = self.openings.read().expect("read openings");
         moves
             .into_iter()
-            .map(|pm| {
+            .filter_map(|pm| {
                 let uci = pm.m.unpack();
-                let mut pos_after = pos.clone();
-                let san = match uci.to_move(pos) {
-                    Ok(m) => SanPlus::from_move_and_play_unchecked(&mut pos_after, m),
-                    Err(_) => SanPlus {
-                        san: San::Null,
-                        suffix: None,
-                    },
+                let Ok(m) = uci.to_move(pos) else {
+                    // Only possible if the key of the position collides
+                    // with the key of another position.
+                    log::warn!(
+                        "skipping illegal move {uci} in {}",
+                        Fen::from_position(pos, EnPassantMode::Legal)
+                    );
+                    return None;
                 };
+                let mut pos_after = pos.clone();
+                let san = SanPlus::from_move_and_play_unchecked(&mut pos_after, m);
                 let game = pm.game.map(|id| {
                     games.push(id);
                     games.len() - 1
                 });
-                (
+                Some((
                     ExplorerMove {
                         uci,
                         san,
@@ -265,7 +270,7 @@ impl AppState {
                         opening: openings.classify_exact(&pos_after).cloned(),
                     },
                     game,
-                )
+                ))
             })
             .collect()
     }
@@ -660,9 +665,13 @@ async fn periodic_openings_refresh(state: Shared) {
     }
 }
 
+/// Waits for SIGINT (Ctrl-C) or SIGTERM (like from systemd).
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    log::info!("shutting down");
+    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => log::info!("received SIGINT, shutting down"),
+        _ = sigterm.recv() => log::info!("received SIGTERM, shutting down"),
+    }
 }
 
 /// Runs the server until it is interrupted.
