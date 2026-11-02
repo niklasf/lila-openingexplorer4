@@ -36,7 +36,7 @@ use crate::{
         metrics::Metrics,
         openings::Openings,
         pgn::masters_pgn,
-        query::{LichessQuery, Limits, MastersQuery, PlayError, PlayPosition},
+        query::{LichessQuery, Limits, MastersQuery, Play, PlayError, PlayPosition},
         replay::{find_visit, position_hash},
         response::{
             ExplorerGame, ExplorerGameWithUci, ExplorerMove, ExplorerResponse, HistoryEntry, Stats,
@@ -49,6 +49,31 @@ use crate::{
 pub enum Kind {
     Lichess,
     Masters,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Lichess => "lichess",
+            Kind::Masters => "masters",
+        }
+    }
+}
+
+/// A query of either database, as the key of the response cache.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ExploreQuery {
+    Lichess(LichessQuery),
+    Masters(MastersQuery),
+}
+
+impl ExploreQuery {
+    fn play(&self) -> &Play {
+        match self {
+            ExploreQuery::Lichess(query) => &query.play,
+            ExploreQuery::Masters(query) => &query.play,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,14 +131,11 @@ impl IntoResponse for Error {
     }
 }
 
-type ResponseCache<Q> = Cache<Q, Bytes>;
-
 pub struct AppState {
     config: AppConfig,
     db: Database,
     openings: RwLock<Openings>,
-    lichess_cache: ResponseCache<LichessQuery>,
-    masters_cache: ResponseCache<MastersQuery>,
+    cache: Cache<ExploreQuery, Bytes>,
     semaphore: Semaphore,
     metrics: Metrics,
     /// For sampling which deep positions fill the block cache.
@@ -382,6 +404,13 @@ impl AppState {
         ))
     }
 
+    fn explore(&self, query: &ExploreQuery, play: PlayPosition) -> Result<Bytes, rocksdb::Error> {
+        match query {
+            ExploreQuery::Lichess(query) => self.lichess(query, play),
+            ExploreQuery::Masters(query) => self.masters(query, play),
+        }
+    }
+
     fn pgn(&self, id: GameId) -> Result<String, Error> {
         Metrics::inc(&self.metrics.pgn_requests);
         match self.db.game(id, true)? {
@@ -472,7 +501,7 @@ async fn lichess(
     query: Result<Query<LichessQuery>, QueryRejection>,
 ) -> Result<Response, Error> {
     let query = parse_query(&state, query)?;
-    lichess_inner(state, query).await
+    explore(state, ExploreQuery::Lichess(query)).await
 }
 
 async fn lichess_history(
@@ -488,49 +517,30 @@ async fn lichess_history(
         },
         ..parse_query(&state, query)?
     };
-    lichess_inner(state, query).await
-}
-
-async fn lichess_inner(state: Shared, query: LichessQuery) -> Result<Response, Error> {
-    let started = Instant::now();
-    let play = query
-        .play
-        .position(&state.openings.read().expect("read openings"))
-        .inspect_err(|_| Metrics::inc(&state.metrics.bad_requests))?;
-    let cached = state.lichess_cache.contains_key(&query);
-    let state2 = Arc::clone(&state);
-    let bytes = state
-        .lichess_cache
-        .try_get_with(query.clone(), async move {
-            Metrics::inc(&state2.metrics.computed);
-            blocking(&state2, move |state| state.lichess(&query, play)).await
-        })
-        .await
-        .map_err(|err| Error::Db((*err).clone()))?;
-    if cached {
-        Metrics::inc(&state.metrics.cache_hits);
-    }
-    state.metrics.request.record(started.elapsed());
-    Ok(json(bytes))
+    explore(state, ExploreQuery::Lichess(query)).await
 }
 
 async fn masters(
     State(state): State<Shared>,
     query: Result<Query<MastersQuery>, QueryRejection>,
 ) -> Result<Response, Error> {
-    let started = Instant::now();
     let query = parse_query(&state, query)?;
+    explore(state, ExploreQuery::Masters(query)).await
+}
+
+async fn explore(state: Shared, query: ExploreQuery) -> Result<Response, Error> {
+    let started = Instant::now();
     let play = query
-        .play
+        .play()
         .position(&state.openings.read().expect("read openings"))
         .inspect_err(|_| Metrics::inc(&state.metrics.bad_requests))?;
-    let cached = state.masters_cache.contains_key(&query);
+    let cached = state.cache.contains_key(&query);
     let state2 = Arc::clone(&state);
     let bytes = state
-        .masters_cache
+        .cache
         .try_get_with(query.clone(), async move {
             Metrics::inc(&state2.metrics.computed);
-            blocking(&state2, move |state| state.masters(&query, play)).await
+            blocking(&state2, move |state| state.explore(&query, play)).await
         })
         .await
         .map_err(|err| Error::Db((*err).clone()))?;
@@ -559,15 +569,8 @@ async fn masters_pgn_handler(
 
 async fn monitor(State(state): State<Shared>) -> String {
     let fields = blocking(&state, |state| {
-        let mut fields = state.metrics.fields();
-        fields.push(format!(
-            "lichess_cache={}u",
-            state.lichess_cache.entry_count()
-        ));
-        fields.push(format!(
-            "masters_cache={}u",
-            state.masters_cache.entry_count()
-        ));
+        let mut fields = state.metrics.fields(state.config.kind);
+        fields.push(format!("response_cache={}u", state.cache.entry_count()));
         fields.push(format!("block_cache_usage={}u", state.db.cache_usage()));
         fields.push(format!(
             "block_cache_pinned={}u",
@@ -603,12 +606,18 @@ async fn monitor(State(state): State<Shared>) -> String {
                 rocksdb::statistics::Ticker::BloomFilterUseful,
             ),
         ] {
-            fields.push(format!("{name}={}u", state.db.ticker(ticker)));
+            if let Some(count) = state.db.ticker(ticker) {
+                fields.push(format!("{name}={count}u"));
+            }
         }
         fields
     })
     .await;
-    format!("opening_explorer {}\n", fields.join(","))
+    format!(
+        "opening_explorer_{} {}\n",
+        state.config.kind.as_str(),
+        fields.join(",")
+    )
 }
 
 async fn db_prop(State(state): State<Shared>, Path(prop): Path<String>) -> Result<String, Error> {
@@ -634,8 +643,7 @@ async fn periodic_openings_refresh(state: Shared) {
             Ok(openings) => {
                 log::info!("refreshed {} opening names", openings.len());
                 *state.openings.write().expect("write openings") = openings;
-                state.lichess_cache.invalidate_all();
-                state.masters_cache.invalidate_all();
+                state.cache.invalidate_all();
                 time::sleep(Duration::from_secs(60 * 167)).await;
             }
             Err(err) => {
@@ -668,11 +676,7 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
     let download_openings = config.openings_dir.is_none() && !config.no_openings;
 
     let state: Shared = Arc::new(AppState {
-        lichess_cache: Cache::builder()
-            .max_capacity(config.cache_entries)
-            .time_to_live(config.cache_ttl)
-            .build(),
-        masters_cache: Cache::builder()
+        cache: Cache::builder()
             .max_capacity(config.cache_entries)
             .time_to_live(config.cache_ttl)
             .build(),

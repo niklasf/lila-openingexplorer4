@@ -190,6 +190,7 @@ pub struct Database {
     db: DB,
     cache: Cache,
     opts: Options,
+    statistics: bool,
 }
 
 impl Database {
@@ -204,7 +205,12 @@ impl Database {
             path.display(),
             started.elapsed()
         );
-        Ok(Database { db, cache, opts })
+        Ok(Database {
+            db,
+            cache,
+            opts,
+            statistics: config.statistics,
+        })
     }
 
     fn cf(&self, name: &str) -> &ColumnFamily {
@@ -287,8 +293,9 @@ impl Database {
         self.cache.get_pinned_usage()
     }
 
-    pub fn ticker(&self, ticker: Ticker) -> u64 {
-        self.opts.get_ticker_count(ticker)
+    /// The count of a ticker, if statistics are collected.
+    pub fn ticker(&self, ticker: Ticker) -> Option<u64> {
+        self.statistics.then(|| self.opts.get_ticker_count(ticker))
     }
 
     pub fn property(&self, name: &str) -> Result<Option<String>, rocksdb::Error> {

@@ -3,6 +3,8 @@ use std::{
     time::Duration,
 };
 
+use crate::server::app::Kind;
+
 /// Latency histogram buckets, upper bounds in microseconds.
 const BUCKETS: [u64; 8] = [250, 500, 1_000, 2_500, 5_000, 10_000, 50_000, u64::MAX];
 
@@ -63,6 +65,7 @@ pub struct Metrics {
     pub misses: AtomicU64,
     /// Games loaded for responses.
     pub games_loaded: AtomicU64,
+    /// Masters only.
     pub pgn_requests: AtomicU64,
     /// Time spent computing responses on the blocking pool.
     pub compute: Histogram,
@@ -79,7 +82,8 @@ impl Metrics {
         counter.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn fields(&self) -> Vec<String> {
+    /// The fields relevant for the served database.
+    pub fn fields(&self, kind: Kind) -> Vec<String> {
         let mut out = vec![
             format!("cache_hits={}u", self.cache_hits.load(Ordering::Relaxed)),
             format!("computed={}u", self.computed.load(Ordering::Relaxed)),
@@ -101,11 +105,13 @@ impl Metrics {
                 "games_loaded={}u",
                 self.games_loaded.load(Ordering::Relaxed)
             ),
-            format!(
+        ];
+        if kind == Kind::Masters {
+            out.push(format!(
                 "pgn_requests={}u",
                 self.pgn_requests.load(Ordering::Relaxed)
-            ),
-        ];
+            ));
+        }
         self.compute.fields("compute", &mut out);
         self.request.fields("request", &mut out);
         out
