@@ -27,6 +27,20 @@ impl LaxDate {
         self.day.map(|d| d.get())
     }
 
+    pub fn pgn(self) -> impl fmt::Display {
+        fmt::from_fn(move |f| {
+            write!(f, "{:04}.", self.year())?;
+            match self.month {
+                Some(month) => write!(f, "{:02}.", month.get())?,
+                None => f.write_str("??.")?,
+            }
+            match self.day {
+                Some(day) => write!(f, "{:02}", day.get()),
+                None => f.write_str("??"),
+            }
+        })
+    }
+
     pub fn earliest_month(&self) -> Month {
         Month::from_months_since_jan_1900(
             u16::from(self.year_since_1900) * 12 + u16::from(self.month().unwrap_or(1)) - 1,
@@ -176,6 +190,19 @@ mod tests {
             assert_eq!(LaxDate::from_str(&lax_date.to_string()).unwrap(), lax_date);
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_pgn() {
+        let pgn = |year, month, day| {
+            LaxDate::from_ymd(year, month, day)
+                .unwrap()
+                .pgn()
+                .to_string()
+        };
+        assert_eq!(pgn(2012, Some(7), Some(3)), "2012.07.03");
+        assert_eq!(pgn(2012, Some(7), None), "2012.07.??");
+        assert_eq!(pgn(2012, None, None), "2012.??.??");
     }
 
     #[test]

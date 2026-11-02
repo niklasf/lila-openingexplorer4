@@ -1,5 +1,3 @@
-use std::fmt;
-
 use serde::Deserialize;
 use serde_with::{
     DisplayFromStr, NoneAsEmptyString, StringWithSeparator, formats::CommaSeparator, serde_as,
@@ -7,18 +5,18 @@ use serde_with::{
 use shakmaty::{
     CastlingMode, EnPassantMode, Position, PositionError, Setup,
     fen::Fen,
-    uci::UciMove,
+    uci::{IllegalUciMoveError, UciMove},
     variant::{Variant, VariantPosition},
 };
+use thiserror::Error;
 
 use crate::{
     packed::{LaxMonth, Month, RatingGroup, RatingGroups, Speed, Speeds},
     server::openings::{Opening, Openings},
 };
 
-/// Default bounds of the previous version of the explorer, still sent by
-/// clients. Ranges reaching beyond them are treated as unbounded, so that
-/// subtotals of the entries can be used.
+/// Bounds that clients send by default. Ranges reaching beyond them are
+/// treated as unbounded, so that subtotals of the entries can be used.
 const MIN_YEAR: u16 = 1952;
 const MAX_YEAR: u16 = 2100;
 
@@ -56,18 +54,20 @@ enum HistoryWanted {
     Yes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BadRequest(pub String);
-
-impl fmt::Display for BadRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+#[derive(Debug, Error)]
+pub enum PlayError {
+    #[error("{0}")]
+    Position(Box<PositionError<VariantPosition>>),
+    #[error("illegal move {uci}: {source}")]
+    IllegalMove {
+        uci: UciMove,
+        source: IllegalUciMoveError,
+    },
 }
 
-impl From<PositionError<VariantPosition>> for BadRequest {
-    fn from(err: PositionError<VariantPosition>) -> BadRequest {
-        BadRequest(err.to_string())
+impl From<PositionError<VariantPosition>> for PlayError {
+    fn from(err: PositionError<VariantPosition>) -> PlayError {
+        PlayError::Position(Box::new(err))
     }
 }
 
@@ -115,7 +115,7 @@ pub struct PlayPosition {
 }
 
 impl Play {
-    pub fn position(&self, openings: &Openings) -> Result<PlayPosition, BadRequest> {
+    pub fn position(&self, openings: &Openings) -> Result<PlayPosition, PlayError> {
         let mut pos =
             VariantPosition::from_setup(self.variant, self.setup.clone(), CastlingMode::Chess960)
                 .or_else(PositionError::ignore_invalid_castling_rights)
@@ -125,7 +125,7 @@ impl Play {
         for uci in &self.play {
             let m = uci
                 .to_move(&pos)
-                .map_err(|err| BadRequest(format!("illegal move {uci}: {err}")))?;
+                .map_err(|source| PlayError::IllegalMove { uci: *uci, source })?;
             pos.play_unchecked(m);
             opening = openings.classify_exact(&pos).or(opening);
         }
@@ -360,7 +360,7 @@ mod tests {
             range("since=2020&until=2020/03").unwrap(),
             (month(2020, 1), month(2020, 3))
         );
-        // Bounds beyond the defaults of the previous explorer.
+        // Bounds beyond the defaults are unbounded.
         assert_eq!(range("since=1952-01&until=3000-12").unwrap(), (None, None));
         assert_eq!(range("since=1900&until=3001").unwrap(), (None, None));
         assert_eq!(range("since=1952-02").unwrap(), (month(1952, 2), None));
