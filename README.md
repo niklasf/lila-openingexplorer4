@@ -10,26 +10,28 @@ hard-linked, so they must be on the same file system as the database:
 
 ```sh
 explorer ingest --db /hdd/db_lichess --games /hdd/sst --positions /hdd/sst_positions
-explorer ingest --db /ssd/db_masters --games /ssd/masters_sst/games --positions /ssd/masters_sst
+explorer ingest --db /hdd/db_masters --games /hdd/masters_sst/games --positions /hdd/masters_sst
 ```
 
 Serve them:
 
 ```sh
-# Keep a significant amount of memory free for the OS page cache. Oversubscribe
-# blocking threads when part of the database is on a slow disk.
 explorer lichess --db /hdd/db_lichess --bind 127.0.0.1:9002 \
-    --cache 64g --blocking-threads 16 --response-cache 300000
+    --cache 40g \ # ~30% of RAM, keeping a significant amount for page cache
+    --blocking-threads 16 \ # oversubscribed when serving from hdd
+    --response-cache 300000
 
-explorer masters --db /ssd/db_masters --bind 127.0.0.1:9003 \
-    --cache 6g --blocking-threads 12
+explorer masters --db /hdd/db_masters --bind 127.0.0.1:9003 \
+    --cache 6g \
+    --blocking-threads 12
 ```
 
 Replay a request log against both:
 
 ```sh
 stress_explorer sample-log.txt.zst \
-    --lichess-url http://127.0.0.1:9002 --masters-url http://127.0.0.1:9003
+    --lichess-url http://127.0.0.1:9002 \
+    --masters-url http://127.0.0.1:9003
 ```
 
 # Todo
