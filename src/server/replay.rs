@@ -39,7 +39,7 @@ pub fn find_visit(
             let mut found = None;
             let mut ply = 0;
             while ply < self.max_ply
-                && let Ok(Some(m)) = self.decoder.decode_next(pos)
+                && let Some(m) = self.decoder.decode_next(pos).expect("valid moves")
             {
                 if Zobrist96::new(hash, self.variant) == self.target {
                     found = Some(Visit {
@@ -56,7 +56,7 @@ pub fn find_visit(
         }
     }
 
-    let decoder = PackedMovesDecoder::new(game.moves).ok()?;
+    let decoder = PackedMovesDecoder::new(game.moves).expect("valid moves");
     pos.with_position_mut(Find {
         decoder,
         max_ply: max_ply.unwrap_or(usize::MAX),

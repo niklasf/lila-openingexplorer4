@@ -64,12 +64,9 @@ pub fn masters_pgn(id: GameId, game: &BorrowedLichessGame<'_>) -> String {
     }
     pgn.push('\n');
 
-    let mut decoder = PackedMovesDecoder::new(game.moves).ok();
+    let mut decoder = PackedMovesDecoder::new(game.moves).expect("valid moves");
     let mut first = true;
-    while let Some(m) = decoder
-        .as_mut()
-        .and_then(|decoder| decoder.decode_next(&pos).ok().flatten())
-    {
+    while let Some(m) = decoder.decode_next(&pos).expect("valid moves") {
         if pos.turn() == Color::White {
             let _ = write!(pgn, "{}. ", pos.fullmoves());
         } else if first {
