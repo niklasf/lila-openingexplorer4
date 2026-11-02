@@ -5,113 +5,126 @@ use std::{
 
 use crate::server::app::Kind;
 
+#[derive(Default)]
+pub struct Counter(AtomicU64);
+
+impl Counter {
+    pub fn inc(&self) {
+        self.add(1);
+    }
+
+    pub fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Maximum of the values recorded since it was last taken.
+#[derive(Default)]
+pub struct Max(AtomicU64);
+
+impl Max {
+    pub fn record(&self, value: u64) {
+        self.0.fetch_max(value, Ordering::Relaxed);
+    }
+
+    pub fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
 /// Latency histogram buckets, upper bounds in microseconds.
 const BUCKETS: [u64; 8] = [250, 500, 1_000, 2_500, 5_000, 10_000, 50_000, u64::MAX];
 
 #[derive(Default)]
 pub struct Histogram {
-    counts: [AtomicU64; BUCKETS.len()],
-    total_micros: AtomicU64,
-    max_micros: AtomicU64,
+    counts: [Counter; BUCKETS.len()],
+    sum_micros: Counter,
+    max_micros: Max,
 }
 
 impl Histogram {
     pub fn record(&self, duration: Duration) {
-        let micros = duration.as_micros() as u64;
-        let bucket = BUCKETS.iter().position(|&max| micros <= max).unwrap_or(0);
-        self.counts[bucket].fetch_add(1, Ordering::Relaxed);
-        self.total_micros.fetch_add(micros, Ordering::Relaxed);
-        self.max_micros.fetch_max(micros, Ordering::Relaxed);
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        let bucket = BUCKETS
+            .iter()
+            .position(|&max| micros <= max)
+            .expect("last bucket is unbounded");
+        self.counts[bucket].inc();
+        self.sum_micros.add(micros);
+        self.max_micros.record(micros);
     }
 
+    /// Cumulative bucket counts, count, sum, and the maximum since the
+    /// previous call.
     fn fields(&self, prefix: &str, out: &mut Vec<String>) {
         let mut count = 0;
-        for (i, max) in BUCKETS.iter().enumerate() {
-            count += self.counts[i].load(Ordering::Relaxed);
-            let name = if *max == u64::MAX {
-                "inf".to_owned()
+        for (counter, max) in self.counts.iter().zip(BUCKETS) {
+            count += counter.get();
+            if max == u64::MAX {
+                out.push(format!("{prefix}_le_inf_us={count}u"));
             } else {
-                max.to_string()
-            };
-            out.push(format!("{prefix}_le_{name}us={count}u"));
+                out.push(format!("{prefix}_le_{max}us={count}u"));
+            }
         }
         out.push(format!("{prefix}_count={count}u"));
-        out.push(format!(
-            "{prefix}_sum_us={}u",
-            self.total_micros.load(Ordering::Relaxed)
-        ));
-        out.push(format!(
-            "{prefix}_max_us={}u",
-            self.max_micros.load(Ordering::Relaxed)
-        ));
+        out.push(format!("{prefix}_sum_us={}u", self.sum_micros.get()));
+        out.push(format!("{prefix}_max_us={}u", self.max_micros.take()));
     }
 }
 
 /// Request counters for `/monitor`.
 #[derive(Default)]
 pub struct Metrics {
-    /// Requests answered from the response cache.
-    pub cache_hits: AtomicU64,
-    /// Requests computed (cache misses).
-    pub computed: AtomicU64,
-    pub bad_requests: AtomicU64,
+    /// Valid explorer requests, answered from the response cache or
+    /// computed.
+    pub requests: Counter,
+    /// Explorer requests that computed their response.
+    pub computed: Counter,
+    pub bad_requests: Counter,
     /// Positions found in the positions column family.
-    pub positions_hits: AtomicU64,
+    pub positions_hits: Counter,
     /// Positions validated from a cold candidate.
-    pub cold_hits: AtomicU64,
-    /// Cold candidates loaded and replayed.
-    pub cold_candidates: AtomicU64,
+    pub cold_hits: Counter,
     /// Positions found in neither column family.
-    pub misses: AtomicU64,
-    /// Games loaded for responses.
-    pub games_loaded: AtomicU64,
+    pub misses: Counter,
+    /// Cold candidates loaded and replayed.
+    pub cold_games_loaded: Counter,
+    /// Games loaded for the moves, top and recent games of responses.
+    pub response_games_loaded: Counter,
     /// Masters only.
-    pub pgn_requests: AtomicU64,
-    /// Time spent computing responses on the blocking pool.
+    pub pgn_requests: Counter,
+    /// Computed responses: time spent computing on the blocking pool.
     pub compute: Histogram,
-    /// Time from receiving a request to the response (including queueing).
+    /// Computed responses: time from receiving the request to the response
+    /// (including queueing for the blocking pool).
     pub request: Histogram,
 }
 
 impl Metrics {
-    pub fn inc(counter: &AtomicU64) {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn add(counter: &AtomicU64, n: u64) {
-        counter.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// The fields relevant for the served database.
+    /// The fields relevant for the served database. Takes the maxima of the
+    /// histograms, so that they cover the time since the previous call.
     pub fn fields(&self, kind: Kind) -> Vec<String> {
-        let mut out = vec![
-            format!("cache_hits={}u", self.cache_hits.load(Ordering::Relaxed)),
-            format!("computed={}u", self.computed.load(Ordering::Relaxed)),
-            format!(
-                "bad_requests={}u",
-                self.bad_requests.load(Ordering::Relaxed)
-            ),
-            format!(
-                "positions_hits={}u",
-                self.positions_hits.load(Ordering::Relaxed)
-            ),
-            format!("cold_hits={}u", self.cold_hits.load(Ordering::Relaxed)),
-            format!(
-                "cold_candidates={}u",
-                self.cold_candidates.load(Ordering::Relaxed)
-            ),
-            format!("misses={}u", self.misses.load(Ordering::Relaxed)),
-            format!(
-                "games_loaded={}u",
-                self.games_loaded.load(Ordering::Relaxed)
-            ),
+        let mut counters = vec![
+            ("requests", &self.requests),
+            ("computed", &self.computed),
+            ("bad_requests", &self.bad_requests),
+            ("positions_hits", &self.positions_hits),
+            ("cold_hits", &self.cold_hits),
+            ("misses", &self.misses),
+            ("cold_games_loaded", &self.cold_games_loaded),
+            ("response_games_loaded", &self.response_games_loaded),
         ];
         if kind == Kind::Masters {
-            out.push(format!(
-                "pgn_requests={}u",
-                self.pgn_requests.load(Ordering::Relaxed)
-            ));
+            counters.push(("pgn_requests", &self.pgn_requests));
         }
+        let mut out: Vec<String> = counters
+            .into_iter()
+            .map(|(name, counter)| format!("{name}={}u", counter.get()))
+            .collect();
         self.compute.fields("compute", &mut out);
         self.request.fields("request", &mut out);
         out

@@ -33,7 +33,7 @@ use crate::{
     server::{
         db::Database,
         explore::{GameRef, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess, prepare_masters},
-        metrics::Metrics,
+        metrics::{Counter, Metrics},
         openings::Openings,
         pgn::masters_pgn,
         query::{LichessQuery, Limits, MastersQuery, Play, PlayError, PlayPosition},
@@ -166,20 +166,19 @@ impl AppState {
         let hash = position_hash(pos);
         let fill_cache = self.fill_cache(ply);
         if let Some(entry) = self.db.positions_entry(&hash, fill_cache)? {
-            Metrics::inc(&self.metrics.positions_hits);
+            self.metrics.positions_hits.inc();
             return Ok(Some(Entry::Pinned(entry)));
         }
         let candidates = self.db.cold_candidates(&hash, fill_cache)?;
         if candidates.is_empty() {
-            Metrics::inc(&self.metrics.misses);
+            self.metrics.misses.inc();
             return Ok(None);
         }
-        Metrics::add(&self.metrics.cold_candidates, candidates.len() as u64);
         let mut entry = LichessEntry::new();
         let mut found = false;
         for (seq, (id, game)) in candidates
             .iter()
-            .zip(self.load_games(&candidates, fill_cache)?)
+            .zip(self.load_games(&candidates, fill_cache, &self.metrics.cold_games_loaded)?)
             .enumerate()
         {
             let Some(game) = game else {
@@ -207,12 +206,12 @@ impl AppState {
             }
         }
         if found {
-            Metrics::inc(&self.metrics.cold_hits);
+            self.metrics.cold_hits.inc();
             let mut buf = Vec::new();
             entry.pack_entire(&mut buf);
             Ok(Some(Entry::Owned(buf)))
         } else {
-            Metrics::inc(&self.metrics.misses);
+            self.metrics.misses.inc();
             Ok(None)
         }
     }
@@ -222,8 +221,9 @@ impl AppState {
         &self,
         ids: &[GameId],
         fill_cache: bool,
+        loaded: &Counter,
     ) -> Result<Vec<Option<Vec<u8>>>, rocksdb::Error> {
-        Metrics::add(&self.metrics.games_loaded, ids.len() as u64);
+        loaded.add(ids.len() as u64);
         Ok(self
             .db
             .games(ids, fill_cache)?
@@ -303,7 +303,11 @@ impl AppState {
         ids.extend(prepared.recent_games.iter().map(|g| g.id));
         let top_offset = ids.len();
         ids.extend(prepared.top_games.iter().map(|g| g.id));
-        let games = self.load_games(&ids, self.fill_cache(ply))?;
+        let games = self.load_games(
+            &ids,
+            self.fill_cache(ply),
+            &self.metrics.response_games_loaded,
+        )?;
         attach_single_games(&mut moves, &ids, &games, false);
 
         let response = ExplorerResponse {
@@ -352,7 +356,11 @@ impl AppState {
         let mut moves = self.explorer_moves(&pos, prepared.moves, &mut ids);
         let candidates_offset = ids.len();
         ids.extend(prepared.candidates.iter().map(|g| g.id));
-        let games = self.load_games(&ids, self.fill_cache(ply))?;
+        let games = self.load_games(
+            &ids,
+            self.fill_cache(ply),
+            &self.metrics.response_games_loaded,
+        )?;
         attach_single_games(&mut moves, &ids, &games, true);
 
         // Rank the candidates by their actual ratings.
@@ -412,7 +420,7 @@ impl AppState {
     }
 
     fn pgn(&self, id: GameId) -> Result<String, Error> {
-        Metrics::inc(&self.metrics.pgn_requests);
+        self.metrics.pgn_requests.inc();
         match self.db.game(id, true)? {
             Some(game) => Ok(masters_pgn(id, &BorrowedLichessGame::unpack_entire(&game))),
             None => Err(Error::NotFound),
@@ -467,14 +475,9 @@ async fn blocking<T: Send + 'static>(
         .await
         .expect("semaphore not closed");
     let state = Arc::clone(state);
-    task::spawn_blocking(move || {
-        let started = Instant::now();
-        let result = f(&state);
-        state.metrics.compute.record(started.elapsed());
-        result
-    })
-    .await
-    .expect("blocking task")
+    task::spawn_blocking(move || f(&state))
+        .await
+        .expect("blocking task")
 }
 
 fn json(bytes: Bytes) -> Response {
@@ -491,7 +494,7 @@ fn json(bytes: Bytes) -> Response {
 /// Maps a rejected query string to a bad request.
 fn parse_query<T>(state: &AppState, query: Result<Query<T>, QueryRejection>) -> Result<T, Error> {
     query.map(|Query(query)| query).map_err(|err| {
-        Metrics::inc(&state.metrics.bad_requests);
+        state.metrics.bad_requests.inc();
         Error::from(err)
     })
 }
@@ -533,21 +536,25 @@ async fn explore(state: Shared, query: ExploreQuery) -> Result<Response, Error> 
     let play = query
         .play()
         .position(&state.openings.read().expect("read openings"))
-        .inspect_err(|_| Metrics::inc(&state.metrics.bad_requests))?;
-    let cached = state.cache.contains_key(&query);
+        .inspect_err(|_| state.metrics.bad_requests.inc())?;
+    state.metrics.requests.inc();
     let state2 = Arc::clone(&state);
     let bytes = state
         .cache
         .try_get_with(query.clone(), async move {
-            Metrics::inc(&state2.metrics.computed);
-            blocking(&state2, move |state| state.explore(&query, play)).await
+            state2.metrics.computed.inc();
+            let bytes = blocking(&state2, move |state| {
+                let started = Instant::now();
+                let bytes = state.explore(&query, play);
+                state.metrics.compute.record(started.elapsed());
+                bytes
+            })
+            .await;
+            state2.metrics.request.record(started.elapsed());
+            bytes
         })
         .await
         .map_err(|err| Error::Db((*err).clone()))?;
-    if cached {
-        Metrics::inc(&state.metrics.cache_hits);
-    }
-    state.metrics.request.record(started.elapsed());
     Ok(json(bytes))
 }
 
@@ -568,7 +575,7 @@ async fn masters_pgn_handler(
 }
 
 async fn monitor(State(state): State<Shared>) -> String {
-    let fields = blocking(&state, |state| {
+    let fields = {
         let mut fields = state.metrics.fields(state.config.kind);
         fields.push(format!("response_cache={}u", state.cache.entry_count()));
         fields.push(format!("block_cache_usage={}u", state.db.cache_usage()));
@@ -611,8 +618,7 @@ async fn monitor(State(state): State<Shared>) -> String {
             }
         }
         fields
-    })
-    .await;
+    };
     format!(
         "opening_explorer_{} {}\n",
         state.config.kind.as_str(),
