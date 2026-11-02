@@ -23,7 +23,7 @@ Overall features:
 
 Critical performance work:
 
-* [ ] Stress testing tool
+* [x] Stress testing tool
 * [ ] Recheck parallel game loading
 * [ ] Determine best disk layout and migration strategy
 * [ ] Document recommended options for each workload
