@@ -5,73 +5,13 @@ use bitflags::bitflags;
 use bytes::{Buf, BufMut};
 use shakmaty::{Color, KnownOutcome, packed::PackedUciMove};
 
-use crate::packed::{GameId, Month, Rating, Speed, pack_int, pack_uint, unpack_int, unpack_uint};
+use crate::packed::{
+    GameId, Month, Rating, RatingGroup, Speed, pack_int, pack_uint, unpack_int, unpack_uint,
+};
 
 /// Each cell (move, group and month) keeps only its most recent games, up to
 /// this many.
 pub const GAMES_PER_CELL: usize = 8;
-
-#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RatingGroup {
-    Low,
-    Group1000,
-    Group1200,
-    Group1400,
-    Group1600,
-    Group1800,
-    Group2000,
-    Group2200,
-    Group2500,
-    Group2800,
-    Group3200,
-}
-
-impl RatingGroup {
-    pub fn select(rating: Rating) -> RatingGroup {
-        let rating = i32::from(rating);
-
-        if rating < 1000 {
-            RatingGroup::Low
-        } else if rating < 1200 {
-            RatingGroup::Group1000
-        } else if rating < 1400 {
-            RatingGroup::Group1200
-        } else if rating < 1600 {
-            RatingGroup::Group1400
-        } else if rating < 1800 {
-            RatingGroup::Group1600
-        } else if rating < 2000 {
-            RatingGroup::Group1800
-        } else if rating < 2200 {
-            RatingGroup::Group2000
-        } else if rating < 2500 {
-            RatingGroup::Group2200
-        } else if rating < 2800 {
-            RatingGroup::Group2500
-        } else if rating < 3200 {
-            RatingGroup::Group2800
-        } else {
-            RatingGroup::Group3200
-        }
-    }
-
-    fn typical_rating(self) -> Rating {
-        Rating::try_from(match self {
-            RatingGroup::Low => 884,
-            RatingGroup::Group1000 => 1111,
-            RatingGroup::Group1200 => 1307,
-            RatingGroup::Group1400 => 1504,
-            RatingGroup::Group1600 => 1701,
-            RatingGroup::Group1800 => 1896,
-            RatingGroup::Group2000 => 2089,
-            RatingGroup::Group2200 => 2310,
-            RatingGroup::Group2500 => 2600,
-            RatingGroup::Group2800 => 2925,
-            RatingGroup::Group3200 => 3269,
-        })
-        .expect("typical rating")
-    }
-}
 
 /// Orders games of the same month within a `LichessEntry`: games are ranked
 /// by month, then by this number. Numbers are only comparable within one
@@ -190,8 +130,14 @@ impl SubStats {
         self.white + self.black + self.draws
     }
 
-    /// Packs the counts, then the rating sum relative to the typical rating
-    /// of the group. The total is not stored, but derived from the counts.
+    pub fn average_rating(&self) -> Option<Rating> {
+        let games = i64::try_from(self.games()).expect("games fit i64");
+        (games > 0).then(|| {
+            let offset = (2 * self.rating_offset_sum + games).div_euclid(2 * games);
+            Rating::from_offset(i16::try_from(offset).expect("average within rating range"))
+        })
+    }
+
     pub fn pack<B: BufMut>(&self, buf: &mut B, rating_group: RatingGroup) {
         match (self.white, self.draws, self.black) {
             (1, 0, 0) => buf.put_u8(0),
@@ -913,6 +859,27 @@ mod tests {
                 .map(|(_, key, game_id)| (key, game_id))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn test_average_rating() {
+        let average = |rating_offset_sum, games| {
+            SubStats {
+                rating_offset_sum,
+                white: games,
+                black: 0,
+                draws: 0,
+            }
+            .average_rating()
+            .map(i32::from)
+        };
+        assert_eq!(average(0, 0), None);
+        assert_eq!(average(-100, 1), Some(1400));
+        // Rounded half up, like the absolute ratings.
+        assert_eq!(average(1, 2), Some(1501));
+        assert_eq!(average(-1, 2), Some(1500));
+        assert_eq!(average(-3, 2), Some(1499));
+        assert_eq!(average(-2, 3), Some(1499));
     }
 
     #[test]

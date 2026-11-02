@@ -1,6 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use arbitrary::Arbitrary;
+use bitflags::bitflags;
 use btoi::btoi;
 use bytes::{Buf, BufMut};
 use thiserror::Error;
@@ -92,6 +93,134 @@ impl TryFrom<i32> for Rating {
 impl fmt::Debug for Rating {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Rating({})", i32::from(*self))
+    }
+}
+
+#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RatingGroup {
+    Low,
+    Group1000,
+    Group1200,
+    Group1400,
+    Group1600,
+    Group1800,
+    Group2000,
+    Group2200,
+    Group2500,
+    Group2800,
+    Group3200,
+}
+
+impl RatingGroup {
+    pub const ALL: [RatingGroup; 11] = [
+        RatingGroup::Low,
+        RatingGroup::Group1000,
+        RatingGroup::Group1200,
+        RatingGroup::Group1400,
+        RatingGroup::Group1600,
+        RatingGroup::Group1800,
+        RatingGroup::Group2000,
+        RatingGroup::Group2200,
+        RatingGroup::Group2500,
+        RatingGroup::Group2800,
+        RatingGroup::Group3200,
+    ];
+
+    pub fn select(rating: Rating) -> RatingGroup {
+        let rating = i32::from(rating);
+
+        if rating < 1000 {
+            RatingGroup::Low
+        } else if rating < 1200 {
+            RatingGroup::Group1000
+        } else if rating < 1400 {
+            RatingGroup::Group1200
+        } else if rating < 1600 {
+            RatingGroup::Group1400
+        } else if rating < 1800 {
+            RatingGroup::Group1600
+        } else if rating < 2000 {
+            RatingGroup::Group1800
+        } else if rating < 2200 {
+            RatingGroup::Group2000
+        } else if rating < 2500 {
+            RatingGroup::Group2200
+        } else if rating < 2800 {
+            RatingGroup::Group2500
+        } else if rating < 3200 {
+            RatingGroup::Group2800
+        } else {
+            RatingGroup::Group3200
+        }
+    }
+
+    pub(crate) fn typical_rating(self) -> Rating {
+        Rating::try_from(match self {
+            RatingGroup::Low => 884,
+            RatingGroup::Group1000 => 1111,
+            RatingGroup::Group1200 => 1307,
+            RatingGroup::Group1400 => 1504,
+            RatingGroup::Group1600 => 1701,
+            RatingGroup::Group1800 => 1896,
+            RatingGroup::Group2000 => 2089,
+            RatingGroup::Group2200 => 2310,
+            RatingGroup::Group2500 => 2600,
+            RatingGroup::Group2800 => 2925,
+            RatingGroup::Group3200 => 3269,
+        })
+        .expect("typical rating")
+    }
+}
+
+bitflags! {
+    /// A set of rating groups.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+    pub struct RatingGroups: u16 {
+        const LOW = 1 << 0;
+        const GROUP_1000 = 1 << 1;
+        const GROUP_1200 = 1 << 2;
+        const GROUP_1400 = 1 << 3;
+        const GROUP_1600 = 1 << 4;
+        const GROUP_1800 = 1 << 5;
+        const GROUP_2000 = 1 << 6;
+        const GROUP_2200 = 1 << 7;
+        const GROUP_2500 = 1 << 8;
+        const GROUP_2800 = 1 << 9;
+        const GROUP_3200 = 1 << 10;
+    }
+}
+
+impl From<RatingGroup> for RatingGroups {
+    fn from(group: RatingGroup) -> RatingGroups {
+        match group {
+            RatingGroup::Low => RatingGroups::LOW,
+            RatingGroup::Group1000 => RatingGroups::GROUP_1000,
+            RatingGroup::Group1200 => RatingGroups::GROUP_1200,
+            RatingGroup::Group1400 => RatingGroups::GROUP_1400,
+            RatingGroup::Group1600 => RatingGroups::GROUP_1600,
+            RatingGroup::Group1800 => RatingGroups::GROUP_1800,
+            RatingGroup::Group2000 => RatingGroups::GROUP_2000,
+            RatingGroup::Group2200 => RatingGroups::GROUP_2200,
+            RatingGroup::Group2500 => RatingGroups::GROUP_2500,
+            RatingGroup::Group2800 => RatingGroups::GROUP_2800,
+            RatingGroup::Group3200 => RatingGroups::GROUP_3200,
+        }
+    }
+}
+
+impl FromIterator<RatingGroup> for RatingGroups {
+    fn from_iter<I: IntoIterator<Item = RatingGroup>>(iter: I) -> RatingGroups {
+        iter.into_iter().map(RatingGroups::from).collect()
+    }
+}
+
+/// Parses the group of a rating, like `RatingGroup::select()`. Lower
+/// bounds of groups, like `1600`, select that group.
+impl FromStr for RatingGroup {
+    type Err = InvalidRating;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(RatingGroup::select)
     }
 }
 

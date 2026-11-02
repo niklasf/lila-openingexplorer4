@@ -1,6 +1,11 @@
+use std::{fmt, str::FromStr};
+
 use arbitrary::{Arbitrary, Unstructured};
+use bitflags::bitflags;
 use btoi::btou;
 use bytes::{Buf, BufMut};
+use serde::Serialize;
+use serde_with::{TryFromInto, serde_as};
 use shakmaty::{
     ByColor, CastlingMode, Color, EnPassantMode, KnownOutcome, Position,
     packed::{PackedSetup, PackedUciMove},
@@ -93,10 +98,13 @@ impl<'a> BorrowedEventInfo<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[serde_as]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct GamePlayer {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub name: String,
+    #[serde_as(as = "Option<TryFromInto<i32>>")]
     pub rating: Option<Rating>,
 }
 
@@ -207,9 +215,55 @@ impl Speed {
     }
 }
 
+bitflags! {
+    /// A set of speeds.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+    pub struct Speeds: u8 {
+        const ULTRA_BULLET = 1 << 0;
+        const BULLET = 1 << 1;
+        const BLITZ = 1 << 2;
+        const RAPID = 1 << 3;
+        const CLASSICAL = 1 << 4;
+        const CORRESPONDENCE = 1 << 5;
+    }
+}
+
+impl From<Speed> for Speeds {
+    fn from(speed: Speed) -> Speeds {
+        match speed {
+            Speed::UltraBullet => Speeds::ULTRA_BULLET,
+            Speed::Bullet => Speeds::BULLET,
+            Speed::Blitz => Speeds::BLITZ,
+            Speed::Rapid => Speeds::RAPID,
+            Speed::Classical => Speeds::CLASSICAL,
+            Speed::Correspondence => Speeds::CORRESPONDENCE,
+        }
+    }
+}
+
+impl FromIterator<Speed> for Speeds {
+    fn from_iter<I: IntoIterator<Item = Speed>>(iter: I) -> Speeds {
+        iter.into_iter().map(Speeds::from).collect()
+    }
+}
+
+impl fmt::Display for Speed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("Invalid speed")]
 pub struct InvalidSpeed;
+
+impl FromStr for Speed {
+    type Err = InvalidSpeed;
+
+    fn from_str(s: &str) -> Result<Speed, InvalidSpeed> {
+        Speed::from_ascii(s.as_bytes())
+    }
+}
 
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum RatingMode {
@@ -246,6 +300,12 @@ impl RatingMode {
             b"rated" => RatingMode::Rated,
             _ => return Err(InvalidRatingMode),
         })
+    }
+}
+
+impl fmt::Display for RatingMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
