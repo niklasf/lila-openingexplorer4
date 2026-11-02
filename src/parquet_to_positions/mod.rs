@@ -366,7 +366,7 @@ pub fn convert(
         // hits a group, so a filter would not help.
         cold_opts: &config.sst.options(false),
         positions_opts: &SstConfig {
-            zstd_level: 0, // Incompressible data
+            zstd_level: 1, // Higher levels save little more, but cost write time
             ..config.sst
         }
         .options(true),

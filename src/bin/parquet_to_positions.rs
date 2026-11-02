@@ -73,13 +73,13 @@ struct Args {
     no_overlap: bool,
     /// Approximate size of the SST files. The target_file_size_base of the
     /// column families should match.
-    #[clap(long, default_value = "512m")]
+    #[clap(long, default_value = "2g")]
     sst_target_size: ByteSize,
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]
     sst_block_size: usize,
     /// Zstd level of the cold positions SST files, or 0 for no compression.
-    /// The positions SST files are not compressed.
+    /// The positions SST files always use zstd level 1.
     #[clap(long, default_value = "3", value_parser = zstd_level())]
     sst_zstd_level: i32,
     /// Maximum size of the zstd dictionary trained for each SST file

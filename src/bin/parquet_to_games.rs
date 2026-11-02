@@ -66,7 +66,7 @@ struct Args {
     no_overlap: bool,
     /// Approximate size of the SST files. The target_file_size_base of the
     /// column family should match.
-    #[clap(long, default_value = "512m")]
+    #[clap(long, default_value = "2g")]
     sst_target_size: ByteSize,
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]

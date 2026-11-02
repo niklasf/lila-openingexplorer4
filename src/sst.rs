@@ -47,6 +47,10 @@ impl<'a> SstFile<'a> {
     }
 }
 
+/// Keep a compressed block if it saves at least 1/16. Blocks of games and
+/// positions typically save about 10%, just below the default minimum of 1/8.
+const MAX_COMPRESSED_BYTES_PER_KB: u32 = 960;
+
 /// Bloom-equivalent bits per key of filters, for about 1% false positives.
 const FILTER_BITS_PER_KEY: f64 = 10.0;
 
@@ -76,10 +80,14 @@ impl SstConfig {
             opts.set_compression_type(DBCompressionType::None);
         } else {
             opts.set_compression_type(DBCompressionType::Zstd);
-            opts.set_compression_options(-14, self.zstd_level, 0, self.zstd_dict);
-            if self.zstd_dict != 0 {
-                opts.set_zstd_max_train_bytes(self.zstd_dict * 100);
-            }
+            opts = opts
+                .get_options_from_string(format!(
+                    "compression_opts={{window_bits=-14;level={};strategy=0;max_dict_bytes={};zstd_max_train_bytes={};max_compressed_bytes_per_kb={MAX_COMPRESSED_BYTES_PER_KB}}}",
+                    self.zstd_level,
+                    self.zstd_dict,
+                    if self.zstd_dict != 0 { self.zstd_dict * 100 } else { 0 },
+                ))
+                .expect("valid compression options");
         }
         opts.set_block_based_table_factory(table_opts);
         opts
