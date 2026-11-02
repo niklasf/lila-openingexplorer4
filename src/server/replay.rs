@@ -1,11 +1,9 @@
 use shakmaty::{
-    CastlingMode, Color, EnPassantMode, Position,
-    packed::PackedUciMove,
-    variant::{VariantPosition, WithPositionMut},
+    CastlingMode, Color, EnPassantMode, Position, packed::PackedUciMove, variant::WithPositionMut,
     zobrist::Zobrist128,
 };
 
-use crate::packed::{BorrowedLichessGame, PackedMovesDecoder, Zobrist96};
+use crate::packed::{BorrowedLichessGame, PackedMovesDecoder, PositionKey};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Visit {
@@ -18,7 +16,7 @@ pub struct Visit {
 /// recorded it. The final position is never a visit.
 pub fn find_visit(
     game: &BorrowedLichessGame<'_>,
-    target: &Zobrist96,
+    target: &PositionKey,
     max_ply: Option<usize>,
 ) -> Option<Visit> {
     let mut pos = game.initial_position();
@@ -27,7 +25,7 @@ pub fn find_visit(
     struct Find<'a> {
         decoder: PackedMovesDecoder<'a>,
         max_ply: usize,
-        target: Zobrist96,
+        target: PositionKey,
         variant: shakmaty::variant::Variant,
     }
 
@@ -41,7 +39,7 @@ pub fn find_visit(
             while ply < self.max_ply
                 && let Some(m) = self.decoder.decode_next(pos).expect("valid moves")
             {
-                if Zobrist96::new(hash, self.variant) == self.target {
+                if PositionKey::from_zobrist(hash, self.variant) == self.target {
                     found = Some(Visit {
                         m: PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
                         turn: pos.turn(),
@@ -65,14 +63,11 @@ pub fn find_visit(
     })
 }
 
-/// Hash of a position as used for the positions and cold_positions keys.
-pub fn position_hash(pos: &VariantPosition) -> Zobrist96 {
-    Zobrist96::new(pos.zobrist_hash(EnPassantMode::Legal), pos.variant())
-}
-
 #[cfg(test)]
 mod tests {
-    use shakmaty::{ByColor, Chess, KnownOutcome, san::San, uci::UciMove};
+    use shakmaty::{
+        ByColor, Chess, KnownOutcome, san::San, uci::UciMove, variant::VariantPosition,
+    };
 
     use super::*;
     use crate::packed::{BorrowedGamePlayer, LaxDate, PackedMoves, RatingMode};
@@ -122,7 +117,7 @@ mod tests {
             moves: &moves.0,
         };
         let visit = |pos: &VariantPosition, max_ply| {
-            find_visit(&game, &position_hash(pos), max_ply)
+            find_visit(&game, &PositionKey::new(pos), max_ply)
                 .map(|visit| (visit.m.unpack(), visit.turn))
         };
         let uci = |s: &str| s.parse::<UciMove>().unwrap();

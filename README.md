@@ -33,7 +33,6 @@ Minor things:
 * [ ] Performance rating
 * [ ] Banned player blacklist
 * [ ] Unify masters/lichess API
-* [ ] LilaVariant (chess960 folded into chess) and the Zobrist96 invariant
 
 Pending documentation changes:
 

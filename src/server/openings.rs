@@ -143,4 +143,51 @@ mod tests {
         pos.play_unchecked(m);
         assert_eq!(openings.classify_exact(&pos).unwrap().eco, "B00");
     }
+
+    /// Plays SAN moves from the start position of the variant.
+    fn play(variant: Variant, sans: &str) -> VariantPosition {
+        let mut pos = VariantPosition::new(variant);
+        for san in sans.split_whitespace() {
+            let m = san.parse::<San>().unwrap().to_move(&pos).unwrap();
+            pos.play_unchecked(m);
+        }
+        pos
+    }
+
+    #[test]
+    fn test_classify_variants() {
+        let mut openings = Openings::default();
+        openings
+            .load_tsv(
+                "eco\tname\tpgn\n\
+                 C44\tKing's Knight Opening\t1. e4 e5 2. Nf3\n\
+                 B01\tScandinavian Defense: Mieses-Kotroc Variation\t1. e4 d5 2. exd5 Qxd5\n\
+                 B00\tBarnes Defense\t1. e4 f6 2. Qh5+\n",
+            )
+            .unwrap();
+        let eco = |variant, sans| {
+            openings
+                .classify_exact(&play(variant, sans))
+                .map(|opening| opening.eco.as_str())
+        };
+        // Variants that start like standard chess share its names, as long
+        // as their extra state is still at its initial value.
+        for variant in [
+            Variant::Chess,
+            Variant::Crazyhouse,
+            Variant::ThreeCheck,
+            Variant::KingOfTheHill,
+        ] {
+            assert_eq!(eco(variant, "e4 e5 Nf3"), Some("C44"));
+        }
+        assert_eq!(eco(Variant::Chess, "e4 d5 exd5 Qxd5"), Some("B01"));
+        assert_eq!(eco(Variant::Chess, "e4 f6 Qh5+"), Some("B00"));
+        // After captures, crazyhouse pockets are no longer empty.
+        assert_eq!(eco(Variant::Crazyhouse, "e4 d5 exd5 Qxd5"), None);
+        // After a check, fewer checks remain in three-check.
+        assert_eq!(eco(Variant::ThreeCheck, "e4 f6 Qh5+"), None);
+        // Other variants have no names at all.
+        assert_eq!(eco(Variant::Atomic, "e4 e5 Nf3"), None);
+        assert_eq!(eco(Variant::Antichess, "e4 e5 Nf3"), None);
+    }
 }

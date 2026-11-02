@@ -28,7 +28,7 @@ use tokio::{net::TcpListener, sync::Semaphore, task, time};
 use crate::{
     packed::{
         BorrowedLichessGame, CellKey, GameId, GameSeq, GroupHeader, InvalidGameId, LichessEntry,
-        Rating, RatingGroup,
+        PositionKey, Rating, RatingGroup,
     },
     server::{
         db::Database,
@@ -37,7 +37,7 @@ use crate::{
         openings::Openings,
         pgn::masters_pgn,
         query::{LichessQuery, Limits, MastersQuery, Play, PlayError, PlayPosition},
-        replay::{find_visit, position_hash},
+        replay::find_visit,
         response::{
             ExplorerGame, ExplorerGameWithUci, ExplorerMove, ExplorerResponse, HistoryEntry, Stats,
         },
@@ -163,7 +163,7 @@ impl AppState {
     /// The packed entry of a position: from the positions column family,
     /// or synthesized from the single game that reached it.
     fn entry(&self, pos: &VariantPosition, ply: u32) -> Result<Option<Entry<'_>>, rocksdb::Error> {
-        let hash = position_hash(pos);
+        let hash = PositionKey::new(pos);
         let fill_cache = self.fill_cache(ply);
         if let Some(entry) = self.db.positions_entry(&hash, fill_cache)? {
             self.metrics.positions_hits.inc();

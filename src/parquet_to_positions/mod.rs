@@ -21,7 +21,7 @@ pub use write::{COLD_DIR, OutputStats, POSITIONS_DIR};
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::Zobrist96,
+    packed::PositionKey,
     parquet::{Input, PrefetchTimes, Prefetcher},
     parquet_to_positions::{
         hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotEntries, HotMap, Sample},
@@ -79,7 +79,7 @@ struct Estimate {
     /// Records of all games, excluding records of hot positions.
     records: u64,
     /// Hot positions and their estimated records.
-    hot: Vec<(Zobrist96, u64)>,
+    hot: Vec<(PositionKey, u64)>,
     months: u64,
     /// Ratio of scratch chunks to record bytes.
     scratch_ratio: f64,
@@ -360,7 +360,7 @@ pub fn convert(
     create_empty_dir(&out.join(COLD_DIR))?;
     create_empty_dir(&out.join(POSITIONS_DIR))?;
 
-    let hot_set: IntSet<Zobrist96> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
+    let hot_set: IntSet<PositionKey> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
     let sst = SstContext {
         // Cold keys are dense prefixes of the hash space: every lookup
         // hits a group, so a filter would not help.
@@ -585,7 +585,7 @@ struct ScatterConfig<'a> {
     io_depth: usize,
     direct: bool,
     counters: &'a Counters,
-    hot_set: &'a IntSet<Zobrist96>,
+    hot_set: &'a IntSet<PositionKey>,
     max_ply: Option<usize>,
 }
 

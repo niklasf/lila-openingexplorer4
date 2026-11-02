@@ -6,7 +6,7 @@ use shakmaty::{KnownOutcome, packed::PackedUciMove};
 use crate::{
     intermediate::GlobalGameSeq,
     packed::{
-        CellKey, GameId, GroupHeader, Month, Rating, RatingGroup, Speed, Zobrist96, outcome_bits,
+        CellKey, GameId, GroupHeader, Month, PositionKey, Rating, RatingGroup, Speed, outcome_bits,
         outcome_from_bits,
     },
 };
@@ -16,11 +16,11 @@ pub struct IntermediateEntry(pub [u8; IntermediateEntry::SIZE]);
 
 impl IntermediateEntry {
     pub const SIZE: usize = 30;
-    pub const KEY_SIZE: usize = Zobrist96::SIZE;
+    pub const KEY_SIZE: usize = PositionKey::SIZE;
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        hash: Zobrist96,
+        hash: PositionKey,
         month: Month,
         m: PackedUciMove,
         speed: Option<Speed>,
@@ -47,8 +47,8 @@ impl IntermediateEntry {
     }
 
     #[inline]
-    pub fn hash(&self) -> Zobrist96 {
-        Zobrist96::unpack(&mut &self.0[..Zobrist96::SIZE])
+    pub fn hash(&self) -> PositionKey {
+        PositionKey::unpack(&mut &self.0[..PositionKey::SIZE])
     }
 
     #[inline]
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn test_intermediate_entry_roundtrip() {
         arbtest(|u| {
-            let hash: Zobrist96 = u.arbitrary()?;
+            let hash: PositionKey = u.arbitrary()?;
             let month: Month = u.arbitrary()?;
             let m = PackedUciMove::pack(u.arbitrary()?);
             let speed: Option<Speed> = u.arbitrary()?;

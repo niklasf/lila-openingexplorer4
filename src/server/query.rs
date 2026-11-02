@@ -371,6 +371,27 @@ mod tests {
     }
 
     #[test]
+    fn test_variants() {
+        for (variant, expected) in [
+            ("standard", Variant::Chess),
+            ("chess960", Variant::Chess),
+            ("fromPosition", Variant::Chess),
+            ("crazyhouse", Variant::Crazyhouse),
+        ] {
+            assert_eq!(
+                lichess(&format!("variant={variant}")).unwrap().play.variant,
+                expected
+            );
+        }
+        // Chess960 positions with castling rights in X-FEN notation.
+        let q = lichess(
+            "variant=chess960&fen=bbnrnkrq%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FBBNRNKRQ+w+KQkq+-+0+1&play=e1f3",
+        )
+        .unwrap();
+        assert!(q.play.position(&Openings::default()).is_ok());
+    }
+
+    #[test]
     fn test_play() {
         let q = lichess(
             "variant=standard&fen=rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR+w+KQkq+-+0+1&play=e2e4%2Ce7e5",

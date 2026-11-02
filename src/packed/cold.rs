@@ -1,4 +1,4 @@
-use crate::packed::{GameId, Zobrist96};
+use crate::packed::{GameId, PositionKey};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ColdKey {
@@ -12,7 +12,7 @@ impl ColdKey {
     /// Further hash bytes stored in each item of the group.
     pub const SUFFIX_SIZE: usize = 2;
 
-    pub fn new(hash: &Zobrist96) -> ColdKey {
+    pub fn new(hash: &PositionKey) -> ColdKey {
         ColdKey::from_hash_bytes(hash.as_bytes())
     }
 
@@ -105,10 +105,10 @@ impl ColdGroup {
 mod tests {
     use super::*;
 
-    fn hash(bytes: [u8; 6]) -> Zobrist96 {
-        let mut inner = [0xab; Zobrist96::SIZE];
+    fn hash(bytes: [u8; 6]) -> PositionKey {
+        let mut inner = [0xab; PositionKey::SIZE];
         inner[..6].copy_from_slice(&bytes);
-        Zobrist96::from_bytes(inner)
+        PositionKey::from_bytes(inner)
     }
 
     fn game(n: u64) -> GameId {

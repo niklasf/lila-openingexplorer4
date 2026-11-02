@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::{LichessEntry, Month, Zobrist96},
+    packed::{LichessEntry, Month, PositionKey},
     parquet::Input,
     parquet_to_positions::replay::Replayer,
 };
@@ -42,7 +42,7 @@ pub struct Sample {
     /// Distinct months of the valid sampled games.
     pub months: u64,
     /// Records per hash, within the first `SAMPLE_PLIES` of each game.
-    counts: Vec<(Zobrist96, u64)>,
+    counts: Vec<(PositionKey, u64)>,
 }
 
 impl Sample {
@@ -56,7 +56,7 @@ impl Sample {
             for _ in 0..threads.clamp(1, samples.max(1)) {
                 s.spawn(|| {
                     let mut replayer = Replayer::new(max_ply);
-                    let mut counts: IntMap<Zobrist96, u64> = IntMap::default();
+                    let mut counts: IntMap<PositionKey, u64> = IntMap::default();
                     let mut months: HashSet<Month> = HashSet::new();
                     let (mut rows, mut records) = (0, 0);
                     // Sequence numbers do not matter for the sample.
@@ -75,7 +75,7 @@ impl Sample {
                             records += replayer.len() as u64;
                             for hash in replayer.hashes_before(SAMPLE_PLIES) {
                                 *counts
-                                    .entry(Zobrist96::new(hash, info.variant))
+                                    .entry(PositionKey::from_zobrist(hash, info.variant))
                                     .or_default() += 1;
                             }
                         }
@@ -90,7 +90,7 @@ impl Sample {
 
         let (mut sampled_rows, mut records) = (0, 0);
         let mut months = HashSet::new();
-        let mut counts: IntMap<Zobrist96, u64> = IntMap::default();
+        let mut counts: IntMap<PositionKey, u64> = IntMap::default();
         for (thread_rows, thread_records, thread_months, thread_counts) in
             results.into_inner().expect("results")
         {
@@ -101,7 +101,7 @@ impl Sample {
                 *counts.entry(hash).or_default() += count;
             }
         }
-        let mut counts: Vec<(Zobrist96, u64)> = counts
+        let mut counts: Vec<(PositionKey, u64)> = counts
             .into_iter()
             .filter(|&(_, count)| count >= MIN_SAMPLE_COUNT)
             .collect();
@@ -116,7 +116,7 @@ impl Sample {
 
     /// Hashes with at least `threshold` estimated records in an input of
     /// `rows` rows, most frequent first, and their estimated records.
-    pub fn hot(&self, rows: u64, threshold: u64) -> Vec<(Zobrist96, u64)> {
+    pub fn hot(&self, rows: u64, threshold: u64) -> Vec<(PositionKey, u64)> {
         let scale = rows as f64 / self.sampled_rows as f64;
         self.counts
             .iter()

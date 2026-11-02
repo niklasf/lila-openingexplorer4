@@ -66,13 +66,13 @@ mod tests {
     use super::*;
     use crate::{
         intermediate::GlobalGameSeq,
-        packed::{GroupHeader, Month, Rating, RatingGroup, Speed, Zobrist96},
+        packed::{GroupHeader, Month, PositionKey, Rating, RatingGroup, Speed},
     };
 
     #[test]
     fn test_packers_agree() {
         arbtest(|u| {
-            let hash: Zobrist96 = u.arbitrary()?;
+            let hash: PositionKey = u.arbitrary()?;
             let moves = [
                 UciMove::Normal {
                     from: Square::E2,

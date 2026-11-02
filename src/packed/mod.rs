@@ -7,8 +7,8 @@ mod int;
 mod lax_date;
 mod month;
 mod moves;
+mod position_key;
 mod rating;
-mod zobrist;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
 pub use cold::{ColdGroup, ColdKey};
@@ -27,5 +27,5 @@ pub use int::{pack_int, pack_uint, unpack_int, unpack_uint};
 pub use lax_date::{InvalidLaxDate, LaxDate};
 pub use month::{InvalidMonth, LaxMonth, Month};
 pub use moves::{InvalidPackedMoves, PackedMoves, PackedMovesDecoder, PackedMovesEncoder};
+pub use position_key::PositionKey;
 pub use rating::{InvalidRating, Rating, RatingGroup, RatingGroups};
-pub use zobrist::Zobrist96;

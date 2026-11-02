@@ -8,7 +8,7 @@ use shakmaty::{
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::{BorrowedLichessGame, GameId, Month, PackedMovesDecoder, Rating, Speed, Zobrist96},
+    packed::{BorrowedLichessGame, GameId, Month, PackedMovesDecoder, PositionKey, Rating, Speed},
 };
 
 /// A position reached in a game, and the move that was eventually played
@@ -140,7 +140,7 @@ impl Replayer {
         let info = *info;
         self.visits.iter().map(move |(&hash, visit)| {
             IntermediateEntry::new(
-                Zobrist96::new(hash, info.variant),
+                PositionKey::from_zobrist(hash, info.variant),
                 info.month,
                 visit.m,
                 info.speed,

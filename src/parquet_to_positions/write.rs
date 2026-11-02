@@ -11,7 +11,7 @@ use rocksdb::{EnvOptions, Options};
 
 use crate::{
     intermediate::{EntryPacker, IntermediateEntry},
-    packed::{ColdGroup, ColdKey, Zobrist96},
+    packed::{ColdGroup, ColdKey, PositionKey},
     parquet_to_positions::{
         hot::HotEntry,
         partition::{BUCKETS, Partition, bucket},
@@ -159,7 +159,7 @@ pub fn write_partition(
 }
 
 fn hash_bytes(entry: &IntermediateEntry) -> &[u8] {
-    &entry.0[..Zobrist96::SIZE]
+    &entry.0[..PositionKey::SIZE]
 }
 
 /// Writes the keys of one column family for sorted buckets and sorted hot
@@ -221,13 +221,13 @@ fn write_range(
             (Family::Positions, [_]) => (),
             (Family::Positions, _) => {
                 while let Some((key, value)) =
-                    hot.next_if(|(key, _)| key[..Zobrist96::SIZE] < *hash)
+                    hot.next_if(|(key, _)| key[..PositionKey::SIZE] < *hash)
                 {
                     writer.put(key, value)?;
                 }
                 debug_assert!(
                     hot.peek()
-                        .is_none_or(|(key, _)| key[..Zobrist96::SIZE] != *hash),
+                        .is_none_or(|(key, _)| key[..PositionKey::SIZE] != *hash),
                     "hot hash in partition records"
                 );
                 packer.pack_sorted(run, buf);

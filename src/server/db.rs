@@ -12,7 +12,7 @@ use rocksdb::{
 use thiserror::Error;
 
 use crate::{
-    packed::{ColdKey, GameId, Zobrist96},
+    packed::{ColdKey, GameId, PositionKey},
     sst::SstConfig,
 };
 
@@ -227,7 +227,7 @@ impl Database {
     /// than one game.
     pub fn positions_entry(
         &self,
-        hash: &Zobrist96,
+        hash: &PositionKey,
         fill_cache: bool,
     ) -> Result<Option<DBPinnableSlice<'_>>, rocksdb::Error> {
         self.db.get_pinned_cf_opt(
@@ -241,7 +241,7 @@ impl Database {
     /// validated by replaying them).
     pub fn cold_candidates(
         &self,
-        hash: &Zobrist96,
+        hash: &PositionKey,
         fill_cache: bool,
     ) -> Result<Vec<GameId>, rocksdb::Error> {
         let key = ColdKey::new(hash);
