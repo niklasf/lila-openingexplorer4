@@ -16,8 +16,8 @@ chess games (currently ~10 B rated games across all variants, growing fast).
 
 Overall features:
 
-* [ ] Lichess games
-* [ ] Master games
+* [x] Lichess games
+* [x] Master games
 * [ ] Broadcast games
 * [ ] Lichess games indexed by player (aka personal opening explorer)
 
