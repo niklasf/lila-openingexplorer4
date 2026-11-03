@@ -55,7 +55,6 @@ Overall features:
 Critical performance work:
 
 * [x] Stress testing tool
-* [ ] Recheck parallel game loading
 * [x] Determine best disk layout and migration strategy
 * [ ] Document recommended options for each workload
 * [ ] Investigate why LRU beats CLOCK
@@ -64,10 +63,13 @@ Critical performance work:
 * [x] Make cold optional
 * [ ] Partial sorting
 * [ ] Recheck compression on latest SSTs
-* [ ] Elias-Fano vs rice on cold entries
-* [ ] Remove sampling cache admission
-* [ ] 16k blocks for parquet_to_games
+* [x] Elias-Fano vs rice on cold entries
+* [x] Optimize SST block sizes
+
+Needs HDDs:
+
 * [ ] Optimize blocking thread count
+* [ ] Recheck parallel game loading
 
 Minor things:
 

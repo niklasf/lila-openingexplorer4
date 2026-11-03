@@ -50,7 +50,7 @@ struct Args {
     #[clap(long, default_value = "2g")]
     sst_target_size: ByteSize,
     /// Block size of the SST files.
-    #[clap(long, default_value = "4096")]
+    #[clap(long, default_value = "16384")]
     sst_block_size: usize,
     /// Zstd level of the SST files, or 0 for no compression.
     #[clap(long, default_value = "3", value_parser = zstd_level())]
