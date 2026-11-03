@@ -2,7 +2,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, process, thread, ti
 
 use clap::{Args, Parser, Subcommand};
 use lila_openingexplorer4::{
-    server::{AppConfig, Database, DbConfig, Kind, admission::CacheAdmission, ingest, serve},
+    server::{AppConfig, Database, DbConfig, Kind, ingest, serve},
     util::ByteSize,
 };
 use tikv_jemallocator::Jemalloc;
@@ -117,10 +117,6 @@ struct ServeArgs {
     /// column family.
     #[arg(long)]
     no_cold: bool,
-    /// Which lookups fill the block cache, by the ply of the position, as
-    /// PLY:PERCENT tiers and the percentage for deeper plies.
-    #[arg(long, default_value = "15:100,20:5,25:2,1", help_heading = "Database")]
-    cache_admission: CacheAdmission,
     #[command(flatten)]
     db_opts: DbArgs,
     /// Concurrent database requests. Defaults to half the available
@@ -218,7 +214,6 @@ fn run(kind: Kind, args: ServeArgs) {
         blocking_threads,
         max_ply: (args.max_ply > 0).then_some(args.max_ply),
         cold: !args.no_cold,
-        admission: args.cache_admission,
         openings_dir: args.openings_dir,
         no_openings: args.no_openings,
     };

@@ -59,7 +59,7 @@ Critical performance work:
 * [x] Determine best disk layout and migration strategy
 * [ ] Document recommended options for each workload
 * [ ] Investigate why LRU beats CLOCK
-* [ ] fill_cache sampling heuristic
+* [x] Investigate cache admission policy
 * [ ] cold-path entry synthesis
 * [x] Make cold optional
 * [ ] Partial sorting

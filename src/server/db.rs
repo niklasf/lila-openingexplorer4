@@ -224,66 +224,36 @@ impl Database {
         self.db.cf_handle(name).expect("column family")
     }
 
-    fn read_options(fill_cache: bool) -> ReadOptions {
-        let mut opts = ReadOptions::default();
-        opts.fill_cache(fill_cache);
-        opts
-    }
-
     /// The packed `LichessEntry` of a position, if it was reached by more
     /// than one game.
     pub fn positions_entry(
         &self,
         hash: &PositionKey,
-        fill_cache: bool,
     ) -> Result<Option<DBPinnableSlice<'_>>, rocksdb::Error> {
-        self.db.get_pinned_cf_opt(
-            self.cf(POSITIONS_CF),
-            hash.as_bytes(),
-            &Self::read_options(fill_cache),
-        )
+        self.db
+            .get_pinned_cf(self.cf(POSITIONS_CF), hash.as_bytes())
     }
 
     /// Games that may have reached the position exactly once (to be
     /// validated by replaying them).
-    pub fn cold_candidates(
-        &self,
-        hash: &PositionKey,
-        fill_cache: bool,
-    ) -> Result<Vec<GameIndex>, rocksdb::Error> {
+    pub fn cold_candidates(&self, hash: &PositionKey) -> Result<Vec<GameIndex>, rocksdb::Error> {
         let key = ColdKey::new(hash);
         Ok(self
             .db
-            .get_pinned_cf_opt(
-                self.cf(COLD_CF),
-                key.prefix(),
-                &Self::read_options(fill_cache),
-            )?
+            .get_pinned_cf(self.cf(COLD_CF), key.prefix())?
             .map_or_else(Vec::new, |group| key.candidates(&group)))
     }
 
     /// The value of a game (see `unpack_game_value`).
-    pub fn game(
-        &self,
-        index: GameIndex,
-        fill_cache: bool,
-    ) -> Result<Option<DBPinnableSlice<'_>>, rocksdb::Error> {
-        self.db.get_pinned_cf_opt(
-            self.cf(GAMES_CF),
-            index.to_bytes(),
-            &Self::read_options(fill_cache),
-        )
+    pub fn game(&self, index: GameIndex) -> Result<Option<DBPinnableSlice<'_>>, rocksdb::Error> {
+        self.db.get_pinned_cf(self.cf(GAMES_CF), index.to_bytes())
     }
 
     /// The index of a game, if the database has the map of game ids.
     pub fn game_index(&self, id: GameId) -> Result<Option<GameIndex>, rocksdb::Error> {
         Ok(self
             .db
-            .get_pinned_cf_opt(
-                self.cf(GAME_IDS_CF),
-                id.to_bytes(),
-                &Self::read_options(true),
-            )?
+            .get_pinned_cf(self.cf(GAME_IDS_CF), id.to_bytes())?
             .map(|value| GameIndex::unpack(&mut &value[..])))
     }
 
@@ -292,17 +262,11 @@ impl Database {
     pub fn games(
         &self,
         indexes: &[GameIndex],
-        fill_cache: bool,
     ) -> Result<Vec<Option<DBPinnableSlice<'_>>>, rocksdb::Error> {
         let keys: Vec<[u8; GameIndex::SIZE]> =
             indexes.iter().map(|index| index.to_bytes()).collect();
         self.db
-            .batched_multi_get_cf_opt(
-                self.cf(GAMES_CF),
-                &keys,
-                false,
-                &Self::read_options(fill_cache),
-            )
+            .batched_multi_get_cf_opt(self.cf(GAMES_CF), &keys, false, &ReadOptions::default())
             .into_iter()
             .collect()
     }

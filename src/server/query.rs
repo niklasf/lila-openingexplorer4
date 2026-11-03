@@ -109,9 +109,6 @@ impl From<RawPlay> for Play {
 pub struct PlayPosition {
     pub pos: VariantPosition,
     pub opening: Option<Opening>,
-    /// Plies from the root position, approximately, trusting the move counters
-    /// of the root setup.
-    pub ply: u32,
 }
 
 impl Play {
@@ -129,13 +126,9 @@ impl Play {
             pos.play_unchecked(m);
             opening = openings.classify_exact(&pos).or(opening);
         }
-        let ply = (u32::from(pos.fullmoves()) - 1)
-            .saturating_mul(2)
-            .saturating_add(pos.turn().fold_wb(0, 1));
         Ok(PlayPosition {
             pos,
             opening: opening.cloned(),
-            ply,
         })
     }
 }
@@ -398,7 +391,7 @@ mod tests {
         )
         .unwrap();
         let pos = q.play.position(&Openings::default()).unwrap();
-        assert_eq!(pos.ply, 2);
+        assert_eq!(pos.pos.fullmoves().get(), 2);
         assert_eq!(q.play, lichess("play=e2e4,e7e5").unwrap().play);
         assert_eq!(
             lichess("fen=&play=").unwrap().play,

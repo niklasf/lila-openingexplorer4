@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     ops::Deref,
     path::PathBuf,
-    sync::{Arc, RwLock, atomic::AtomicU64},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -30,7 +30,6 @@ use crate::{
         RatingGroup, unpack_game_value,
     },
     server::{
-        admission::CacheAdmission,
         db::Database,
         explore::{
             GameRef, MASTERS_TOP_CANDIDATES, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
@@ -93,8 +92,6 @@ pub struct AppConfig {
     pub max_ply: Option<usize>,
     /// Look up cold positions (reached by a single game).
     pub cold: bool,
-    /// Which lookups fill the block cache.
-    pub admission: CacheAdmission,
     /// Directory with a.tsv to e.tsv of chess-openings, instead of
     /// downloading them.
     pub openings_dir: Option<PathBuf>,
@@ -142,26 +139,17 @@ pub struct AppState {
     cache: Cache<ExploreQuery, Bytes>,
     semaphore: Semaphore,
     metrics: Metrics,
-    /// For sampling which deep positions fill the block cache.
-    sample: AtomicU64,
 }
 
 type Shared = Arc<AppState>;
 
 impl AppState {
-    /// Whether a lookup of a position at the given ply should fill the
-    /// block cache.
-    fn fill_cache(&self, ply: u32) -> bool {
-        self.config.admission.fill(ply, &self.sample)
-    }
-
     /// The packed entry of a position: from the positions column family,
     /// or (unless disabled) synthesized from the single game that reached
     /// it.
-    fn entry(&self, pos: &VariantPosition, ply: u32) -> Result<Option<Entry<'_>>, rocksdb::Error> {
+    fn entry(&self, pos: &VariantPosition) -> Result<Option<Entry<'_>>, rocksdb::Error> {
         let hash = PositionKey::new(pos);
-        let fill_cache = self.fill_cache(ply);
-        if let Some(entry) = self.db.positions_entry(&hash, fill_cache)? {
+        if let Some(entry) = self.db.positions_entry(&hash)? {
             self.metrics.positions_hits.inc();
             return Ok(Some(Entry::Pinned(entry)));
         }
@@ -169,18 +157,17 @@ impl AppState {
             self.metrics.misses.inc();
             return Ok(None);
         }
-        let candidates = self.db.cold_candidates(&hash, fill_cache)?;
+        let candidates = self.db.cold_candidates(&hash)?;
         if candidates.is_empty() {
             self.metrics.misses.inc();
             return Ok(None);
         }
         let mut entry = LichessEntry::new();
         let mut found = false;
-        for (id, game) in candidates.iter().zip(self.load_games(
-            &candidates,
-            fill_cache,
-            &self.metrics.cold_games_loaded,
-        )?) {
+        for (id, game) in candidates
+            .iter()
+            .zip(self.load_games(&candidates, &self.metrics.cold_games_loaded)?)
+        {
             let Some(game) = game else {
                 log::warn!("cold candidate {id} not found in games");
                 continue;
@@ -219,13 +206,12 @@ impl AppState {
     fn load_games(
         &self,
         ids: &[GameIndex],
-        fill_cache: bool,
         loaded: &Counter,
     ) -> Result<Vec<Option<Vec<u8>>>, rocksdb::Error> {
         loaded.add(ids.len() as u64);
         Ok(self
             .db
-            .games(ids, fill_cache)?
+            .games(ids)?
             .into_iter()
             .map(|game| game.map(|game| game.to_vec()))
             .collect())
@@ -293,8 +279,8 @@ impl AppState {
     }
 
     fn lichess(&self, query: &LichessQuery, play: PlayPosition) -> Result<Bytes, rocksdb::Error> {
-        let PlayPosition { pos, opening, ply } = play;
-        let entry = self.entry(&pos, ply)?;
+        let PlayPosition { pos, opening } = play;
+        let entry = self.entry(&pos)?;
         let bytes: &[u8] = entry.as_deref().unwrap_or(&[]);
         let prepared = prepare_lichess(bytes, &query.filter, &query.limits, query.history);
 
@@ -304,11 +290,7 @@ impl AppState {
         ids.extend(prepared.recent_games.iter().map(|g| g.id));
         let top_offset = ids.len();
         ids.extend(prepared.top_games.iter().map(|g| g.id));
-        let games = self.load_games(
-            &ids,
-            self.fill_cache(ply),
-            &self.metrics.response_games_loaded,
-        )?;
+        let games = self.load_games(&ids, &self.metrics.response_games_loaded)?;
         attach_single_games(&mut moves, &games, false);
 
         let response = ExplorerResponse {
@@ -343,8 +325,8 @@ impl AppState {
     }
 
     fn masters(&self, query: &MastersQuery, play: PlayPosition) -> Result<Bytes, rocksdb::Error> {
-        let PlayPosition { pos, opening, ply } = play;
-        let entry = self.entry(&pos, ply)?;
+        let PlayPosition { pos, opening } = play;
+        let entry = self.entry(&pos)?;
         let bytes: &[u8] = entry.as_deref().unwrap_or(&[]);
         let prepared = prepare_masters(
             bytes,
@@ -357,11 +339,7 @@ impl AppState {
         let mut moves = self.explorer_moves(&pos, prepared.moves, &mut ids);
         let candidates_offset = ids.len();
         ids.extend(prepared.candidates.iter().map(|g| g.id));
-        let games = self.load_games(
-            &ids,
-            self.fill_cache(ply),
-            &self.metrics.response_games_loaded,
-        )?;
+        let games = self.load_games(&ids, &self.metrics.response_games_loaded)?;
         attach_single_games(&mut moves, &games, true);
 
         // Rank the candidates by their actual ratings.
@@ -419,7 +397,7 @@ impl AppState {
     fn pgn(&self, id: GameId) -> Result<String, Error> {
         self.metrics.pgn_requests.inc();
         let index = self.db.game_index(id)?.ok_or(Error::NotFound)?;
-        let game = self.db.game(index, true)?.ok_or(Error::NotFound)?;
+        let game = self.db.game(index)?.ok_or(Error::NotFound)?;
         let (id, game) = unpack_game_value(&game);
         Ok(masters_pgn(id, &game))
     }
@@ -686,7 +664,6 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         semaphore: Semaphore::new(config.blocking_threads),
         openings: RwLock::new(openings),
         metrics: Metrics::default(),
-        sample: AtomicU64::new(0),
         config,
         db,
     });
