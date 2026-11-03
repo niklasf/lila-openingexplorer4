@@ -27,8 +27,8 @@ pub struct PreparedMove {
     pub stats: SubStats,
     /// The only game, if the move was played exactly once.
     pub game: Option<GameIndex>,
-    /// Highest rank seen among the games of the move, and its game.
-    latest: Option<(u64, GameIndex)>,
+    /// Most recent game seen among the games of the move.
+    latest: Option<GameIndex>,
 }
 
 impl PreparedMove {
@@ -41,10 +41,8 @@ impl PreparedMove {
         }
     }
 
-    fn see_game(&mut self, rank: u64, id: GameIndex) {
-        if self.latest.is_none_or(|(latest, _)| latest < rank) {
-            self.latest = Some((rank, id));
-        }
+    fn see_game(&mut self, id: GameIndex) {
+        self.latest = self.latest.max(Some(id));
     }
 
     /// Finishes the move, once all its cells are aggregated: whether it has
@@ -53,10 +51,7 @@ impl PreparedMove {
         if self.stats.games() == 0 {
             return None;
         }
-        self.game = self
-            .latest
-            .filter(|_| self.stats.games() == 1)
-            .map(|(_, id)| id);
+        self.game = self.latest.filter(|_| self.stats.games() == 1);
         Some(self)
     }
 }
@@ -66,9 +61,8 @@ impl PreparedMove {
 pub struct GameRef {
     pub group: RatingGroup,
     pub speed: Option<Speed>,
-    /// Chronological rank within the entry.
-    pub rank: u64,
     pub m: PackedUciMove,
+    /// Chronological within the entry.
     pub id: GameIndex,
 }
 
@@ -176,43 +170,47 @@ fn lower_bound(group: RatingGroup) -> i32 {
 
 /// Key of a top game: closest to the highscore of its speed, then most
 /// recent.
-pub(crate) fn top_key(speed: Option<Speed>, group: RatingGroup, rank: u64) -> (Reverse<i32>, u64) {
-    (Reverse(highscore(speed) - lower_bound(group)), rank)
+pub(crate) fn top_key(
+    speed: Option<Speed>,
+    group: RatingGroup,
+    id: GameIndex,
+) -> (Reverse<i32>, GameIndex) {
+    (Reverse(highscore(speed) - lower_bound(group)), id)
 }
 
 /// Which games of the matching cells to keep while aggregating.
 pub(crate) struct GameSelection {
     /// Most recent games, enough to fill the recent games after removing
     /// the top games.
-    pub(crate) recent: TopK<u64, GameRef>,
+    pub(crate) recent: TopK<GameIndex, GameRef>,
     /// Best games among the top rating groups.
-    pub(crate) top: TopK<(Reverse<i32>, u64), GameRef>,
+    pub(crate) top: TopK<(Reverse<i32>, GameIndex), GameRef>,
     pub(crate) top_group: Option<RatingGroup>,
     /// Masters: most recent games of the highest groups.
-    pub(crate) candidates: TopK<(RatingGroup, u64), GameRef>,
+    pub(crate) candidates: TopK<(RatingGroup, GameIndex), GameRef>,
 }
 
 impl GameSelection {
-    /// Whether any game of a cell whose best game has the given rank could
+    /// Whether any game of a cell whose newest game is the given one could
     /// be selected.
     pub(crate) fn accepts_cell(
         &self,
         speed: Option<Speed>,
         group: RatingGroup,
-        max_rank: u64,
+        newest: GameIndex,
     ) -> bool {
-        self.recent.accepts(&max_rank)
+        self.recent.accepts(&newest)
             || (self.top_group.is_some_and(|top_group| group >= top_group)
-                && self.top.accepts(&top_key(speed, group, max_rank)))
-            || self.candidates.accepts(&(group, max_rank))
+                && self.top.accepts(&top_key(speed, group, newest)))
+            || self.candidates.accepts(&(group, newest))
     }
 
     pub(crate) fn push(&mut self, g: GameRef) {
-        self.recent.push(g.rank, g);
+        self.recent.push(g.id, g);
         if self.top_group.is_some_and(|top_group| g.group >= top_group) {
-            self.top.push(top_key(g.speed, g.group, g.rank), g);
+            self.top.push(top_key(g.speed, g.group, g.id), g);
         }
-        self.candidates.push((g.group, g.rank), g);
+        self.candidates.push((g.group, g.id), g);
     }
 }
 
@@ -288,28 +286,23 @@ fn aggregate(
                 continue;
             }
             let games = games.as_deref_mut().expect("games wanted");
-            let Some((rank, id)) = cells.next_game() else {
+            let Some(id) = cells.next_game() else {
                 continue;
             };
-            pm.see_game(rank, id);
-            if !games.accepts_cell(header.speed, header.rating_group, rank) {
+            pm.see_game(id);
+            if !games.accepts_cell(header.speed, header.rating_group, id) {
                 games_done = true;
                 continue;
             }
             let game_ref = GameRef {
                 group: header.rating_group,
                 speed: header.speed,
-                rank,
                 m,
                 id,
             };
             games.push(game_ref);
-            while let Some((rank, id)) = cells.next_game() {
-                games.push(GameRef {
-                    rank,
-                    id,
-                    ..game_ref
-                });
+            while let Some(id) = cells.next_game() {
+                games.push(GameRef { id, ..game_ref });
             }
         }
     }
@@ -466,9 +459,7 @@ mod tests {
     use shakmaty::{Color, KnownOutcome, uci::UciMove};
 
     use super::*;
-    use crate::packed::{
-        CellKey, GameSeq, GroupHeader, LichessEntry, Rating, RatingGroups, Speeds,
-    };
+    use crate::packed::{CellKey, GroupHeader, LichessEntry, Rating, RatingGroups, Speeds};
 
     fn id(n: u64) -> GameIndex {
         GameIndex::new(n).unwrap()
@@ -491,7 +482,6 @@ mod tests {
                 ),
                 rating,
                 outcome,
-                GameSeq(seq),
                 id(seq),
             );
         };
@@ -633,12 +623,11 @@ mod tests {
                 .or_insert_with(|| PreparedMove::new(m));
             agg.add(pm, month, &cell.stats, collect_months);
             if let Some(games) = games.as_deref_mut() {
-                for (rank, id) in cell.games {
-                    pm.see_game(rank, id);
+                for id in cell.games {
+                    pm.see_game(id);
                     games.push(GameRef {
                         group: header.rating_group,
                         speed: header.speed,
-                        rank,
                         m,
                         id,
                     });
@@ -661,7 +650,12 @@ mod tests {
     fn dense_entry(u: &mut arbitrary::Unstructured) -> arbitrary::Result<LichessEntry> {
         let mut entry = LichessEntry::new();
         let moves = ["e2e4", "d2d4", "c2c4"];
+        // Chronological game indexes, as in real entries.
+        let mut month = 1400;
         for seq in 0..u.int_in_range(0..=400)? {
+            if u.ratio(1, 6)? {
+                month += 1;
+            }
             let uci: UciMove = moves[u.int_in_range(0..=2)?].parse().unwrap();
             let speed = if u.arbitrary()? {
                 Speed::Blitz
@@ -670,7 +664,7 @@ mod tests {
             };
             let rating = Rating::try_from(u.int_in_range(1500..=2600)? / 500 * 500).unwrap();
             let outcome: KnownOutcome = u.arbitrary()?;
-            let month = Month::from_months_since_jan_1900(u.int_in_range(1400..=1460)?);
+            let month = Month::from_months_since_jan_1900(month);
             entry.add_game(
                 CellKey::new(
                     PackedUciMove::pack(uci),
@@ -682,7 +676,6 @@ mod tests {
                 ),
                 rating,
                 outcome,
-                GameSeq(seq),
                 id(seq + 1),
             );
         }
@@ -742,7 +735,7 @@ mod tests {
             );
             assert_eq!(a.total, b.total);
             assert_eq!(moves(&a.moves), moves(&b.moves));
-            // Ties in rank do not occur: ranks are unique within an entry.
+            // Ties do not occur: game indexes are unique within an entry.
             assert_eq!(game_ids(&a.top_games), game_ids(&b.top_games));
             assert_eq!(game_ids(&a.recent_games), game_ids(&b.recent_games));
             let segments = |p: &LichessPrepared| {

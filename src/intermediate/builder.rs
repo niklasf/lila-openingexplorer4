@@ -1,6 +1,6 @@
 use crate::{
     intermediate::IntermediateEntry,
-    packed::{CellKey, EntryCell, GAMES_PER_CELL, GameIndex, GameSeq, LichessEntry, SubStats},
+    packed::{CellKey, EntryCell, GAMES_PER_CELL, GameIndex, LichessEntry, SubStats},
 };
 
 impl LichessEntry {
@@ -10,7 +10,6 @@ impl LichessEntry {
             record.cell_key(),
             record.rating(),
             record.outcome(),
-            GameSeq(record.game_index().get()),
             record.game_index(),
         );
     }
@@ -21,7 +20,7 @@ impl LichessEntry {
 pub struct EntryPacker {
     /// Cells, with the start and end index of their kept games.
     cells: Vec<(CellKey, SubStats, usize, usize)>,
-    games: Vec<(GameSeq, GameIndex)>,
+    games: Vec<GameIndex>,
 }
 
 impl EntryPacker {
@@ -38,7 +37,7 @@ impl EntryPacker {
             self.games.extend(
                 run[run.len().saturating_sub(GAMES_PER_CELL)..]
                     .iter()
-                    .map(|record| (GameSeq(record.game_index().get()), record.game_index())),
+                    .map(IntermediateEntry::game_index),
             );
             self.cells
                 .push((run[0].cell_key(), stats, start, self.games.len()));
@@ -110,7 +109,6 @@ mod tests {
                     CellKey::new(m, header, month),
                     rating,
                     outcome,
-                    GameSeq(seq),
                     GameIndex::new(seq).unwrap(),
                 );
             }

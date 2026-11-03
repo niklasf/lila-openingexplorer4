@@ -61,7 +61,9 @@ Critical performance work:
 * [ ] Investigate why LRU beats CLOCK
 * [ ] fill_cache sampling heuristic
 * [ ] cold-path entry synthesis
-* [ ] Make cold optional
+* [x] Make cold optional
+* [ ] Partial sorting
+* [ ] Recheck compression on latest SSTs
 
 Minor things:
 

@@ -13,13 +13,6 @@ use crate::packed::{
 /// this many.
 pub const GAMES_PER_CELL: usize = 8;
 
-/// Orders games of the same month within a `LichessEntry`: games are ranked
-/// by month, then by this number. Numbers are only comparable within one
-/// entry. Packing condenses them into ranks, and merging continues after the
-/// largest number of the entry.
-#[derive(Arbitrary, Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GameSeq(pub u64);
-
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct GroupHeader {
     pub speed: Option<Speed>,
@@ -210,20 +203,20 @@ impl CellKey {
     }
 }
 
-/// A cell to be packed: its statistics and games, ordered by `GameSeq`.
+/// A cell to be packed: its statistics and games, in ascending order.
 /// At least the most recent `min(GAMES_PER_CELL, games of the cell)` games
 /// must be given.
 #[derive(Debug, Copy, Clone)]
 pub struct EntryCell<'a> {
     pub key: CellKey,
     pub stats: SubStats,
-    pub games: &'a [(GameSeq, GameIndex)],
+    pub games: &'a [GameIndex],
 }
 
 impl<'a> EntryCell<'a> {
     /// The games that are packed: the most recent ones, exactly
     /// `min(GAMES_PER_CELL, games of the cell)` of them.
-    fn packed_games(&self) -> &'a [(GameSeq, GameIndex)] {
+    fn packed_games(&self) -> &'a [GameIndex] {
         let n = self.stats.games().min(GAMES_PER_CELL as u64) as usize;
         assert!(self.games.len() >= n, "cell is missing games");
         &self.games[self.games.len() - n..]
@@ -235,12 +228,12 @@ impl<'a> EntryCell<'a> {
 struct Cell {
     stats: SubStats,
     /// In any order, truncated to the most recent games once in a while.
-    games: Vec<(GameSeq, GameIndex)>,
+    games: Vec<GameIndex>,
 }
 
 impl Cell {
-    fn push_game(&mut self, seq: GameSeq, game: GameIndex) {
-        self.games.push((seq, game));
+    fn push_game(&mut self, game: GameIndex) {
+        self.games.push(game);
         if self.games.len() >= 4 * GAMES_PER_CELL {
             self.truncate_games();
         }
@@ -248,7 +241,7 @@ impl Cell {
 
     /// Sorts the games and keeps only the most recent ones.
     fn truncate_games(&mut self) {
-        self.games.sort_unstable_by_key(|(seq, _)| *seq);
+        self.games.sort_unstable();
         self.games
             .drain(..self.games.len().saturating_sub(GAMES_PER_CELL));
     }
@@ -269,7 +262,7 @@ impl Cell {
 /// tag    := uint(newest month << 2 | GroupFlags)
 /// multi  := [SubStats of all cells of the group] cell (uint(month delta) cell)*
 /// cell   := SubStats game*
-/// game   := uint(rank) GameIndex (5 bytes)
+/// game   := GameIndex (5 bytes)
 /// ```
 ///
 /// A cell holds the games of a month for a move and group. Months are
@@ -277,13 +270,13 @@ impl Cell {
 /// month of the previous cell. A group of a single month has neither a
 /// length nor a subtotal; a group of `SUBTOTAL_MIN_MONTHS` or more months
 /// has a subtotal. Each cell has exactly
-/// `min(GAMES_PER_CELL, games of the cell)` games, the most recent ones, so
-/// that the first game of a cell has the highest rank. The rank of a game
-/// is its chronological position (by month, then `GameSeq`) among all
-/// packed games of the entry.
+/// `min(GAMES_PER_CELL, games of the cell)` games, the most recent ones
+/// (highest game indexes), newest first.
 ///
-/// Merging is associative: within a month, the games of a merged entry are
-/// considered more recent than the games of the entry it is merged into.
+/// Game indexes are chronological within a variant (the order of the
+/// parquet input), so newer months have higher game indexes. Readers rely on
+/// this to stop early, and to order games across cells. (Chess960 games are
+/// not strictly chronological, which is accepted.)
 #[derive(Default, Debug, Clone)]
 pub struct LichessEntry {
     cells: BTreeMap<CellKey, Cell>,
@@ -291,9 +284,19 @@ pub struct LichessEntry {
 
 impl Arbitrary<'_> for LichessEntry {
     fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
+        // Chronological game indexes, as in real entries.
+        let mut parts: Vec<(
+            shakmaty::uci::UciMove,
+            Option<Speed>,
+            Rating,
+            KnownOutcome,
+            Month,
+        )> = u.arbitrary_iter()?.collect::<arbitrary::Result<_>>()?;
+        parts.sort_by_key(|part| part.4);
         let mut entry = LichessEntry::new();
-        for (seq, part) in u.arbitrary_iter()?.enumerate() {
-            let (m, speed, rating, outcome, month, game) = part?;
+        let mut index = u.int_in_range(0..=1 << 32)?;
+        for (m, speed, rating, outcome, month) in parts {
+            index += u.int_in_range(1..=1000)?;
             let header = GroupHeader {
                 speed,
                 rating_group: RatingGroup::select(rating),
@@ -302,8 +305,7 @@ impl Arbitrary<'_> for LichessEntry {
                 CellKey::new(PackedUciMove::pack(m), header, month),
                 rating,
                 outcome,
-                GameSeq(seq as u64),
-                game,
+                GameIndex::new(index).expect("game index"),
             );
         }
         Ok(entry)
@@ -321,7 +323,6 @@ impl LichessEntry {
         key: CellKey,
         rating: Rating,
         outcome: KnownOutcome,
-        seq: GameSeq,
         game: GameIndex,
     ) {
         debug_assert_eq!(
@@ -331,7 +332,7 @@ impl LichessEntry {
         );
         let cell = self.cells.entry(key).or_default();
         cell.stats.add(rating, outcome);
-        cell.push_game(seq, game);
+        cell.push_game(game);
     }
 
     pub fn pack_entire(&mut self, buf: &mut Vec<u8>) {
@@ -348,21 +349,13 @@ impl LichessEntry {
         );
     }
 
-    /// Merges a packed entry into this entry. Within a month, its games are
-    /// considered more recent than all games of this entry.
+    /// Merges a packed entry into this entry.
     pub fn merge_unpack_entire(&mut self, bytes: &[u8]) {
-        let base = self
-            .cells
-            .values()
-            .flat_map(|cell| cell.games.iter().map(|(seq, _)| seq.0 + 1))
-            .max()
-            .unwrap_or(0);
-
         for view in EntryView::unpack_entire(bytes).cells() {
             let cell = self.cells.entry(view.key).or_default();
             cell.stats.merge(&view.stats);
-            for (rank, game) in view.games {
-                cell.push_game(GameSeq(base + rank), game);
+            for game in view.games {
+                cell.push_game(game);
             }
         }
     }
@@ -373,17 +366,6 @@ impl LichessEntry {
     where
         I: Iterator<Item = EntryCell<'a>> + Clone,
     {
-        let mut keys: Vec<(Month, GameSeq)> = cells
-            .clone()
-            .flat_map(|cell| {
-                cell.packed_games()
-                    .iter()
-                    .map(move |(seq, _)| (cell.key.month, *seq))
-            })
-            .collect();
-        keys.sort_unstable();
-        let rank = |month: Month, seq: GameSeq| keys.partition_point(|k| *k < (month, seq)) as u64;
-
         let mut cells = cells.peekable();
         let mut group: Vec<EntryCell<'a>> = Vec::new();
         let mut multi = Vec::new();
@@ -408,19 +390,14 @@ impl LichessEntry {
             }
             new_move = cells.peek().is_none_or(|next| next.key.m != first.key.m);
             buf.put_u8(first.key.header | if new_move { LAST_GROUP_OF_MOVE } else { 0 });
-            pack_group(buf, &mut multi, &group, &rank);
+            pack_group(buf, &mut multi, &group);
         }
     }
 }
 
 /// Packs the cells of one group (ascending months), using `multi` as
 /// scratch space.
-fn pack_group(
-    buf: &mut Vec<u8>,
-    multi: &mut Vec<u8>,
-    group: &[EntryCell<'_>],
-    rank: &impl Fn(Month, GameSeq) -> u64,
-) {
+fn pack_group(buf: &mut Vec<u8>, multi: &mut Vec<u8>, group: &[EntryCell<'_>]) {
     let rating_group = group[0].key.group_header().rating_group;
     let newest = group[group.len() - 1].key.month.months_since_jan_1900();
     let is_multi = group.len() > 1;
@@ -430,7 +407,7 @@ fn pack_group(
     flags.set(GroupFlags::HAS_SUBTOTAL, has_subtotal);
     pack_uint(buf, u64::from(newest) << 2 | flags.bits());
     if !is_multi {
-        pack_cell(buf, &group[0], rating_group, rank);
+        pack_cell(buf, &group[0], rating_group);
         return;
     }
 
@@ -448,7 +425,7 @@ fn pack_group(
         if i > 0 {
             pack_uint(multi, u64::from(prev_month - month));
         }
-        pack_cell(multi, cell, rating_group, rank);
+        pack_cell(multi, cell, rating_group);
         prev_month = month;
     }
     pack_uint(buf, multi.len() as u64);
@@ -456,17 +433,11 @@ fn pack_group(
 }
 
 /// Packs the statistics of a cell and its games, newest first.
-fn pack_cell(
-    buf: &mut Vec<u8>,
-    cell: &EntryCell<'_>,
-    rating_group: RatingGroup,
-    rank: &impl Fn(Month, GameSeq) -> u64,
-) {
+fn pack_cell(buf: &mut Vec<u8>, cell: &EntryCell<'_>, rating_group: RatingGroup) {
     cell.stats.pack(buf, rating_group);
     let games = cell.packed_games();
-    debug_assert!(games.is_sorted_by(|a, b| a.0 < b.0), "games not in order");
-    for (seq, game) in games.iter().rev() {
-        pack_uint(buf, rank(cell.key.month, *seq));
+    debug_assert!(games.is_sorted(), "games not in order");
+    for game in games.iter().rev() {
         game.pack(buf);
     }
 }
@@ -474,10 +445,7 @@ fn pack_cell(
 /// Skips a cell (statistics and games), returning its statistics.
 fn skip_cell(buf: &mut &[u8], rating_group: RatingGroup) -> SubStats {
     let stats = SubStats::unpack(buf, rating_group);
-    for _ in 0..stats.games().min(GAMES_PER_CELL as u64) {
-        unpack_uint(buf);
-        buf.advance(GameIndex::SIZE);
-    }
+    buf.advance(stats.games().min(GAMES_PER_CELL as u64) as usize * GameIndex::SIZE);
     stats
 }
 
@@ -655,15 +623,13 @@ impl<'a> GroupCells<'a> {
         })
     }
 
-    /// The next game of the current cell, with its rank in the entry. Games
-    /// are newest first, so the first game of a cell has the highest rank.
-    pub fn next_game(&mut self) -> Option<(u64, GameIndex)> {
+    /// The next game of the current cell. Games are newest first.
+    pub fn next_game(&mut self) -> Option<GameIndex> {
         if self.games_left == 0 {
             return None;
         }
         self.games_left -= 1;
-        let rank = unpack_uint(&mut self.buf);
-        Some((rank, GameIndex::unpack(&mut self.buf)))
+        Some(GameIndex::unpack(&mut self.buf))
     }
 }
 
@@ -689,8 +655,8 @@ impl<'a> Iterator for GroupCells<'a> {
 pub struct CellView<'a> {
     pub key: CellKey,
     pub stats: SubStats,
-    /// The most recent `min(GAMES_PER_CELL, games of the cell)` games, with
-    /// their rank in the entry, newest first.
+    /// The most recent `min(GAMES_PER_CELL, games of the cell)` games,
+    /// newest first.
     pub games: CellGames<'a>,
 }
 
@@ -714,22 +680,20 @@ impl<'a> Iterator for CellViews<'a> {
     }
 }
 
-/// Iterator over the packed games of a cell, newest first, with their rank
-/// in the entry.
+/// Iterator over the packed games of a cell, newest first.
 #[derive(Debug, Clone)]
 pub struct CellGames<'a> {
     buf: &'a [u8],
 }
 
 impl Iterator for CellGames<'_> {
-    type Item = (u64, GameIndex);
+    type Item = GameIndex;
 
-    fn next(&mut self) -> Option<(u64, GameIndex)> {
+    fn next(&mut self) -> Option<GameIndex> {
         if self.buf.is_empty() {
             return None;
         }
-        let rank = unpack_uint(&mut self.buf);
-        Some((rank, GameIndex::unpack(&mut self.buf)))
+        Some(GameIndex::unpack(&mut self.buf))
     }
 }
 
@@ -763,7 +727,7 @@ mod tests {
         GameIndex,
     );
 
-    fn add(entry: &mut LichessEntry, (m, speed, rating, outcome, month, game): Game, seq: u64) {
+    fn add(entry: &mut LichessEntry, (m, speed, rating, outcome, month, game): Game) {
         let header = GroupHeader {
             speed,
             rating_group: RatingGroup::select(rating),
@@ -772,13 +736,12 @@ mod tests {
             CellKey::new(PackedUciMove::pack(m), header, month),
             rating,
             outcome,
-            GameSeq(seq),
             game,
         );
     }
 
     /// Statistics of all cells in canonical order, and their packed games
-    /// in chronological order.
+    /// in ascending order.
     #[allow(clippy::type_complexity)]
     fn view(bytes: &[u8]) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameIndex)>) {
         let view = EntryView::unpack_entire(bytes);
@@ -786,18 +749,12 @@ mod tests {
         let mut games: Vec<_> = cells
             .iter()
             .flat_map(|cell| {
-                let ranks: Vec<_> = cell.games.clone().collect();
-                assert!(ranks.is_sorted_by(|a, b| a.0 > b.0), "games newest first");
-                ranks.into_iter().map(|(rank, game)| (rank, cell.key, game))
+                let games: Vec<_> = cell.games.clone().collect();
+                assert!(games.is_sorted_by(|a, b| a > b), "games newest first");
+                games.into_iter().map(|game| (game, cell.key))
             })
             .collect();
-        games.sort_unstable_by_key(|(rank, ..)| *rank);
-        assert!(
-            games
-                .iter()
-                .enumerate()
-                .all(|(i, (rank, ..))| i as u64 == *rank)
-        );
+        games.sort_unstable();
 
         // Groups are in canonical order and consistent with the cells.
         let mut group_cells = Vec::new();
@@ -829,10 +786,7 @@ mod tests {
 
         (
             cells,
-            games
-                .into_iter()
-                .map(|(_, key, game)| (key, game))
-                .collect(),
+            games.into_iter().map(|(game, key)| (key, game)).collect(),
         )
     }
 
@@ -848,23 +802,16 @@ mod tests {
         let mut games: Vec<_> = entry
             .cells
             .iter()
-            .flat_map(|(key, cell)| {
-                cell.games
-                    .iter()
-                    .map(|(seq, game)| ((key.month, *seq), *key, *game))
-            })
+            .flat_map(|(key, cell)| cell.games.iter().map(|game| (*game, *key)))
             .collect();
-        games.sort_unstable_by_key(|(order, ..)| *order);
+        games.sort_unstable();
         (
             entry
                 .cells
                 .iter()
                 .map(|(key, cell)| (*key, cell.stats))
                 .collect(),
-            games
-                .into_iter()
-                .map(|(_, key, game)| (key, game))
-                .collect(),
+            games.into_iter().map(|(game, key)| (key, game)).collect(),
         )
     }
 
@@ -944,7 +891,7 @@ mod tests {
                 Month::from_months_since_jan_1900(1400 + 3 * seq as u16),
                 GameIndex::new(seq).unwrap(),
             );
-            add(&mut entry, game, seq);
+            add(&mut entry, game);
         }
         let game: Game = (
             "e2e4".parse().unwrap(),
@@ -954,7 +901,7 @@ mod tests {
             Month::from_months_since_jan_1900(1400),
             GameIndex::new(256).unwrap(),
         );
-        add(&mut entry, game, 1000);
+        add(&mut entry, game);
 
         let buf = pack(&entry);
         let groups: Vec<_> = EntryView::unpack_entire(&buf).groups().collect();
@@ -979,8 +926,10 @@ mod tests {
         let first = cells.next_cell().unwrap();
         assert_eq!(first.key.month(), groups[1].newest_month);
         assert_eq!(first.stats.games(), 1);
-        let (rank, _) = cells.next_game().unwrap();
-        assert_eq!(rank, 2 * SUBTOTAL_MIN_MONTHS as u64);
+        assert_eq!(
+            cells.next_game(),
+            Some(GameIndex::new(2 * SUBTOTAL_MIN_MONTHS as u64 - 1).unwrap())
+        );
         assert_eq!(cells.next_game(), None);
         let second = cells.next_cell().unwrap();
         assert_eq!(
@@ -998,15 +947,13 @@ mod tests {
             // Adding all games to one entry is the same as merging entries
             // of consecutive parts.
             let mut all = LichessEntry::new();
-            let mut seq = 0;
             let mut packed_parts = Vec::new();
             for _ in 0..u.int_in_range(0..=4)? {
                 let mut part = LichessEntry::new();
-                for (part_seq, game) in u.arbitrary_iter()?.enumerate() {
+                for game in u.arbitrary_iter()? {
                     let game: Game = game?;
-                    add(&mut all, game, seq);
-                    add(&mut part, game, part_seq as u64);
-                    seq += 1;
+                    add(&mut all, game);
+                    add(&mut part, game);
                 }
                 packed_parts.push(pack(&part));
             }

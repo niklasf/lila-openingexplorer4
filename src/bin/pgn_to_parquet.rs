@@ -11,8 +11,11 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
 
-/// Converts PGN files (optionally zstd compressed) to a single parquet file,
-/// with one row per game, in the order of the files and their games.
+/// Converts PGN files (optionally zstd compressed) to a single parquet file.
+///
+/// Pass the files of each variant in chronological order (like the monthly
+/// lichess database dumps): rows are game indexes, which should be
+/// chronological by month within each variant.
 ///
 /// Unplayed games (fewer than two plies), unfinished games (without a known
 /// outcome), and games that cannot be parsed are skipped.

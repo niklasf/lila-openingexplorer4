@@ -75,13 +75,20 @@ pub fn read_legacy_ids(path: &Path) -> io::Result<FxHashMap<GameId, GameId>> {
 
 /// Collects PGN files from paths. Directories are walked recursively, and
 /// their `.pgn` files sorted by path, which is chronological for the
-/// `games/yyyy/mm/dd.pgn` layout of the masters database.
+/// `games/yyyy/mm/dd.pgn` layout of the masters database. Unknown months and
+/// days (`xx`) come first, because games are indexed under the earliest
+/// possible month, and game indexes (rows) must be chronological by month.
 pub fn collect_pgns(paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
         let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
             .map(|entry| entry.map(|e| e.path()))
             .collect::<io::Result<_>>()?;
-        entries.sort();
+        entries.sort_by_key(|path| {
+            let unknown = path
+                .file_stem()
+                .is_some_and(|stem| stem.as_encoded_bytes() == b"xx");
+            (!unknown, path.clone())
+        });
         for path in entries {
             if path.is_dir() {
                 walk(&path, out)?;

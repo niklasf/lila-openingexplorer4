@@ -15,8 +15,7 @@ pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
 pub use cold::{ColdGroup, ColdKey};
 pub use entry::{
     CellGames, CellHeader, CellKey, CellView, CellViews, EntryCell, EntryView, GAMES_PER_CELL,
-    GameSeq, GroupCells, GroupHeader, GroupView, GroupViews, LichessEntry, SUBTOTAL_MIN_MONTHS,
-    SubStats,
+    GroupCells, GroupHeader, GroupView, GroupViews, LichessEntry, SUBTOTAL_MIN_MONTHS, SubStats,
 };
 pub use game::{
     BorrowedEventInfo, BorrowedGamePlayer, BorrowedLichessGame, EventInfo, GamePlayer,

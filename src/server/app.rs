@@ -26,8 +26,8 @@ use tokio::{
 
 use crate::{
     packed::{
-        CellKey, GameId, GameIndex, GameSeq, GroupHeader, InvalidGameId, LichessEntry, PositionKey,
-        Rating, RatingGroup, unpack_game_value,
+        CellKey, GameId, GameIndex, GroupHeader, InvalidGameId, LichessEntry, PositionKey, Rating,
+        RatingGroup, unpack_game_value,
     },
     server::{
         admission::CacheAdmission,
@@ -176,11 +176,11 @@ impl AppState {
         }
         let mut entry = LichessEntry::new();
         let mut found = false;
-        for (seq, (id, game)) in candidates
-            .iter()
-            .zip(self.load_games(&candidates, fill_cache, &self.metrics.cold_games_loaded)?)
-            .enumerate()
-        {
+        for (id, game) in candidates.iter().zip(self.load_games(
+            &candidates,
+            fill_cache,
+            &self.metrics.cold_games_loaded,
+        )?) {
             let Some(game) = game else {
                 log::warn!("cold candidate {id} not found in games");
                 continue;
@@ -199,7 +199,6 @@ impl AppState {
                     ),
                     rating,
                     game.outcome,
-                    GameSeq(seq as u64),
                     *id,
                 );
                 found = true;
