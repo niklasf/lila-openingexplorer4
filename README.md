@@ -65,6 +65,9 @@ Critical performance work:
 * [ ] Partial sorting
 * [ ] Recheck compression on latest SSTs
 * [ ] Elias-Fano vs rice on cold entries
+* [ ] Remove sampling cache admission
+* [ ] 16k blocks for parquet_to_games
+* [ ] Optimize blocking thread count
 
 Minor things:
 

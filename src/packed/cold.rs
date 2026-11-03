@@ -43,7 +43,10 @@ impl ColdKey {
     /// of the group.
     pub fn candidates(&self, value: &[u8]) -> Vec<GameIndex> {
         let group = ColdGroupView::new(value);
-        let mut gaps = BitReader::at(group.bits, (group.count * u64::from(group.width)) as usize);
+        let mut gaps = BitReader::at(
+            group.bits,
+            (group.count * u64::from(ColdGroup::INDEX_BITS)) as usize,
+        );
         let mut candidates = Vec::new();
         let mut suffix = 0u64;
         for i in 0..group.count {
@@ -62,8 +65,8 @@ impl ColdKey {
 /// prefix. The items are sorted by suffix.
 ///
 /// ```text
-/// value := width (u8) uint(count) index* gap*   (bit-packed, least significant bit first)
-/// index := GameIndex, `width` bits
+/// value := uint(count) index* gap*   (bit-packed, least significant bit first)
+/// index := GameIndex, `ColdGroup::INDEX_BITS` bits
 /// gap   := suffix - previous suffix (the first from 0), Rice coded with
 ///          parameter `rice_parameter(count)`: (gap >> k) as unary ones, a
 ///          zero, the low k bits
@@ -74,18 +77,29 @@ impl ColdKey {
 /// matching items directly.
 #[derive(Debug)]
 pub struct ColdGroup {
-    /// Bits of each game index.
-    width: u32,
     prefix: Option<[u8; ColdKey::PREFIX_SIZE]>,
     items: Vec<(u16, GameIndex)>,
     value: Vec<u8>,
 }
 
 impl ColdGroup {
+    /// Bits of each game index: enough for 17.2 B games. Lichess had 8.34 B
+    /// games in 2026-11, growing by about 1.2 B a year, so this lasts until
+    /// about 2033.
+    pub const INDEX_BITS: u32 = 34;
+
     /// A group builder for game indexes below `games`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are too many games for `INDEX_BITS`.
     pub fn new(games: u64) -> ColdGroup {
+        assert!(
+            games <= 1 << ColdGroup::INDEX_BITS,
+            "{games} games do not fit into the {}-bit game indexes of cold positions",
+            ColdGroup::INDEX_BITS
+        );
         ColdGroup {
-            width: (u64::BITS - games.saturating_sub(1).leading_zeros()).max(1),
             prefix: None,
             items: Vec::new(),
             value: Vec::new(),
@@ -96,7 +110,10 @@ impl ColdGroup {
     /// if the item does not belong to the current group; the current group
     /// must then be finished first.
     pub fn push(&mut self, key: ColdKey, game: GameIndex) -> Result<(), ColdKey> {
-        debug_assert!(game.get() >> self.width == 0, "game index too large");
+        debug_assert!(
+            game.get() >> ColdGroup::INDEX_BITS == 0,
+            "game index too large"
+        );
         match self.prefix {
             Some(prefix) if prefix != key.prefix => return Err(key),
             Some(_) => {
@@ -128,11 +145,10 @@ impl ColdGroup {
         let count = self.items.len() as u64;
         let k = rice_parameter(count);
         self.value.clear();
-        self.value.push(self.width as u8);
         pack_uint(&mut self.value, count);
         let mut bits = BitWriter::new(&mut self.value);
         for &(_, game) in &self.items {
-            bits.write(game.get(), self.width);
+            bits.write(game.get(), ColdGroup::INDEX_BITS);
         }
         let mut previous = 0;
         for &(suffix, _) in &self.items {
@@ -158,18 +174,16 @@ fn rice_parameter(count: u64) -> u32 {
 /// The header and bits of a packed group.
 struct ColdGroupView<'a> {
     k: u32,
-    width: u32,
     count: u64,
     bits: &'a [u8],
 }
 
 impl<'a> ColdGroupView<'a> {
     fn new(value: &'a [u8]) -> ColdGroupView<'a> {
-        let (&width, mut rest) = value.split_first().expect("cold group header");
+        let mut rest = value;
         let count = unpack_uint(&mut rest);
         ColdGroupView {
             k: rice_parameter(count),
-            width: u32::from(width),
             count,
             bits: rest,
         }
@@ -177,7 +191,8 @@ impl<'a> ColdGroupView<'a> {
 
     fn index(&self, i: u64) -> GameIndex {
         GameIndex::new(
-            BitReader::at(self.bits, (i * u64::from(self.width)) as usize).read(self.width),
+            BitReader::at(self.bits, (i * u64::from(ColdGroup::INDEX_BITS)) as usize)
+                .read(ColdGroup::INDEX_BITS),
         )
         .expect("valid game index")
     }
@@ -236,7 +251,7 @@ mod tests {
     #[test]
     fn test_group_roundtrip() {
         arbtest(|u| {
-            let games = u.int_in_range(1..=1u64 << 40)?;
+            let games = u.int_in_range(1..=1u64 << ColdGroup::INDEX_BITS)?;
             let mut items: Vec<(u16, u64)> = (0..u.int_in_range(1..=300)?)
                 .map(|_| {
                     // Few distinct suffixes sometimes, to have duplicates.
@@ -313,10 +328,16 @@ mod tests {
                 .unwrap();
         }
         let len = group.finish().unwrap().1.len();
-        // 2 header bytes, 45 * 34 index bits, about 45 * 12 gap bits.
+        // 1 header byte, 45 * 34 index bits, about 45 * 12 gap bits.
         assert!(
-            len <= 2 + (45usize * 34 + 45 * 25 / 2).div_ceil(8),
+            len <= 1 + (45usize * 34 + 45 * 25 / 2).div_ceil(8),
             "{len} bytes"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "do not fit")]
+    fn test_too_many_games() {
+        ColdGroup::new((1 << ColdGroup::INDEX_BITS) + 1);
     }
 }
