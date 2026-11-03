@@ -145,11 +145,14 @@ impl ColdGroup {
     }
 }
 
-/// Near-optimal Rice parameter for `count` uniformly distributed suffixes:
-/// `floor(log2(ln(2) * 65536 / count))`, in integer arithmetic.
+/// Rice parameter for `count` uniformly distributed suffixes. The gaps are
+/// about exponentially distributed with mean `m = 65536 / (count + 1)`, for
+/// which `k + 1` beats `k` while `2^k < asinh(1/2) * m`. So this is the
+/// smallest `k` with `2^k >= asinh(1/2) * m`, in integer arithmetic. It
+/// matches the empirically best parameter for all realistic counts.
 fn rice_parameter(count: u64) -> u32 {
-    // ln(2) * 65536 = 45426.09...
-    (0..16).rev().find(|k| count << k <= 45426).unwrap_or(0)
+    // asinh(1/2) * 65536 = 31536.7...
+    (0..16).find(|k| (count + 1) << k >= 31537).unwrap_or(16)
 }
 
 /// The header and bits of a packed group.
@@ -277,15 +280,16 @@ mod tests {
     #[test]
     fn test_rice_parameter() {
         for count in 1..=100_000u64 {
-            let expected = ((1 << 16) as f64 / count as f64 * std::f64::consts::LN_2)
-                .log2()
-                .floor()
-                .clamp(0.0, 16.0) as u32;
+            let mean_gap = (1 << 16) as f64 / (count + 1) as f64;
+            let expected = (0.5f64.asinh() * mean_gap).log2().ceil().max(0.0) as u32;
             assert_eq!(rice_parameter(count), expected, "count {count}");
         }
+        // Near the typical group size.
+        assert_eq!(rice_parameter(45), 10);
+        assert_eq!(rice_parameter(100), 9);
     }
 
-    /// About 12.4 bits per suffix for groups like those of the full
+    /// About 12 bits per suffix for groups like those of the full
     /// database (about 45 items).
     #[test]
     fn test_group_size() {
@@ -309,7 +313,10 @@ mod tests {
                 .unwrap();
         }
         let len = group.finish().unwrap().1.len();
-        // 2 header bytes, 45 * 34 index bits, about 45 * 12.4 gap bits.
-        assert!(len <= 2 + (45usize * (34 + 13)).div_ceil(8), "{len} bytes");
+        // 2 header bytes, 45 * 34 index bits, about 45 * 12 gap bits.
+        assert!(
+            len <= 2 + (45usize * 34 + 45 * 25 / 2).div_ceil(8),
+            "{len} bytes"
+        );
     }
 }
