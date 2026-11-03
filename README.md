@@ -56,9 +56,11 @@ Critical performance work:
 
 * [x] Stress testing tool
 * [ ] Recheck parallel game loading
-* [ ] Determine best disk layout and migration strategy
+* [x] Determine best disk layout and migration strategy
 * [ ] Document recommended options for each workload
-* [ ] Consider --lru-cache utility
+* [ ] Investigate why LRU beats CLOCK
+* [ ] fill_cache sampling heuristic
+* [ ] cold-path entry synthesis
 * [ ] Make cold optional
 
 Minor things:

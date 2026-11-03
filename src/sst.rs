@@ -49,7 +49,7 @@ impl<'a> SstFile<'a> {
 
 /// Keep a compressed block if it saves at least 1/16. Blocks of games and
 /// positions typically save about 10%, just below the default minimum of 1/8.
-const MAX_COMPRESSED_BYTES_PER_KB: u32 = 960;
+const MAX_COMPRESSED_BYTES_PER_KB: i32 = 960;
 
 /// Bloom-equivalent bits per key of filters, for about 1% false positives.
 const FILTER_BITS_PER_KEY: f64 = 10.0;
@@ -80,14 +80,9 @@ impl SstConfig {
             opts.set_compression_type(DBCompressionType::None);
         } else {
             opts.set_compression_type(DBCompressionType::Zstd);
-            opts = opts
-                .get_options_from_string(format!(
-                    "compression_opts={{window_bits=-14;level={};strategy=0;max_dict_bytes={};zstd_max_train_bytes={};max_compressed_bytes_per_kb={MAX_COMPRESSED_BYTES_PER_KB}}}",
-                    self.zstd_level,
-                    self.zstd_dict,
-                    if self.zstd_dict != 0 { self.zstd_dict * 100 } else { 0 },
-                ))
-                .expect("valid compression options");
+            opts.set_compression_options(-14, self.zstd_level, 0, self.zstd_dict);
+            opts.set_zstd_max_train_bytes(self.zstd_dict * 100);
+            opts.set_compression_options_max_compressed_bytes_per_kb(MAX_COMPRESSED_BYTES_PER_KB);
         }
         opts.set_block_based_table_factory(table_opts);
         opts
@@ -105,6 +100,9 @@ impl SstConfig {
         // the top-level index needs to stay in memory.
         table_opts.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
         table_opts.set_metadata_block_size(4096);
+        // Delta-encode index keys in runs of 16, instead of storing every
+        // key in full.
+        table_opts.set_index_block_restart_interval(16);
         if filter {
             set_filter(&mut table_opts);
             table_opts.set_partition_filters(true);
