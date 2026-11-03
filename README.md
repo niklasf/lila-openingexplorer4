@@ -3,28 +3,43 @@
 Next generation opening explorer for lichess.org, indexing billions of
 chess games (currently ~10 B rated games across all variants, growing fast).
 
-# Example usage
+# Usage
+
+Production: 128 GB RAM, 12 hardware threads, SST files on hard disks,
+two instances running intermittently.
 
 Create the database directories from the SST files. The SST files are
 hard-linked, so they must be on the same file system as the database:
 
 ```sh
 explorer ingest --db /hdd/db_lichess --games /hdd/sst --positions /hdd/sst_positions
-explorer ingest --db /hdd/db_masters --games /hdd/masters_sst/games --positions /hdd/masters_sst
+explorer ingest --db /hdd/db_masters --games /hdd/masters_sst/games --positions /hdd/masters_sst --game-ids /hdd/masters_sst/game_ids
 ```
 
 Serve them:
 
 ```sh
-explorer lichess --db /hdd/db_lichess --bind 127.0.0.1:9002 \
-    --cache 40g \ # ~30% of RAM, keeping a significant amount for page cache
-    --blocking-threads 16 \ # oversubscribed when serving from hdd
+explorer lichess --db /hdd/db_lichess --bind 127.0.0.1:9002 --cors \
+    --cache 32g \
+    --blocking-threads 16 \
     --response-cache 300000
 
-explorer masters --db /hdd/db_masters --bind 127.0.0.1:9003 \
-    --cache 6g \
+explorer masters --db /hdd/db_masters --bind 127.0.0.1:9003 --cors \
+    --max-ply 0 \
+    --cache 4g \
     --blocking-threads 12
 ```
+
+* `--cache`: Should fit index and filter blocks (10.9 GB as of 2026-11,
+  growing with the number of games). Adding more is good, but keep a
+  significant amount of RAM for the page cache to avoid cold starts.
+* No `--direct-reads`: Avoid when cold starts matter. Otherwise good combined
+  with assigning all RAM to `--cache`.
+* `--blocking-threads 16`: To be measured. On hard disks, it might be good
+  to oversubscribe.
+* `--response-cache 100000`: 28% hit rate in 2026-11. More gains little.
+* `--max-ply` must match the indexing run: 50 (the default) for lichess,
+  0 (all plies) for masters.
 
 Replay a request log against both:
 
@@ -56,7 +71,7 @@ Critical performance work:
 
 * [x] Stress testing tool
 * [x] Determine best disk layout and migration strategy
-* [ ] Document recommended options for each workload
+* [x] Document recommended options for each workload
 * [x] Investigate why LRU beats CLOCK
 * [x] Investigate cache admission policy
 * [x] Make cold optional
