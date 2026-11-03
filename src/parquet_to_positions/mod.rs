@@ -21,7 +21,7 @@ pub use write::{COLD_DIR, OutputStats, POSITIONS_DIR};
 
 use crate::{
     intermediate::IntermediateEntry,
-    packed::{GameIndex, PositionKey},
+    packed::{ColdGroup, GameIndex, PositionKey},
     parquet::{Input, PrefetchTimes, Prefetcher},
     parquet_to_positions::{
         hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotEntries, HotMap, Sample},
@@ -41,6 +41,19 @@ use crate::{
 /// one being loaded and sorted, and the resident partition of the next pass,
 /// which is temporarily held twice while it is distributed to buckets.
 const PARTITIONS_IN_MEMORY: u64 = 4;
+
+/// Zstd level of cold positions SST files. Their bit-packed game indexes
+/// and Rice codes are practically incompressible, unless there are few
+/// games: then the high bits of the game indexes are always zero, and
+/// groups are small (masters cold positions compress about 2x).
+fn cold_zstd_level(games: u64) -> i32 {
+    let bits = u64::BITS - games.saturating_sub(1).leading_zeros();
+    if bits + 4 <= ColdGroup::INDEX_BITS {
+        3
+    } else {
+        0
+    }
+}
 
 /// Assumed ratio of zstd compressed scratch chunks to record bytes. The ratio
 /// depends on how many records of a game land in the same chunk, so it grows
@@ -368,12 +381,13 @@ pub fn convert(
     let sst = SstContext {
         // Cold keys are dense prefixes of the hash space: every lookup
         // hits a group, so a filter would not help.
-        cold_opts: &config.sst.options(false),
-        positions_opts: &SstConfig {
-            zstd_level: 1, // Higher levels save little more, but cost write time
+        cold_opts: &SstConfig {
+            zstd_level: cold_zstd_level(plan.input.all_rows()),
+            zstd_dict: 0,
             ..config.sst
         }
-        .options(true),
+        .options(false),
+        positions_opts: &config.sst.options(true),
         env_opts: &config.sst.env_options(),
         out,
         target_size: config.sst_target_size,
@@ -789,4 +803,19 @@ fn scatter_pass(
         scratch: files,
         hot: hot_map.pack(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cold_zstd_level() {
+        // Masters, and lichess.
+        assert_eq!(cold_zstd_level(2_997_978), 3);
+        assert_eq!(cold_zstd_level(8_337_694_503), 0);
+        // The threshold: 30 bits are 4 spare bits of 34.
+        assert_eq!(cold_zstd_level(1 << 30), 3);
+        assert_eq!(cold_zstd_level((1 << 30) + 1), 0);
+    }
 }

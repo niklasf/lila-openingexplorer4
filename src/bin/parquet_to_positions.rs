@@ -82,12 +82,8 @@ struct Args {
     /// Block size of the SST files.
     #[clap(long, default_value = "4096")]
     sst_block_size: usize,
-    /// Zstd level of the cold positions SST files, or 0 for no compression.
-    /// The positions SST files always use zstd level 1.
-    #[clap(long, default_value = "3", value_parser = zstd_level())]
-    sst_zstd_level: i32,
-    /// Maximum size of the zstd dictionary trained for each SST file
-    /// (0 to disable dictionary compression).
+    /// Maximum size of the zstd dictionary trained for each positions SST
+    /// file (0 to disable dictionary compression).
     #[clap(long, default_value = "0")]
     sst_zstd_dict: i32,
     /// Threads for replaying the input (default: two thirds of the threads
@@ -147,7 +143,9 @@ fn main() {
         overlap: !args.no_overlap,
         sst: SstConfig {
             block_size: args.sst_block_size,
-            zstd_level: args.sst_zstd_level,
+            // Higher levels save little more, but cost write time. Cold
+            // positions use their own level.
+            zstd_level: 1,
             zstd_dict: args.sst_zstd_dict,
             direct_io: !args.no_direct_io,
         },

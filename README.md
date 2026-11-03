@@ -76,7 +76,7 @@ Critical performance work:
 * [x] Investigate cache admission policy
 * [x] Make cold optional
 * [x] Partial sorting
-* [ ] Recheck compression on latest SSTs
+* [x] Recheck compression on latest SSTs
 * [x] Elias-Fano vs rice on cold entries
 * [x] Optimize SST block sizes
 
