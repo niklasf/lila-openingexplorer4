@@ -64,6 +64,7 @@ Critical performance work:
 * [x] Make cold optional
 * [ ] Partial sorting
 * [ ] Recheck compression on latest SSTs
+* [ ] Elias-Fano vs rice on cold entries
 
 Minor things:
 

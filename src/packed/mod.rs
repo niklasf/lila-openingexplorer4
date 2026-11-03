@@ -1,3 +1,4 @@
+mod bits;
 mod bytes;
 mod cold;
 mod entry;

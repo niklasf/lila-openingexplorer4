@@ -1,4 +1,8 @@
-use crate::packed::{GameIndex, PositionKey, pack_uint, unpack_uint};
+use crate::packed::{
+    GameIndex, PositionKey,
+    bits::{BitReader, BitWriter},
+    pack_uint, unpack_uint,
+};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ColdKey {
@@ -39,7 +43,7 @@ impl ColdKey {
     /// of the group.
     pub fn candidates(&self, value: &[u8]) -> Vec<GameIndex> {
         let group = ColdGroupView::new(value);
-        let mut gaps = BitReader::new(group.bits, group.count * u64::from(group.width));
+        let mut gaps = BitReader::at(group.bits, (group.count * u64::from(group.width)) as usize);
         let mut candidates = Vec::new();
         let mut suffix = 0u64;
         for i in 0..group.count {
@@ -58,10 +62,11 @@ impl ColdKey {
 /// prefix. The items are sorted by suffix.
 ///
 /// ```text
-/// value := k (u8) width (u8) uint(count) index* gap*   (bit-packed, MSB first)
+/// value := width (u8) uint(count) index* gap*   (bit-packed, least significant bit first)
 /// index := GameIndex, `width` bits
 /// gap   := suffix - previous suffix (the first from 0), Rice coded with
-///          parameter k: (gap >> k) as unary ones, a zero, the low k bits
+///          parameter `rice_parameter(count)`: (gap >> k) as unary ones, a
+///          zero, the low k bits
 /// ```
 ///
 /// Indexes come first, at fixed width, so that a lookup can stop decoding
@@ -121,14 +126,8 @@ impl ColdGroup {
     pub fn finish(&mut self) -> Option<([u8; ColdKey::PREFIX_SIZE], &[u8])> {
         let prefix = self.prefix.take()?;
         let count = self.items.len() as u64;
-        // Near-optimal Rice parameter for uniformly distributed suffixes:
-        // log2 of ln(2) times the mean gap.
-        let k = ((1 << 16) as f64 / count as f64 * std::f64::consts::LN_2)
-            .log2()
-            .floor()
-            .clamp(0.0, 16.0) as u32;
+        let k = rice_parameter(count);
         self.value.clear();
-        self.value.push(k as u8);
         self.value.push(self.width as u8);
         pack_uint(&mut self.value, count);
         let mut bits = BitWriter::new(&mut self.value);
@@ -140,10 +139,17 @@ impl ColdGroup {
             bits.write_rice(u64::from(suffix - previous), k);
             previous = suffix;
         }
-        bits.finish();
+        bits.finish_padded();
         self.items.clear();
         Some((prefix, &self.value))
     }
+}
+
+/// Near-optimal Rice parameter for `count` uniformly distributed suffixes:
+/// `floor(log2(ln(2) * 65536 / count))`, in integer arithmetic.
+fn rice_parameter(count: u64) -> u32 {
+    // ln(2) * 65536 = 45426.09...
+    (0..16).rev().find(|k| count << k <= 45426).unwrap_or(0)
 }
 
 /// The header and bits of a packed group.
@@ -156,10 +162,10 @@ struct ColdGroupView<'a> {
 
 impl<'a> ColdGroupView<'a> {
     fn new(value: &'a [u8]) -> ColdGroupView<'a> {
-        let (&[k, width], mut rest) = value.split_first_chunk::<2>().expect("cold group header");
+        let (&width, mut rest) = value.split_first().expect("cold group header");
         let count = unpack_uint(&mut rest);
         ColdGroupView {
-            k: u32::from(k),
+            k: rice_parameter(count),
             width: u32::from(width),
             count,
             bits: rest,
@@ -167,90 +173,10 @@ impl<'a> ColdGroupView<'a> {
     }
 
     fn index(&self, i: u64) -> GameIndex {
-        GameIndex::new(BitReader::new(self.bits, i * u64::from(self.width)).read(self.width))
-            .expect("valid game index")
-    }
-}
-
-/// Appends bits to a buffer, most significant bit first.
-struct BitWriter<'a> {
-    buf: &'a mut Vec<u8>,
-    acc: u64,
-    len: u32,
-}
-
-impl<'a> BitWriter<'a> {
-    fn new(buf: &'a mut Vec<u8>) -> BitWriter<'a> {
-        BitWriter {
-            buf,
-            acc: 0,
-            len: 0,
-        }
-    }
-
-    /// Writes the low `bits` bits of `value` (at most 56 at a time).
-    fn write(&mut self, value: u64, bits: u32) {
-        debug_assert!(bits <= 56 && (bits == 64 || value >> bits == 0));
-        self.acc = self.acc << bits | value;
-        self.len += bits;
-        while self.len >= 8 {
-            self.len -= 8;
-            self.buf.push((self.acc >> self.len) as u8);
-        }
-        self.acc &= (1 << self.len) - 1;
-    }
-
-    fn write_rice(&mut self, value: u64, k: u32) {
-        let mut quotient = value >> k;
-        while quotient >= 32 {
-            self.write((1 << 32) - 1, 32);
-            quotient -= 32;
-        }
-        self.write(((1 << quotient) - 1) << 1, quotient as u32 + 1);
-        self.write(value & ((1 << k) - 1), k);
-    }
-
-    /// Pads the last byte with zeros.
-    fn finish(mut self) {
-        if self.len > 0 {
-            let pad = 8 - self.len;
-            self.write(0, pad);
-        }
-    }
-}
-
-/// Reads bits written by `BitWriter`.
-struct BitReader<'a> {
-    bits: &'a [u8],
-    pos: u64,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(bits: &'a [u8], pos: u64) -> BitReader<'a> {
-        BitReader { bits, pos }
-    }
-
-    fn bit(&mut self) -> bool {
-        let byte = self.bits[(self.pos / 8) as usize];
-        let bit = byte >> (7 - self.pos % 8) & 1 != 0;
-        self.pos += 1;
-        bit
-    }
-
-    fn read(&mut self, bits: u32) -> u64 {
-        let mut value = 0;
-        for _ in 0..bits {
-            value = value << 1 | u64::from(self.bit());
-        }
-        value
-    }
-
-    fn read_rice(&mut self, k: u32) -> u64 {
-        let mut quotient = 0;
-        while self.bit() {
-            quotient += 1;
-        }
-        quotient << k | self.read(k)
+        GameIndex::new(
+            BitReader::at(self.bits, (i * u64::from(self.width)) as usize).read(self.width),
+        )
+        .expect("valid game index")
     }
 }
 
@@ -347,6 +273,18 @@ mod tests {
         .budget_ms(2000);
     }
 
+    /// The integer Rice parameter matches its definition.
+    #[test]
+    fn test_rice_parameter() {
+        for count in 1..=100_000u64 {
+            let expected = ((1 << 16) as f64 / count as f64 * std::f64::consts::LN_2)
+                .log2()
+                .floor()
+                .clamp(0.0, 16.0) as u32;
+            assert_eq!(rice_parameter(count), expected, "count {count}");
+        }
+    }
+
     /// About 12.4 bits per suffix for groups like those of the full
     /// database (about 45 items).
     #[test]
@@ -371,7 +309,7 @@ mod tests {
                 .unwrap();
         }
         let len = group.finish().unwrap().1.len();
-        // 3 header bytes, 45 * 34 index bits, about 45 * 12.4 gap bits.
-        assert!(len <= 3 + (45usize * (34 + 13)).div_ceil(8), "{len} bytes");
+        // 2 header bytes, 45 * 34 index bits, about 45 * 12.4 gap bits.
+        assert!(len <= 2 + (45usize * (34 + 13)).div_ceil(8), "{len} bytes");
     }
 }

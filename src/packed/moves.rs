@@ -1,10 +1,10 @@
-use std::num::NonZero;
-
 use shakmaty::{
     Bitboard, Move, Position, Rank, Role, Square, attacks,
     variant::{VariantPosition, WithPosition},
 };
 use thiserror::Error;
+
+use crate::packed::bits::{BitReader, BitWriter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackedMoves(pub Vec<u8>);
@@ -16,10 +16,7 @@ impl PackedMoves {
 
     pub fn encoder_with_capacity(plies: usize) -> PackedMovesEncoder {
         PackedMovesEncoder {
-            writer: BitWriter {
-                bytes: Vec::with_capacity(plies + 1),
-                ..BitWriter::default()
-            },
+            writer: BitWriter::new(Vec::with_capacity(plies + 1)),
         }
     }
 
@@ -38,16 +35,23 @@ impl PackedMoves {
     }
 }
 
-#[derive(Default)]
 pub struct PackedMovesEncoder {
-    writer: BitWriter,
+    writer: BitWriter<Vec<u8>>,
+}
+
+impl Default for PackedMovesEncoder {
+    fn default() -> PackedMovesEncoder {
+        PackedMovesEncoder {
+            writer: BitWriter::new(Vec::new()),
+        }
+    }
 }
 
 impl PackedMovesEncoder {
     #[inline]
     pub fn encode_next(&mut self, pos: &VariantPosition, m: Move) {
         struct EncodeMove<'a> {
-            writer: &'a mut BitWriter,
+            writer: &'a mut BitWriter<Vec<u8>>,
             m: Move,
         }
 
@@ -67,7 +71,7 @@ impl PackedMovesEncoder {
     }
 
     pub fn finish(self) -> PackedMoves {
-        PackedMoves(self.writer.finish())
+        PackedMoves(self.writer.finish_terminated())
     }
 }
 
@@ -77,7 +81,7 @@ pub struct PackedMovesDecoder<'a> {
 
 impl PackedMovesDecoder<'_> {
     pub fn new(bytes: &[u8]) -> Result<PackedMovesDecoder<'_>, InvalidPackedMoves> {
-        let reader = BitReader::new(bytes)?;
+        let reader = BitReader::terminated(bytes).ok_or(InvalidPackedMoves)?;
         Ok(PackedMovesDecoder { reader })
     }
 
@@ -98,99 +102,6 @@ impl PackedMovesDecoder<'_> {
 #[error("invalid packed moves")]
 pub struct InvalidPackedMoves;
 
-#[derive(Default)]
-struct BitWriter {
-    bytes: Vec<u8>,
-    pending: u64,
-    pending_bits: u32,
-}
-
-impl BitWriter {
-    #[inline]
-    fn write_bits(&mut self, value: u32, bits: u32) {
-        debug_assert!(bits <= 32 && u64::from(value) < (1 << bits));
-
-        self.pending |= u64::from(value) << self.pending_bits;
-        self.pending_bits += bits;
-
-        while self.pending_bits >= 8 {
-            self.bytes.push(self.pending as u8);
-            self.pending >>= 8;
-            self.pending_bits -= 8;
-        }
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        self.write_bits(1, 1);
-        if self.pending_bits > 0 {
-            self.bytes.push(self.pending as u8);
-        }
-        self.bytes
-    }
-}
-
-struct BitReader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    len: usize,
-    /// Last (up to) 8 bytes, zero padded, so that every read is a fixed
-    /// size load.
-    tail: u64,
-    tail_start: usize,
-}
-
-impl BitReader<'_> {
-    fn new(bytes: &[u8]) -> Result<BitReader<'_>, InvalidPackedMoves> {
-        let tail_start = bytes.len().saturating_sub(8);
-        let tail = match bytes.last_chunk() {
-            Some(chunk) => u64::from_le_bytes(*chunk),
-            None => bytes
-                .iter()
-                .rev()
-                .fold(0, |acc, b| (acc << 8) | u64::from(*b)),
-        };
-        Ok(BitReader {
-            bytes,
-            tail,
-            tail_start,
-            pos: 0,
-            len: bytes.len() * 8
-                - bytes
-                    .last()
-                    .copied()
-                    .and_then(NonZero::new)
-                    .ok_or(InvalidPackedMoves)?
-                    .leading_zeros() as usize
-                - 1,
-        })
-    }
-
-    #[inline]
-    fn has_remaining(&self) -> bool {
-        self.pos < self.len
-    }
-
-    #[inline]
-    fn read_bits(&mut self, bits: u32) -> Result<u32, InvalidPackedMoves> {
-        debug_assert!(bits <= 32);
-
-        if self.pos + bits as usize > self.len {
-            return Err(InvalidPackedMoves);
-        }
-
-        let start = self.pos / 8;
-        let word = if start < self.tail_start {
-            u64::from_le_bytes(*self.bytes[start..].first_chunk().expect("before tail"))
-        } else {
-            self.tail >> (8 * (start - self.tail_start))
-        } >> (self.pos % 8);
-
-        self.pos += bits as usize;
-
-        Ok((word & ((1 << bits) - 1)) as u32)
-    }
-}
-
 #[inline]
 fn bits_for(slots: usize) -> u32 {
     // Same as slots.next_power_of_two().ilog2()
@@ -198,14 +109,14 @@ fn bits_for(slots: usize) -> u32 {
 }
 
 #[inline]
-fn role_index(role: Role) -> u32 {
-    u32::from(role) - 1
+fn role_index(role: Role) -> u64 {
+    u64::from(role) - 1
 }
 
 #[inline]
-fn square_index(sq: Square, mask: Bitboard) -> u32 {
+fn square_index(sq: Square, mask: Bitboard) -> u64 {
     let below = mask & Bitboard((1 << u32::from(sq)) - 1);
-    below.count() as u32
+    below.count() as u64
 }
 
 #[inline]
@@ -266,30 +177,30 @@ fn pseudo_legal_targets<P: Position>(pos: &P, role: Role, from: Square) -> Bitbo
     }
 }
 
-fn encode_move<P: Position>(writer: &mut BitWriter, pos: &P, m: Move) {
+fn encode_move<P: Position>(writer: &mut BitWriter<Vec<u8>>, pos: &P, m: Move) {
     let piece_bits = bits_for(pos.us().count() + usize::from(pos.pockets().is_some()));
     if let Some(from) = m.from() {
         let targets = pseudo_legal_targets(pos, m.role(), from);
         let target_bits = bits_for(targets.count());
-        writer.write_bits(square_index(from, pos.us()), piece_bits);
-        writer.write_bits(square_index(m.to(), targets), target_bits);
+        writer.write(square_index(from, pos.us()), piece_bits);
+        writer.write(square_index(m.to(), targets), target_bits);
         if let Some(promotion) = m.promotion() {
-            writer.write_bits(role_index(promotion), bits_for(6));
+            writer.write(role_index(promotion), bits_for(6));
         } else if piece_bits == 0 && target_bits == 0 {
-            writer.write_bits(0, 1); // Force at least one bit per move
+            writer.write(0, 1); // Force at least one bit per move
         }
     } else {
         // Drop move
-        writer.write_bits(pos.us().count() as u32, piece_bits);
-        writer.write_bits(role_index(m.role()), bits_for(6));
-        writer.write_bits(u32::from(m.to()), bits_for(64));
+        writer.write(pos.us().count() as u64, piece_bits);
+        writer.write(role_index(m.role()), bits_for(6));
+        writer.write(u64::from(m.to()), bits_for(64));
     }
 }
 
 #[inline]
 fn decode_move<P: Position>(reader: &mut BitReader, pos: &P) -> Result<Move, InvalidPackedMoves> {
     let piece_bits = bits_for(pos.us().count() + usize::from(pos.pockets().is_some()));
-    let piece_index = reader.read_bits(piece_bits)? as usize;
+    let piece_index = reader.read(piece_bits) as usize;
     if piece_index < pos.us().count() {
         let from = nth_square(pos.us(), piece_index).ok_or(InvalidPackedMoves)?;
 
@@ -297,18 +208,15 @@ fn decode_move<P: Position>(reader: &mut BitReader, pos: &P) -> Result<Move, Inv
 
         let targets = pseudo_legal_targets(pos, role, from);
         let target_bits = bits_for(targets.count());
-        let to = nth_square(targets, reader.read_bits(target_bits)? as usize)
-            .ok_or(InvalidPackedMoves)?;
+        let to =
+            nth_square(targets, reader.read(target_bits) as usize).ok_or(InvalidPackedMoves)?;
 
         // Deliberately fused with &, to make a single rarely taken branch.
         let promotion =
             if (role == Role::Pawn) & (to.rank() == pos.turn().relative_rank(Rank::Eighth)) {
-                Some(
-                    Role::try_from(reader.read_bits(bits_for(6))? + 1)
-                        .map_err(|_| InvalidPackedMoves)?,
-                )
+                Some(Role::try_from(reader.read(bits_for(6)) + 1).map_err(|_| InvalidPackedMoves)?)
             } else {
-                if piece_bits == 0 && target_bits == 0 && reader.read_bits(1)? != 0 {
+                if piece_bits == 0 && target_bits == 0 && reader.read(1) != 0 {
                     return Err(InvalidPackedMoves);
                 }
                 None
@@ -336,9 +244,8 @@ fn decode_move<P: Position>(reader: &mut BitReader, pos: &P) -> Result<Move, Inv
         })
     } else if piece_index == pos.us().count() && pos.pockets().is_some() {
         Ok(Move::Put {
-            role: Role::try_from(reader.read_bits(bits_for(6))? + 1)
-                .map_err(|_| InvalidPackedMoves)?,
-            to: Square::new(reader.read_bits(bits_for(64))?),
+            role: Role::try_from(reader.read(bits_for(6)) + 1).map_err(|_| InvalidPackedMoves)?,
+            to: Square::new(reader.read(bits_for(64)) as u32),
         })
     } else {
         Err(InvalidPackedMoves)
@@ -352,41 +259,6 @@ mod tests {
     use shakmaty::{CastlingMode, fen::Fen, san::San};
 
     use super::*;
-
-    #[test]
-    fn test_bits_roundtrip() {
-        struct Group {
-            value: u32,
-            len: u32,
-        }
-
-        impl Arbitrary<'_> for Group {
-            fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-                let len = u.int_in_range(0..=32)?;
-                let value = u.int_in_range(0..=(1u64 << len) - 1)? as u32;
-                Ok(Group { value, len })
-            }
-        }
-
-        arbtest(|u| {
-            let groups: Vec<Group> = u.arbitrary()?;
-
-            let mut writer = BitWriter::default();
-            for group in &groups {
-                writer.write_bits(group.value, group.len);
-            }
-            let bytes = writer.finish();
-
-            let mut reader = BitReader::new(&bytes).unwrap();
-            for group in &groups {
-                assert!(reader.has_remaining() || group.len == 0);
-                assert_eq!(reader.read_bits(group.len).unwrap(), group.value);
-            }
-            assert!(!reader.has_remaining());
-
-            Ok(())
-        });
-    }
 
     #[test]
     fn test_moves_roundtrip() {
