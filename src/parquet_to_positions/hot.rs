@@ -12,8 +12,8 @@ use nohash_hasher::IntMap;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::{LichessEntry, Month, PositionKey},
+    intermediate::IntermediateEntry,
+    packed::{GameIndex, LichessEntry, Month, PositionKey},
     parquet::Input,
     parquet_to_positions::replay::Replayer,
 };
@@ -59,8 +59,8 @@ impl Sample {
                     let mut counts: IntMap<PositionKey, u64> = IntMap::default();
                     let mut months: HashSet<Month> = HashSet::new();
                     let (mut rows, mut records) = (0, 0);
-                    // Sequence numbers do not matter for the sample.
-                    let seq = GlobalGameSeq::new(0).expect("seq");
+                    // Game indexes do not matter for the sample.
+                    let index = GameIndex::new(0).expect("game index");
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         if k >= samples {
@@ -70,7 +70,7 @@ impl Sample {
                         let batch = input.read_games(i).expect("read row group");
                         for (_, game) in batch.rows() {
                             rows += 1;
-                            let info = replayer.replay_game(&game, seq);
+                            let info = replayer.replay_game(&game, index);
                             months.insert(info.month);
                             records += replayer.len() as u64;
                             for hash in replayer.hashes_before(SAMPLE_PLIES) {

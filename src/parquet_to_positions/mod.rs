@@ -20,8 +20,8 @@ use nohash_hasher::IntSet;
 pub use write::{COLD_DIR, OutputStats, POSITIONS_DIR};
 
 use crate::{
-    intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::PositionKey,
+    intermediate::IntermediateEntry,
+    packed::{GameIndex, PositionKey},
     parquet::{Input, PrefetchTimes, Prefetcher},
     parquet_to_positions::{
         hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotEntries, HotMap, Sample},
@@ -705,8 +705,8 @@ fn scatter_pass(
                     let timer = Instant::now();
                     let mut sending = Duration::ZERO;
                     for (k, (_, game)) in batch.rows().enumerate() {
-                        let seq = GlobalGameSeq::new(first_row + k as u64).expect("seq");
-                        let info = replayer.replay_game(&game, seq);
+                        let index = GameIndex::new(first_row + k as u64).expect("game index");
+                        let info = replayer.replay_game(&game, index);
                         games += 1;
 
                         for entry in replayer.entries(&info) {

@@ -10,8 +10,8 @@ impl LichessEntry {
             record.cell_key(),
             record.rating(),
             record.outcome(),
-            GameSeq(record.seq().get()),
-            record.seq().game_index(),
+            GameSeq(record.game_index().get()),
+            record.game_index(),
         );
     }
 }
@@ -38,7 +38,7 @@ impl EntryPacker {
             self.games.extend(
                 run[run.len().saturating_sub(GAMES_PER_CELL)..]
                     .iter()
-                    .map(|record| (GameSeq(record.seq().get()), record.seq().game_index())),
+                    .map(|record| (GameSeq(record.game_index().get()), record.game_index())),
             );
             self.cells
                 .push((run[0].cell_key(), stats, start, self.games.len()));
@@ -64,10 +64,7 @@ mod tests {
     use shakmaty::{KnownOutcome, Square, packed::PackedUciMove, uci::UciMove};
 
     use super::*;
-    use crate::{
-        intermediate::GlobalGameSeq,
-        packed::{GroupHeader, Month, PositionKey, Rating, RatingGroup, Speed},
-    };
+    use crate::packed::{GroupHeader, Month, PositionKey, Rating, RatingGroup, Speed};
 
     #[test]
     fn test_packers_agree() {
@@ -103,7 +100,7 @@ mod tests {
                     speed,
                     rating,
                     outcome,
-                    GlobalGameSeq::new(seq).unwrap(),
+                    GameIndex::new(seq).unwrap(),
                 ));
                 let header = GroupHeader {
                     speed,

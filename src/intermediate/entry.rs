@@ -3,12 +3,9 @@ use std::fmt;
 use bytes::{Buf, BufMut};
 use shakmaty::{KnownOutcome, packed::PackedUciMove};
 
-use crate::{
-    intermediate::GlobalGameSeq,
-    packed::{
-        CellKey, GroupHeader, Month, PositionKey, Rating, RatingGroup, Speed, outcome_bits,
-        outcome_from_bits,
-    },
+use crate::packed::{
+    CellKey, GameIndex, GroupHeader, Month, PositionKey, Rating, RatingGroup, Speed, outcome_bits,
+    outcome_from_bits,
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -17,6 +14,8 @@ pub struct IntermediateEntry(pub [u8; IntermediateEntry::SIZE]);
 impl IntermediateEntry {
     pub const SIZE: usize = 24;
     pub const KEY_SIZE: usize = PositionKey::SIZE;
+    /// Bits for the game index, packed into 5 bytes with the outcome.
+    pub const GAME_INDEX_BITS: u32 = 38;
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -26,8 +25,13 @@ impl IntermediateEntry {
         speed: Option<Speed>,
         rating: Rating,
         outcome: KnownOutcome,
-        seq: GlobalGameSeq,
+        game: GameIndex,
     ) -> IntermediateEntry {
+        assert!(
+            game.get() < 1 << Self::GAME_INDEX_BITS,
+            "game index {game} exceeds {} bits",
+            Self::GAME_INDEX_BITS
+        );
         let header = GroupHeader {
             speed,
             rating_group: RatingGroup::select(rating),
@@ -38,7 +42,7 @@ impl IntermediateEntry {
         buf.put_slice(&m.to_bytes());
         buf.put_u8(header.to_byte());
         month.pack(&mut buf);
-        buf.put_uint(seq.get() << 2 | u64::from(outcome_bits(outcome)), 5);
+        buf.put_uint(game.get() << 2 | u64::from(outcome_bits(outcome)), 5);
         rating.pack_fixed(&mut buf);
         debug_assert!(buf.is_empty());
         IntermediateEntry(bytes)
@@ -56,7 +60,7 @@ impl IntermediateEntry {
 
     #[inline]
     pub fn sort_key(&self) -> (u128, u64) {
-        // key() + cell_key() + seq_and_outcome()
+        // key() + cell_key() + game_and_outcome()
         (
             u128::from_be_bytes(self.0[..16].try_into().expect("16 bytes")),
             u64::from_be_bytes(self.0[14..22].try_into().expect("8 bytes")),
@@ -89,18 +93,18 @@ impl IntermediateEntry {
     }
 
     #[inline]
-    fn seq_and_outcome(&self) -> u64 {
+    fn game_and_outcome(&self) -> u64 {
         (&self.0[17..22]).get_uint(5)
     }
 
     #[inline]
-    pub fn seq(&self) -> GlobalGameSeq {
-        GlobalGameSeq::new(self.seq_and_outcome() >> 2).expect("38 bits")
+    pub fn game_index(&self) -> GameIndex {
+        GameIndex::new(self.game_and_outcome() >> 2).expect("38 bits")
     }
 
     #[inline]
     pub fn outcome(&self) -> KnownOutcome {
-        outcome_from_bits((self.seq_and_outcome() & 0b11) as u8).expect("valid outcome")
+        outcome_from_bits((self.game_and_outcome() & 0b11) as u8).expect("valid outcome")
     }
 
     #[inline]
@@ -116,7 +120,7 @@ impl fmt::Debug for IntermediateEntry {
             .field("uci_move", &format_args!("{}", self.uci_move().unpack()))
             .field("group_header", &self.group_header())
             .field("month", &self.month())
-            .field("seq", &self.seq())
+            .field("game_index", &self.game_index())
             .field("outcome", &self.outcome())
             .field("rating", &self.rating())
             .finish()
@@ -138,9 +142,11 @@ mod tests {
             let speed: Option<Speed> = u.arbitrary()?;
             let rating: Rating = u.arbitrary()?;
             let outcome: KnownOutcome = u.arbitrary()?;
-            let seq: GlobalGameSeq = u.arbitrary()?;
+            let game =
+                GameIndex::new(u.int_in_range(0..=(1 << IntermediateEntry::GAME_INDEX_BITS) - 1)?)
+                    .unwrap();
 
-            let entry = IntermediateEntry::new(hash, month, m, speed, rating, outcome, seq);
+            let entry = IntermediateEntry::new(hash, month, m, speed, rating, outcome, game);
 
             assert_eq!(entry.hash(), hash);
             assert_eq!(entry.month(), month);
@@ -150,7 +156,7 @@ mod tests {
                 entry.group_header().rating_group,
                 RatingGroup::select(rating)
             );
-            assert_eq!(entry.seq(), seq);
+            assert_eq!(entry.game_index(), game);
             assert_eq!(entry.outcome(), outcome);
             assert_eq!(entry.rating(), rating);
             Ok(())

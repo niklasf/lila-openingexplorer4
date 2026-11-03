@@ -224,11 +224,11 @@ fn write_range(
         match (family, run) {
             (Family::Cold, [single]) => {
                 let key = ColdKey::from_hash_bytes(hash);
-                if let Err(key) = cold_group.push(key, single.seq().game_index()) {
+                if let Err(key) = cold_group.push(key, single.game_index()) {
                     let (prefix, value) = cold_group.finish().expect("non-empty group");
                     writer.put(&prefix, value)?;
                     cold_group
-                        .push(key, single.seq().game_index())
+                        .push(key, single.game_index())
                         .expect("empty group");
                 }
                 cold_records += 1;
