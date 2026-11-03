@@ -49,6 +49,30 @@ stress_explorer sample-log.txt.zst \
     --masters-url http://127.0.0.1:9003
 ```
 
+# Indexing
+
+1. Convert PGN files to a more compact parquet file. Inputs must be in
+   chronological order by month.
+
+   ```sh
+   pgns=$(ls /mnt/lichess_db/*/*.pgn.zst | awk -F_ '{print $NF, $0}' | sort -s -k1,1 | cut -d' ' -f2)
+   pgn_to_parquet --out lichess_db_rated.parquet $pgns
+   ```
+
+2. Walk the parquet files to produce SSTs indexed by position. Benefits from
+   large memory and disk scratch space.
+
+   ```sh
+   parquet_to_positions lichess_db_rated.parquet --out sst_positions --scratch scratch --scratch-budget 3400g --memory-budget 100g
+   ```
+
+3. Walk the parquet files to produce SSTs indexed by game id.
+
+   ```sh
+   parquet_to_games lichess_db_rated.parquet --out sst
+   ```
+
+
 # Todo
 
 ## Indexing from scratch
