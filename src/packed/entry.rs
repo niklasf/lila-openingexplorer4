@@ -6,7 +6,7 @@ use bytes::{Buf, BufMut};
 use shakmaty::{Color, KnownOutcome, packed::PackedUciMove};
 
 use crate::packed::{
-    GameId, Month, Rating, RatingGroup, Speed, pack_int, pack_uint, unpack_int, unpack_uint,
+    GameIndex, Month, Rating, RatingGroup, Speed, pack_int, pack_uint, unpack_int, unpack_uint,
 };
 
 /// Each cell (move, group and month) keeps only its most recent games, up to
@@ -217,13 +217,13 @@ impl CellKey {
 pub struct EntryCell<'a> {
     pub key: CellKey,
     pub stats: SubStats,
-    pub games: &'a [(GameSeq, GameId)],
+    pub games: &'a [(GameSeq, GameIndex)],
 }
 
 impl<'a> EntryCell<'a> {
     /// The games that are packed: the most recent ones, exactly
     /// `min(GAMES_PER_CELL, games of the cell)` of them.
-    fn packed_games(&self) -> &'a [(GameSeq, GameId)] {
+    fn packed_games(&self) -> &'a [(GameSeq, GameIndex)] {
         let n = self.stats.games().min(GAMES_PER_CELL as u64) as usize;
         assert!(self.games.len() >= n, "cell is missing games");
         &self.games[self.games.len() - n..]
@@ -235,12 +235,12 @@ impl<'a> EntryCell<'a> {
 struct Cell {
     stats: SubStats,
     /// In any order, truncated to the most recent games once in a while.
-    games: Vec<(GameSeq, GameId)>,
+    games: Vec<(GameSeq, GameIndex)>,
 }
 
 impl Cell {
-    fn push_game(&mut self, seq: GameSeq, game_id: GameId) {
-        self.games.push((seq, game_id));
+    fn push_game(&mut self, seq: GameSeq, game: GameIndex) {
+        self.games.push((seq, game));
         if self.games.len() >= 4 * GAMES_PER_CELL {
             self.truncate_games();
         }
@@ -269,7 +269,7 @@ impl Cell {
 /// tag    := uint(newest month << 2 | GroupFlags)
 /// multi  := [SubStats of all cells of the group] cell (uint(month delta) cell)*
 /// cell   := SubStats game*
-/// game   := uint(rank) GameId (6 bytes)
+/// game   := uint(rank) GameIndex (5 bytes)
 /// ```
 ///
 /// A cell holds the games of a month for a move and group. Months are
@@ -293,7 +293,7 @@ impl Arbitrary<'_> for LichessEntry {
     fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
         let mut entry = LichessEntry::new();
         for (seq, part) in u.arbitrary_iter()?.enumerate() {
-            let (m, speed, rating, outcome, month, game_id) = part?;
+            let (m, speed, rating, outcome, month, game) = part?;
             let header = GroupHeader {
                 speed,
                 rating_group: RatingGroup::select(rating),
@@ -303,7 +303,7 @@ impl Arbitrary<'_> for LichessEntry {
                 rating,
                 outcome,
                 GameSeq(seq as u64),
-                game_id,
+                game,
             );
         }
         Ok(entry)
@@ -322,7 +322,7 @@ impl LichessEntry {
         rating: Rating,
         outcome: KnownOutcome,
         seq: GameSeq,
-        game_id: GameId,
+        game: GameIndex,
     ) {
         debug_assert_eq!(
             key.group_header().rating_group,
@@ -331,7 +331,7 @@ impl LichessEntry {
         );
         let cell = self.cells.entry(key).or_default();
         cell.stats.add(rating, outcome);
-        cell.push_game(seq, game_id);
+        cell.push_game(seq, game);
     }
 
     pub fn pack_entire(&mut self, buf: &mut Vec<u8>) {
@@ -361,8 +361,8 @@ impl LichessEntry {
         for view in EntryView::unpack_entire(bytes).cells() {
             let cell = self.cells.entry(view.key).or_default();
             cell.stats.merge(&view.stats);
-            for (rank, game_id) in view.games {
-                cell.push_game(GameSeq(base + rank), game_id);
+            for (rank, game) in view.games {
+                cell.push_game(GameSeq(base + rank), game);
             }
         }
     }
@@ -465,9 +465,9 @@ fn pack_cell(
     cell.stats.pack(buf, rating_group);
     let games = cell.packed_games();
     debug_assert!(games.is_sorted_by(|a, b| a.0 < b.0), "games not in order");
-    for (seq, game_id) in games.iter().rev() {
+    for (seq, game) in games.iter().rev() {
         pack_uint(buf, rank(cell.key.month, *seq));
-        game_id.pack(buf);
+        game.pack(buf);
     }
 }
 
@@ -476,7 +476,7 @@ fn skip_cell(buf: &mut &[u8], rating_group: RatingGroup) -> SubStats {
     let stats = SubStats::unpack(buf, rating_group);
     for _ in 0..stats.games().min(GAMES_PER_CELL as u64) {
         unpack_uint(buf);
-        buf.advance(GameId::SIZE);
+        buf.advance(GameIndex::SIZE);
     }
     stats
 }
@@ -657,13 +657,13 @@ impl<'a> GroupCells<'a> {
 
     /// The next game of the current cell, with its rank in the entry. Games
     /// are newest first, so the first game of a cell has the highest rank.
-    pub fn next_game(&mut self) -> Option<(u64, GameId)> {
+    pub fn next_game(&mut self) -> Option<(u64, GameIndex)> {
         if self.games_left == 0 {
             return None;
         }
         self.games_left -= 1;
         let rank = unpack_uint(&mut self.buf);
-        Some((rank, GameId::unpack(&mut self.buf)))
+        Some((rank, GameIndex::unpack(&mut self.buf)))
     }
 }
 
@@ -722,14 +722,14 @@ pub struct CellGames<'a> {
 }
 
 impl Iterator for CellGames<'_> {
-    type Item = (u64, GameId);
+    type Item = (u64, GameIndex);
 
-    fn next(&mut self) -> Option<(u64, GameId)> {
+    fn next(&mut self) -> Option<(u64, GameIndex)> {
         if self.buf.is_empty() {
             return None;
         }
         let rank = unpack_uint(&mut self.buf);
-        Some((rank, GameId::unpack(&mut self.buf)))
+        Some((rank, GameIndex::unpack(&mut self.buf)))
     }
 }
 
@@ -754,9 +754,16 @@ mod tests {
         pack(&entry)
     }
 
-    type Game = (UciMove, Option<Speed>, Rating, KnownOutcome, Month, GameId);
+    type Game = (
+        UciMove,
+        Option<Speed>,
+        Rating,
+        KnownOutcome,
+        Month,
+        GameIndex,
+    );
 
-    fn add(entry: &mut LichessEntry, (m, speed, rating, outcome, month, game_id): Game, seq: u64) {
+    fn add(entry: &mut LichessEntry, (m, speed, rating, outcome, month, game): Game, seq: u64) {
         let header = GroupHeader {
             speed,
             rating_group: RatingGroup::select(rating),
@@ -766,14 +773,14 @@ mod tests {
             rating,
             outcome,
             GameSeq(seq),
-            game_id,
+            game,
         );
     }
 
     /// Statistics of all cells in canonical order, and their packed games
     /// in chronological order.
     #[allow(clippy::type_complexity)]
-    fn view(bytes: &[u8]) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameId)>) {
+    fn view(bytes: &[u8]) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameIndex)>) {
         let view = EntryView::unpack_entire(bytes);
         let cells: Vec<_> = view.cells().collect();
         let mut games: Vec<_> = cells
@@ -781,9 +788,7 @@ mod tests {
             .flat_map(|cell| {
                 let ranks: Vec<_> = cell.games.clone().collect();
                 assert!(ranks.is_sorted_by(|a, b| a.0 > b.0), "games newest first");
-                ranks
-                    .into_iter()
-                    .map(|(rank, game_id)| (rank, cell.key, game_id))
+                ranks.into_iter().map(|(rank, game)| (rank, cell.key, game))
             })
             .collect();
         games.sort_unstable_by_key(|(rank, ..)| *rank);
@@ -826,14 +831,16 @@ mod tests {
             cells,
             games
                 .into_iter()
-                .map(|(_, key, game_id)| (key, game_id))
+                .map(|(_, key, game)| (key, game))
                 .collect(),
         )
     }
 
     /// Like `view`, but from the model.
     #[allow(clippy::type_complexity)]
-    fn expected_view(entry: &LichessEntry) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameId)>) {
+    fn expected_view(
+        entry: &LichessEntry,
+    ) -> (Vec<(CellKey, SubStats)>, Vec<(CellKey, GameIndex)>) {
         let mut entry = entry.clone();
         for cell in entry.cells.values_mut() {
             cell.truncate_games();
@@ -844,7 +851,7 @@ mod tests {
             .flat_map(|(key, cell)| {
                 cell.games
                     .iter()
-                    .map(|(seq, game_id)| ((key.month, *seq), *key, *game_id))
+                    .map(|(seq, game)| ((key.month, *seq), *key, *game))
             })
             .collect();
         games.sort_unstable_by_key(|(order, ..)| *order);
@@ -856,7 +863,7 @@ mod tests {
                 .collect(),
             games
                 .into_iter()
-                .map(|(_, key, game_id)| (key, game_id))
+                .map(|(_, key, game)| (key, game))
                 .collect(),
         )
     }
@@ -935,7 +942,7 @@ mod tests {
                 rating,
                 KnownOutcome::Draw,
                 Month::from_months_since_jan_1900(1400 + 3 * seq as u16),
-                GameId::unpack(&mut &[0, 0, 0, 0, 0, seq as u8][..]),
+                GameIndex::new(seq).unwrap(),
             );
             add(&mut entry, game, seq);
         }
@@ -945,7 +952,7 @@ mod tests {
             rating,
             KnownOutcome::Draw,
             Month::from_months_since_jan_1900(1400),
-            GameId::unpack(&mut &[0, 0, 0, 0, 1, 0][..]),
+            GameIndex::new(256).unwrap(),
         );
         add(&mut entry, game, 1000);
 

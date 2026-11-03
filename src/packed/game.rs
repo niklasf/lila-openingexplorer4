@@ -14,7 +14,7 @@ use shakmaty::{
 use thiserror::Error;
 
 use crate::packed::{
-    LaxDate, PackedMoves, Rating, pack_bytes, pack_string, unpack_bytes, unpack_string,
+    GameId, LaxDate, PackedMoves, Rating, pack_bytes, pack_string, unpack_bytes, unpack_string,
 };
 
 pub fn unpack_uci_move<B: Buf>(buf: &mut B) -> PackedUciMove {
@@ -527,6 +527,19 @@ pub fn initial_position(setup: Option<&PackedSetup>) -> VariantPosition {
                 .expect("valid setup")
         }
     }
+}
+
+/// Packs a value of the games column family: the id of the game, then the
+/// packed game.
+pub fn pack_game_value<B: BufMut>(id: GameId, game: &BorrowedLichessGame<'_>, buf: &mut B) {
+    id.pack(buf);
+    game.pack_entire(buf);
+}
+
+/// Unpacks a value of the games column family.
+pub fn unpack_game_value(mut bytes: &[u8]) -> (GameId, BorrowedLichessGame<'_>) {
+    let id = GameId::unpack(&mut bytes);
+    (id, BorrowedLichessGame::unpack_entire(bytes))
 }
 
 #[cfg(test)]

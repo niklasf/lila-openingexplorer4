@@ -25,9 +25,13 @@ pub struct Input {
     direct_files: Option<Vec<File>>,
     /// Pairs of reader index and row group index within that reader.
     row_groups: Vec<(usize, usize)>,
-    /// Index of the first row of each row group across all inputs, and the
-    /// total number of rows at the end.
+    /// Index of the first row of each row group across the selected row
+    /// groups, and the total number of selected rows at the end.
     row_offsets: Vec<u64>,
+    /// Rows of the skipped row groups.
+    skipped_rows: u64,
+    /// Rows of all row groups of all inputs, selected or not.
+    all_rows: u64,
 }
 
 impl Input {
@@ -61,6 +65,12 @@ impl Input {
             .enumerate()
             .flat_map(|(r, reader)| (0..reader.num_row_groups()).map(move |i| (r, i)))
             .collect();
+        let rows = |&(r, i): &(usize, usize)| readers[r].metadata().row_group(i).num_rows() as u64;
+        let all_rows = row_groups.iter().map(rows).sum();
+        let skipped_rows = row_groups[..skip.min(row_groups.len())]
+            .iter()
+            .map(rows)
+            .sum();
         row_groups.drain(..skip.min(row_groups.len()));
         if let Some(limit) = limit {
             row_groups.truncate(limit);
@@ -68,8 +78,8 @@ impl Input {
         let mut row_offsets = Vec::with_capacity(row_groups.len() + 1);
         let mut offset = 0;
         row_offsets.push(offset);
-        for &(r, i) in &row_groups {
-            offset += readers[r].metadata().row_group(i).num_rows() as u64;
+        for row_group in &row_groups {
+            offset += rows(row_group);
             row_offsets.push(offset);
         }
         Ok(Input {
@@ -77,6 +87,8 @@ impl Input {
             direct_files,
             row_groups,
             row_offsets,
+            skipped_rows,
+            all_rows,
         })
     }
 
@@ -88,15 +100,22 @@ impl Input {
         self.row_offsets[row_group + 1] - self.row_offsets[row_group]
     }
 
-    /// Total number of rows of all row groups.
+    /// Total number of rows of the selected row groups.
     pub fn total_rows(&self) -> u64 {
         *self.row_offsets.last().expect("row offsets")
     }
 
-    /// Index of the first row of the row group, counting from the first row
-    /// group of the first input.
+    /// Index of the first row of the (selected) row group, counting from the
+    /// first row of the first input, including skipped row groups. This is
+    /// the `GameIndex` of the first game of the row group.
     pub fn first_row(&self, row_group: usize) -> u64 {
-        self.row_offsets[row_group]
+        self.skipped_rows + self.row_offsets[row_group]
+    }
+
+    /// Rows of all inputs, including row groups that are not selected: an
+    /// upper bound for game indexes.
+    pub fn all_rows(&self) -> u64 {
+        self.all_rows
     }
 
     pub fn read_games(&self, row_group: usize) -> parquet::errors::Result<GameBatch> {

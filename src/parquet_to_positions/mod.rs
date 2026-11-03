@@ -220,6 +220,8 @@ pub struct Config {
     pub sst: SstConfig,
     /// Start a new SST file once the current one reaches this size.
     pub sst_target_size: u64,
+    /// Write the cold positions (reached by a single game).
+    pub cold: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -357,7 +359,9 @@ pub fn convert(
     // Fail early rather than after the first scatter pass.
     create_dir(scratch_dir)?;
     create_dir(out)?;
-    create_empty_dir(&out.join(COLD_DIR))?;
+    if config.cold {
+        create_empty_dir(&out.join(COLD_DIR))?;
+    }
     create_empty_dir(&out.join(POSITIONS_DIR))?;
 
     let hot_set: IntSet<PositionKey> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
@@ -373,6 +377,8 @@ pub fn convert(
         env_opts: &config.sst.env_options(),
         out,
         target_size: config.sst_target_size,
+        games: plan.input.all_rows(),
+        cold: config.cold,
         stats: Mutex::new(OutputStats::default()),
     };
     let counters = Counters::default();
@@ -698,9 +704,9 @@ fn scatter_pass(
                     // Time spent blocked on the chunk writers is not replay.
                     let timer = Instant::now();
                     let mut sending = Duration::ZERO;
-                    for (k, (game_id, game)) in batch.rows().enumerate() {
+                    for (k, (_, game)) in batch.rows().enumerate() {
                         let seq = GlobalGameSeq::new(first_row + k as u64).expect("seq");
-                        let info = replayer.replay_game(game_id, &game, seq);
+                        let info = replayer.replay_game(&game, seq);
                         games += 1;
 
                         for entry in replayer.entries(&info) {

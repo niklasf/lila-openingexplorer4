@@ -2,7 +2,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, process, thread, ti
 
 use clap::{Args, Parser, Subcommand};
 use lila_openingexplorer4::{
-    server::{AppConfig, Database, DbConfig, Kind, ingest, serve},
+    server::{AppConfig, Database, DbConfig, Kind, admission::CacheAdmission, ingest, serve},
     util::ByteSize,
 };
 use tikv_jemallocator::Jemalloc;
@@ -47,6 +47,15 @@ struct IngestArgs {
     /// positions and cold_positions.
     #[arg(long)]
     positions: PathBuf,
+    /// Leave out the cold positions (positions reached by a single game),
+    /// so that the cold_positions subdirectory is not needed.
+    #[arg(long)]
+    no_cold: bool,
+    /// Directory with the map from game ids to game indexes, written by
+    /// parquet_to_games --game-ids. Needed for looking up games by id
+    /// (/masters/pgn/{id}).
+    #[arg(long)]
+    game_ids: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -102,6 +111,16 @@ struct ServeArgs {
     /// found (or missed) inconsistently.
     #[arg(long, default_value = "50")]
     max_ply: usize,
+    /// Do not look up cold positions: positions reached by a single game
+    /// are answered as if no game reached them. Saves a lookup and loading
+    /// the candidate games for every position that is not in the positions
+    /// column family.
+    #[arg(long)]
+    no_cold: bool,
+    /// Which lookups fill the block cache, by the ply of the position, as
+    /// PLY:PERCENT tiers and the percentage for deeper plies.
+    #[arg(long, default_value = "15:100,20:5,25:2,1", help_heading = "Database")]
+    cache_admission: CacheAdmission,
     #[command(flatten)]
     db_opts: DbArgs,
     /// Concurrent database requests. Defaults to half the available
@@ -161,7 +180,10 @@ fn main() {
                 &args.db,
                 &args.games,
                 &args.positions.join("positions"),
-                &args.positions.join("cold_positions"),
+                (!args.no_cold)
+                    .then(|| args.positions.join("cold_positions"))
+                    .as_deref(),
+                args.game_ids.as_deref(),
             ) {
                 Ok(stats) => println!(
                     "ingested {} games files, {} positions files, {} cold_positions files into {}",
@@ -195,6 +217,8 @@ fn run(kind: Kind, args: ServeArgs) {
         cache_ttl: Duration::from_secs(args.response_cache_ttl),
         blocking_threads,
         max_ply: (args.max_ply > 0).then_some(args.max_ply),
+        cold: !args.no_cold,
+        admission: args.cache_admission,
         openings_dir: args.openings_dir,
         no_openings: args.no_openings,
     };

@@ -6,7 +6,7 @@ use std::{
 use shakmaty::packed::PackedUciMove;
 
 use crate::{
-    packed::{EntryView, GameId, Month, RatingGroup, Speed, SubStats},
+    packed::{EntryView, GameIndex, Month, RatingGroup, Speed, SubStats},
     server::query::{LichessFilter, Limits},
 };
 
@@ -26,9 +26,9 @@ pub struct PreparedMove {
     pub m: PackedUciMove,
     pub stats: SubStats,
     /// The only game, if the move was played exactly once.
-    pub game: Option<GameId>,
+    pub game: Option<GameIndex>,
     /// Highest rank seen among the games of the move, and its game.
-    latest: Option<(u64, GameId)>,
+    latest: Option<(u64, GameIndex)>,
 }
 
 impl PreparedMove {
@@ -41,7 +41,7 @@ impl PreparedMove {
         }
     }
 
-    fn see_game(&mut self, rank: u64, id: GameId) {
+    fn see_game(&mut self, rank: u64, id: GameIndex) {
         if self.latest.is_none_or(|(latest, _)| latest < rank) {
             self.latest = Some((rank, id));
         }
@@ -69,7 +69,7 @@ pub struct GameRef {
     /// Chronological rank within the entry.
     pub rank: u64,
     pub m: PackedUciMove,
-    pub id: GameId,
+    pub id: GameIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -470,8 +470,8 @@ mod tests {
         CellKey, GameSeq, GroupHeader, LichessEntry, Rating, RatingGroups, Speeds,
     };
 
-    fn id(n: u64) -> GameId {
-        GameId::unpack(&mut &n.to_be_bytes()[2..])
+    fn id(n: u64) -> GameIndex {
+        GameIndex::new(n).unwrap()
     }
 
     fn entry() -> Vec<u8> {
@@ -549,9 +549,9 @@ mod tests {
         // Without a rating filter, the top groups down to 2000 are selected:
         // games 3 (2600 bullet) and 4 (2100 rapid) are top games, with the
         // bullet game closer to the highscore of its speed.
-        let top: Vec<GameId> = prepared.top_games.iter().map(|g| g.id).collect();
+        let top: Vec<GameIndex> = prepared.top_games.iter().map(|g| g.id).collect();
         assert_eq!(top, vec![id(3), id(4)]);
-        let recent: Vec<GameId> = prepared.recent_games.iter().map(|g| g.id).collect();
+        let recent: Vec<GameIndex> = prepared.recent_games.iter().map(|g| g.id).collect();
         assert_eq!(recent, vec![id(2), id(1)]);
         let history = prepared.history.unwrap();
         // Without `until`, the last month is omitted.
@@ -601,11 +601,11 @@ mod tests {
         let buf = entry();
         let prepared = prepare_masters(&buf, &all(), &limits(), 2);
         assert_eq!(prepared.total.games(), 4);
-        let candidates: Vec<GameId> = prepared.candidates.iter().map(|g| g.id).collect();
+        let candidates: Vec<GameIndex> = prepared.candidates.iter().map(|g| g.id).collect();
         assert_eq!(candidates, vec![id(3), id(4)]);
     }
 
-    fn game_ids(games: &[GameRef]) -> Vec<GameId> {
+    fn game_ids(games: &[GameRef]) -> Vec<GameIndex> {
         games.iter().map(|g| g.id).collect()
     }
 
@@ -652,7 +652,7 @@ mod tests {
         agg
     }
 
-    fn moves(moves: &[PreparedMove]) -> Vec<(PackedUciMove, SubStats, Option<GameId>)> {
+    fn moves(moves: &[PreparedMove]) -> Vec<(PackedUciMove, SubStats, Option<GameIndex>)> {
         moves.iter().map(|pm| (pm.m, pm.stats, pm.game)).collect()
     }
 

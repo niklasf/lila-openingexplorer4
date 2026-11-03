@@ -1,6 +1,9 @@
 use arbitrary::{Arbitrary, Unstructured};
 
-/// Used to maintain the order of games as in the input.
+use crate::packed::GameIndex;
+
+/// The row of a game in the parquet input, used to maintain the order of
+/// games as in the input, and as its `GameIndex`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GlobalGameSeq(u64);
 
@@ -14,6 +17,10 @@ impl GlobalGameSeq {
 
     pub fn get(self) -> u64 {
         self.0
+    }
+
+    pub fn game_index(self) -> GameIndex {
+        GameIndex::new(self.0).expect("game index")
     }
 }
 

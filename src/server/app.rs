@@ -2,10 +2,7 @@ use std::{
     net::SocketAddr,
     ops::Deref,
     path::PathBuf,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, RwLock, atomic::AtomicU64},
     time::{Duration, Instant},
 };
 
@@ -29,10 +26,11 @@ use tokio::{
 
 use crate::{
     packed::{
-        BorrowedLichessGame, CellKey, GameId, GameSeq, GroupHeader, InvalidGameId, LichessEntry,
-        PositionKey, Rating, RatingGroup,
+        CellKey, GameId, GameIndex, GameSeq, GroupHeader, InvalidGameId, LichessEntry, PositionKey,
+        Rating, RatingGroup, unpack_game_value,
     },
     server::{
+        admission::CacheAdmission,
         db::Database,
         explore::{
             GameRef, MASTERS_TOP_CANDIDATES, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
@@ -93,6 +91,10 @@ pub struct AppConfig {
     pub blocking_threads: usize,
     /// Games were indexed up to this ply (`None` for all plies).
     pub max_ply: Option<usize>,
+    /// Look up cold positions (reached by a single game).
+    pub cold: bool,
+    /// Which lookups fill the block cache.
+    pub admission: CacheAdmission,
     /// Directory with a.tsv to e.tsv of chess-openings, instead of
     /// downloading them.
     pub openings_dir: Option<PathBuf>,
@@ -148,28 +150,24 @@ type Shared = Arc<AppState>;
 
 impl AppState {
     /// Whether a lookup of a position at the given ply should fill the
-    /// block cache: deep positions are rarely requested again.
+    /// block cache.
     fn fill_cache(&self, ply: u32) -> bool {
-        let percent = if ply < 15 {
-            return true;
-        } else if ply < 20 {
-            5
-        } else if ply < 25 {
-            2
-        } else {
-            1
-        };
-        self.sample.fetch_add(1, Ordering::Relaxed) % 100 < percent
+        self.config.admission.fill(ply, &self.sample)
     }
 
     /// The packed entry of a position: from the positions column family,
-    /// or synthesized from the single game that reached it.
+    /// or (unless disabled) synthesized from the single game that reached
+    /// it.
     fn entry(&self, pos: &VariantPosition, ply: u32) -> Result<Option<Entry<'_>>, rocksdb::Error> {
         let hash = PositionKey::new(pos);
         let fill_cache = self.fill_cache(ply);
         if let Some(entry) = self.db.positions_entry(&hash, fill_cache)? {
             self.metrics.positions_hits.inc();
             return Ok(Some(Entry::Pinned(entry)));
+        }
+        if !self.config.cold {
+            self.metrics.misses.inc();
+            return Ok(None);
         }
         let candidates = self.db.cold_candidates(&hash, fill_cache)?;
         if candidates.is_empty() {
@@ -187,7 +185,7 @@ impl AppState {
                 log::warn!("cold candidate {id} not found in games");
                 continue;
             };
-            let game = BorrowedLichessGame::unpack_entire(&game);
+            let (_, game) = unpack_game_value(&game);
             if let Some(visit) = find_visit(&game, &hash, self.config.max_ply) {
                 let rating = game.players[visit.turn].rating.unwrap_or_default();
                 entry.add_game(
@@ -221,7 +219,7 @@ impl AppState {
     /// Loads games by id, keeping the order.
     fn load_games(
         &self,
-        ids: &[GameId],
+        ids: &[GameIndex],
         fill_cache: bool,
         loaded: &Counter,
     ) -> Result<Vec<Option<Vec<u8>>>, rocksdb::Error> {
@@ -238,7 +236,7 @@ impl AppState {
         &self,
         pos: &VariantPosition,
         moves: Vec<PreparedMove>,
-        games: &mut Vec<GameId>,
+        games: &mut Vec<GameIndex>,
     ) -> Vec<(ExplorerMove, Option<usize>)> {
         let openings = self.openings.read().expect("read openings");
         moves
@@ -284,13 +282,12 @@ impl AppState {
         refs.iter()
             .zip(&games[offset..])
             .filter_map(|(game_ref, game)| {
-                game.as_ref().map(|game| ExplorerGameWithUci {
-                    uci: game_ref.m.unpack(),
-                    game: ExplorerGame::new(
-                        game_ref.id,
-                        &BorrowedLichessGame::unpack_entire(game),
-                        masters,
-                    ),
+                game.as_ref().map(|game| {
+                    let (id, game) = unpack_game_value(game);
+                    ExplorerGameWithUci {
+                        uci: game_ref.m.unpack(),
+                        game: ExplorerGame::new(id, &game, masters),
+                    }
                 })
             })
             .collect()
@@ -313,7 +310,7 @@ impl AppState {
             self.fill_cache(ply),
             &self.metrics.response_games_loaded,
         )?;
-        attach_single_games(&mut moves, &ids, &games, false);
+        attach_single_games(&mut moves, &games, false);
 
         let response = ExplorerResponse {
             total: Stats::from(&prepared.total),
@@ -366,7 +363,7 @@ impl AppState {
             self.fill_cache(ply),
             &self.metrics.response_games_loaded,
         )?;
-        attach_single_games(&mut moves, &ids, &games, true);
+        attach_single_games(&mut moves, &games, true);
 
         // Rank the candidates by their actual ratings.
         let mut top_games: Vec<(i32, usize)> = prepared
@@ -376,7 +373,7 @@ impl AppState {
             .enumerate()
             .filter_map(|(i, (_, game))| {
                 game.as_ref().map(|game| {
-                    let game = BorrowedLichessGame::unpack_entire(game);
+                    let (_, game) = unpack_game_value(game);
                     let rating = |rating: Option<Rating>| rating.map_or(0, i32::from);
                     (
                         rating(game.players.white.rating) + rating(game.players.black.rating),
@@ -391,15 +388,11 @@ impl AppState {
             .into_iter()
             .map(|(_, i)| {
                 let game_ref = &prepared.candidates[i];
+                let (id, game) =
+                    unpack_game_value(games[candidates_offset + i].as_deref().expect("loaded"));
                 ExplorerGameWithUci {
                     uci: game_ref.m.unpack(),
-                    game: ExplorerGame::new(
-                        game_ref.id,
-                        &BorrowedLichessGame::unpack_entire(
-                            games[candidates_offset + i].as_deref().expect("loaded"),
-                        ),
-                        true,
-                    ),
+                    game: ExplorerGame::new(id, &game, true),
                 }
             })
             .collect();
@@ -426,10 +419,10 @@ impl AppState {
 
     fn pgn(&self, id: GameId) -> Result<String, Error> {
         self.metrics.pgn_requests.inc();
-        match self.db.game(id, true)? {
-            Some(game) => Ok(masters_pgn(id, &BorrowedLichessGame::unpack_entire(&game))),
-            None => Err(Error::NotFound),
-        }
+        let index = self.db.game_index(id)?.ok_or(Error::NotFound)?;
+        let game = self.db.game(index, true)?.ok_or(Error::NotFound)?;
+        let (id, game) = unpack_game_value(&game);
+        Ok(masters_pgn(id, &game))
     }
 }
 
@@ -453,7 +446,6 @@ impl Deref for Entry<'_> {
 /// Attaches the only game of each move, once the games are loaded.
 fn attach_single_games(
     moves: &mut [(ExplorerMove, Option<usize>)],
-    ids: &[GameId],
     games: &[Option<Vec<u8>>],
     masters: bool,
 ) {
@@ -461,11 +453,8 @@ fn attach_single_games(
         if let Some(i) = *index
             && let Some(game) = &games[i]
         {
-            m.game = Some(ExplorerGame::new(
-                ids[i],
-                &BorrowedLichessGame::unpack_entire(game),
-                masters,
-            ));
+            let (id, game) = unpack_game_value(game);
+            m.game = Some(ExplorerGame::new(id, &game, masters));
         }
     }
 }

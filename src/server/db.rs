@@ -12,13 +12,15 @@ use rocksdb::{
 use thiserror::Error;
 
 use crate::{
-    packed::{ColdKey, GameId, PositionKey},
+    packed::{ColdKey, GameId, GameIndex, PositionKey},
     sst::read_table_options,
 };
 
 pub const GAMES_CF: &str = "games";
 pub const POSITIONS_CF: &str = "positions";
 pub const COLD_CF: &str = "cold_positions";
+/// Optional map from `GameId` to `GameIndex`, for looking up games by id.
+pub const GAME_IDS_CF: &str = "game_ids";
 
 /// Subdirectory of the database for hard links of SST files that are about
 /// to be ingested.
@@ -47,20 +49,25 @@ pub enum DbError {
 }
 
 fn descriptors(cache: &Cache) -> Vec<ColumnFamilyDescriptor> {
-    [(GAMES_CF, false), (POSITIONS_CF, true), (COLD_CF, false)]
-        .into_iter()
-        .map(|(name, filter)| {
-            let mut table_opts = read_table_options(filter);
-            table_opts.set_block_cache(cache);
-            table_opts.set_cache_index_and_filter_blocks(true);
-            table_opts.set_cache_index_and_filter_blocks_with_high_priority(true);
-            table_opts.set_pin_top_level_index_and_filter(true);
-            let mut opts = Options::default();
-            opts.set_block_based_table_factory(&table_opts);
-            opts.set_disable_auto_compactions(true);
-            ColumnFamilyDescriptor::new(name, opts)
-        })
-        .collect()
+    [
+        (GAMES_CF, false),
+        (POSITIONS_CF, true),
+        (COLD_CF, false),
+        (GAME_IDS_CF, false),
+    ]
+    .into_iter()
+    .map(|(name, filter)| {
+        let mut table_opts = read_table_options(filter);
+        table_opts.set_block_cache(cache);
+        table_opts.set_cache_index_and_filter_blocks(true);
+        table_opts.set_cache_index_and_filter_blocks_with_high_priority(true);
+        table_opts.set_pin_top_level_index_and_filter(true);
+        let mut opts = Options::default();
+        opts.set_block_based_table_factory(&table_opts);
+        opts.set_disable_auto_compactions(true);
+        ColumnFamilyDescriptor::new(name, opts)
+    })
+    .collect()
 }
 
 fn db_options(config: &DbConfig) -> Options {
@@ -79,7 +86,12 @@ fn db_options(config: &DbConfig) -> Options {
 
 fn make_cache(config: &DbConfig) -> Cache {
     if config.lru_cache {
-        Cache::new_lru_cache(config.cache_bytes as usize)
+        let mut opts = rocksdb::LruCacheOptions::default();
+        opts.set_capacity(config.cache_bytes as usize);
+        // Index and filter blocks (inserted with high priority) are only
+        // evicted by each other, never by data blocks.
+        opts.set_high_pri_pool_ratio(1.0);
+        Cache::new_lru_cache_opts(&opts)
     } else {
         // Estimated entry charge 0: automatic (block sizes vary with
         // compression).
@@ -105,16 +117,19 @@ pub struct IngestStats {
     pub games_files: usize,
     pub positions_files: usize,
     pub cold_files: usize,
+    pub game_ids_files: usize,
 }
 
-/// Creates a database at `path` from the SST files of the three
-/// directories, which are hard-linked (the originals are left untouched).
-/// The directories must be on the same file system as the database.
+/// Creates a database at `path` from the SST files of the directories,
+/// which are hard-linked (the originals are left untouched). The
+/// directories must be on the same file system as the database. Without
+/// `cold` or `game_ids`, their column families stay empty.
 pub fn ingest(
     path: &Path,
     games: &Path,
     positions: &Path,
-    cold: &Path,
+    cold: Option<&Path>,
+    game_ids: Option<&Path>,
 ) -> Result<IngestStats, DbError> {
     let config = DbConfig {
         cache_bytes: 64 << 20,
@@ -135,10 +150,14 @@ pub fn ingest(
 
     let mut stats = IngestStats::default();
     for (cf_name, dir, count) in [
-        (GAMES_CF, games, &mut stats.games_files),
-        (POSITIONS_CF, positions, &mut stats.positions_files),
+        (GAMES_CF, Some(games), &mut stats.games_files),
+        (POSITIONS_CF, Some(positions), &mut stats.positions_files),
         (COLD_CF, cold, &mut stats.cold_files),
+        (GAME_IDS_CF, game_ids, &mut stats.game_ids_files),
     ] {
+        let Some(dir) = dir else {
+            continue;
+        };
         let started = Instant::now();
         let files = sst_files(dir)?;
         // RocksDB removes the "moved" files after linking them into the
@@ -231,7 +250,7 @@ impl Database {
         &self,
         hash: &PositionKey,
         fill_cache: bool,
-    ) -> Result<Vec<GameId>, rocksdb::Error> {
+    ) -> Result<Vec<GameIndex>, rocksdb::Error> {
         let key = ColdKey::new(hash);
         Ok(self
             .db
@@ -240,28 +259,43 @@ impl Database {
                 key.prefix(),
                 &Self::read_options(fill_cache),
             )?
-            .map_or_else(Vec::new, |group| key.candidates(&group).collect()))
+            .map_or_else(Vec::new, |group| key.candidates(&group)))
     }
 
+    /// The value of a game (see `unpack_game_value`).
     pub fn game(
         &self,
-        id: GameId,
+        index: GameIndex,
         fill_cache: bool,
     ) -> Result<Option<DBPinnableSlice<'_>>, rocksdb::Error> {
         self.db.get_pinned_cf_opt(
             self.cf(GAMES_CF),
-            id.to_bytes(),
+            index.to_bytes(),
             &Self::read_options(fill_cache),
         )
     }
 
-    /// Packed games, in the order of the ids (`None` for unknown ids).
+    /// The index of a game, if the database has the map of game ids.
+    pub fn game_index(&self, id: GameId) -> Result<Option<GameIndex>, rocksdb::Error> {
+        Ok(self
+            .db
+            .get_pinned_cf_opt(
+                self.cf(GAME_IDS_CF),
+                id.to_bytes(),
+                &Self::read_options(true),
+            )?
+            .map(|value| GameIndex::unpack(&mut &value[..])))
+    }
+
+    /// Values of games, in the order of the indexes (`None` for unknown
+    /// indexes).
     pub fn games(
         &self,
-        ids: &[GameId],
+        indexes: &[GameIndex],
         fill_cache: bool,
     ) -> Result<Vec<Option<DBPinnableSlice<'_>>>, rocksdb::Error> {
-        let keys: Vec<[u8; GameId::SIZE]> = ids.iter().map(|id| id.to_bytes()).collect();
+        let keys: Vec<[u8; GameIndex::SIZE]> =
+            indexes.iter().map(|index| index.to_bytes()).collect();
         self.db
             .batched_multi_get_cf_opt(
                 self.cf(GAMES_CF),

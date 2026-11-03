@@ -1,6 +1,6 @@
 use crate::{
     intermediate::IntermediateEntry,
-    packed::{CellKey, EntryCell, GAMES_PER_CELL, GameId, GameSeq, LichessEntry, SubStats},
+    packed::{CellKey, EntryCell, GAMES_PER_CELL, GameIndex, GameSeq, LichessEntry, SubStats},
 };
 
 impl LichessEntry {
@@ -11,7 +11,7 @@ impl LichessEntry {
             record.rating(),
             record.outcome(),
             GameSeq(record.seq().get()),
-            record.game_id(),
+            record.seq().game_index(),
         );
     }
 }
@@ -21,7 +21,7 @@ impl LichessEntry {
 pub struct EntryPacker {
     /// Cells, with the start and end index of their kept games.
     cells: Vec<(CellKey, SubStats, usize, usize)>,
-    games: Vec<(GameSeq, GameId)>,
+    games: Vec<(GameSeq, GameIndex)>,
 }
 
 impl EntryPacker {
@@ -38,7 +38,7 @@ impl EntryPacker {
             self.games.extend(
                 run[run.len().saturating_sub(GAMES_PER_CELL)..]
                     .iter()
-                    .map(|record| (GameSeq(record.seq().get()), record.game_id())),
+                    .map(|record| (GameSeq(record.seq().get()), record.seq().game_index())),
             );
             self.cells
                 .push((run[0].cell_key(), stats, start, self.games.len()));
@@ -96,7 +96,6 @@ mod tests {
                 let speed = *u.choose(&[Some(Speed::Blitz), Some(Speed::Rapid), None])?;
                 let rating = Rating::try_from(u.int_in_range(900..=1300)?).unwrap();
                 let outcome: KnownOutcome = u.arbitrary()?;
-                let game_id: GameId = u.arbitrary()?;
                 records.push(IntermediateEntry::new(
                     hash,
                     month,
@@ -105,7 +104,6 @@ mod tests {
                     rating,
                     outcome,
                     GlobalGameSeq::new(seq).unwrap(),
-                    game_id,
                 ));
                 let header = GroupHeader {
                     speed,
@@ -116,7 +114,7 @@ mod tests {
                     rating,
                     outcome,
                     GameSeq(seq),
-                    game_id,
+                    GameIndex::new(seq).unwrap(),
                 );
             }
             let mut expected_buf = Vec::new();

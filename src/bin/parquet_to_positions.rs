@@ -50,6 +50,10 @@ struct Args {
     /// cold_positions and positions (which must be empty or missing).
     #[clap(long)]
     out: PathBuf,
+    /// Do not write the cold positions (positions reached by a single
+    /// game), for an explorer that does not look them up.
+    #[clap(long)]
+    no_cold: bool,
     /// Only index the positions of the first plies of each game, or 0 for
     /// all positions.
     #[clap(long, default_value = "50")]
@@ -148,6 +152,7 @@ fn main() {
             direct_io: !args.no_direct_io,
         },
         sst_target_size: args.sst_target_size.into(),
+        cold: !args.no_cold,
     };
 
     let planned = Instant::now();
@@ -182,16 +187,18 @@ fn main() {
         stats.hot_records,
         stats.hot_positions,
     );
-    println!(
-        "cold_positions: {} groups for {} records in {} files ({} bytes, {:.1} B/record, {:.1} B/group, largest {} bytes)",
-        output.cold.keys,
-        output.cold_records,
-        output.cold.files,
-        output.cold.bytes,
-        output.cold.bytes as f64 / output.cold_records.max(1) as f64,
-        output.cold.bytes_per_key(),
-        output.cold.largest_file,
-    );
+    if config.cold {
+        println!(
+            "cold_positions: {} groups for {} records in {} files ({} bytes, {:.1} B/record, {:.1} B/group, largest {} bytes)",
+            output.cold.keys,
+            output.cold_records,
+            output.cold.files,
+            output.cold.bytes,
+            output.cold.bytes as f64 / output.cold_records.max(1) as f64,
+            output.cold.bytes_per_key(),
+            output.cold.largest_file,
+        );
+    }
     println!(
         "positions: {} keys for {} records in {} files ({} bytes, {:.1} B/key, ratio {:.3}, largest {} bytes)",
         output.positions.keys,

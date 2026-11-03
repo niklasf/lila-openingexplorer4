@@ -8,7 +8,7 @@ use shakmaty::{
 
 use crate::{
     intermediate::{GlobalGameSeq, IntermediateEntry},
-    packed::{BorrowedLichessGame, GameId, Month, PackedMovesDecoder, PositionKey, Rating, Speed},
+    packed::{BorrowedLichessGame, Month, PackedMovesDecoder, PositionKey, Rating, Speed},
 };
 
 /// A position reached in a game, and the move that was eventually played
@@ -23,7 +23,6 @@ struct Visit {
 /// The metadata shared by all records of one game.
 #[derive(Copy, Clone)]
 pub struct GameInfo {
-    pub game_id: GameId,
     pub seq: GlobalGameSeq,
     pub variant: Variant,
     pub month: Month,
@@ -59,15 +58,9 @@ impl Replayer {
     }
 
     /// Replays a game, and returns its metadata.
-    pub fn replay_game(
-        &mut self,
-        game_id: GameId,
-        game: &BorrowedLichessGame<'_>,
-        seq: GlobalGameSeq,
-    ) -> GameInfo {
+    pub fn replay_game(&mut self, game: &BorrowedLichessGame<'_>, seq: GlobalGameSeq) -> GameInfo {
         let pos = game.initial_position();
         let info = GameInfo {
-            game_id,
             seq,
             variant: pos.variant(),
             // The earliest possible month if only the year is known.
@@ -147,7 +140,6 @@ impl Replayer {
                 info.ratings[self.turn_at(visit.ply)],
                 info.outcome,
                 info.seq,
-                info.game_id,
             )
         })
     }

@@ -44,6 +44,10 @@ pub struct SstContext<'a> {
     pub out: &'a Path,
     /// Approximate size of the SST files.
     pub target_size: u64,
+    /// Upper bound for game indexes.
+    pub games: u64,
+    /// Write the cold positions column family.
+    pub cold: bool,
     pub stats: Mutex<OutputStats>,
 }
 
@@ -56,13 +60,16 @@ pub struct OutputStats {
     pub cold_records: u64,
     /// Records written as part of a positions entry, excluding hot records.
     pub position_records: u64,
+    /// Records of positions reached by a single game that were not written,
+    /// because cold positions are disabled.
+    pub skipped_cold_records: u64,
 }
 
 impl OutputStats {
     /// SST bytes of each column family per record written so far
     /// (excluding hot records).
     fn bytes_per_record(&self) -> (f64, f64) {
-        let records = self.cold_records + self.position_records;
+        let records = self.cold_records + self.skipped_cold_records + self.position_records;
         if records == 0 {
             (
                 INITIAL_COLD_BYTES_PER_RECORD,
@@ -81,6 +88,7 @@ impl OutputStats {
         self.positions.merge(&other.positions);
         self.cold_records += other.cold_records;
         self.position_records += other.position_records;
+        self.skipped_cold_records += other.skipped_cold_records;
     }
 }
 
@@ -91,7 +99,8 @@ enum Family {
 }
 
 /// Writes a sorted partition and the packed hot entries of its key range
-/// to SST files for both column families.
+/// to SST files for both column families (or only positions, unless
+/// `sst.cold`).
 ///
 /// For each column family, the partition is split into contiguous ranges of
 /// buckets, at most one target file size each, or more if that would exceed
@@ -119,7 +128,11 @@ pub fn write_partition(
     };
     let (positions_ranges, positions_files) =
         ranges(records * positions_per_record + hot_bytes as f64);
-    let (cold_ranges, cold_files) = ranges(records * cold_per_record);
+    let (cold_ranges, cold_files) = if sst.cold {
+        ranges(records * cold_per_record)
+    } else {
+        (0, 0)
+    };
     // The larger positions tasks first.
     let tasks: Vec<(Family, usize, usize, usize)> = (0..positions_ranges)
         .map(|range| (Family::Positions, range, positions_ranges, positions_files))
@@ -191,8 +204,9 @@ fn write_range(
     let mut next_file_at = total_records / files;
     let mut records = 0;
     let mut cold_records = 0;
-    let mut cold_group = ColdGroup::default();
+    let mut cold_group = ColdGroup::new(sst.games);
     let mut position_records = 0;
+    let mut skipped_cold_records = 0;
     let mut hot = hot.iter().peekable();
 
     for run in buckets
@@ -210,15 +224,21 @@ fn write_range(
         match (family, run) {
             (Family::Cold, [single]) => {
                 let key = ColdKey::from_hash_bytes(hash);
-                if let Err(key) = cold_group.push(key, single.game_id()) {
+                if let Err(key) = cold_group.push(key, single.seq().game_index()) {
                     let (prefix, value) = cold_group.finish().expect("non-empty group");
                     writer.put(&prefix, value)?;
-                    cold_group.push(key, single.game_id()).expect("empty group");
+                    cold_group
+                        .push(key, single.seq().game_index())
+                        .expect("empty group");
                 }
                 cold_records += 1;
             }
             (Family::Cold, _) => (),
-            (Family::Positions, [_]) => (),
+            (Family::Positions, [_]) => {
+                if !sst.cold {
+                    skipped_cold_records += 1;
+                }
+            }
             (Family::Positions, _) => {
                 while let Some((key, value)) =
                     hot.next_if(|(key, _)| key[..PositionKey::SIZE] < *hash)
@@ -255,6 +275,7 @@ fn write_range(
         Family::Positions => OutputStats {
             positions: written,
             position_records,
+            skipped_cold_records,
             ..OutputStats::default()
         },
     })
