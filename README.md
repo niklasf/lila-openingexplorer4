@@ -57,7 +57,7 @@ Critical performance work:
 * [x] Stress testing tool
 * [x] Determine best disk layout and migration strategy
 * [ ] Document recommended options for each workload
-* [ ] Investigate why LRU beats CLOCK
+* [x] Investigate why LRU beats CLOCK
 * [x] Investigate cache admission policy
 * [ ] cold-path entry synthesis
 * [x] Make cold optional

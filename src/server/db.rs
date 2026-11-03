@@ -30,8 +30,6 @@ const STAGING_DIR: &str = "staging";
 pub struct DbConfig {
     /// Size of the shared block cache in bytes.
     pub cache_bytes: u64,
-    /// Use an LRU cache instead of a hyper clock cache.
-    pub lru_cache: bool,
     /// Bypass the page cache.
     pub direct_reads: bool,
     /// Collect RocksDB statistics.
@@ -84,19 +82,14 @@ fn db_options(config: &DbConfig) -> Options {
     opts
 }
 
+/// An LRU cache in which index and filter blocks (inserted with high
+/// priority) are only evicted by each other, never by data blocks. A hyper
+/// clock cache has no such reserved pool, and caused many more disk reads.
 fn make_cache(config: &DbConfig) -> Cache {
-    if config.lru_cache {
-        let mut opts = rocksdb::LruCacheOptions::default();
-        opts.set_capacity(config.cache_bytes as usize);
-        // Index and filter blocks (inserted with high priority) are only
-        // evicted by each other, never by data blocks.
-        opts.set_high_pri_pool_ratio(1.0);
-        Cache::new_lru_cache_opts(&opts)
-    } else {
-        // Estimated entry charge 0: automatic (block sizes vary with
-        // compression).
-        Cache::new_hyper_clock_cache(config.cache_bytes as usize, 0)
-    }
+    let mut opts = rocksdb::LruCacheOptions::default();
+    opts.set_capacity(config.cache_bytes as usize);
+    opts.set_high_pri_pool_ratio(1.0);
+    Cache::new_lru_cache_opts(&opts)
 }
 
 /// SST files of a directory, in key order (file names sort by key range).
@@ -133,7 +126,6 @@ pub fn ingest(
 ) -> Result<IngestStats, DbError> {
     let config = DbConfig {
         cache_bytes: 64 << 20,
-        lru_cache: true,
         ..DbConfig::default()
     };
     let cache = make_cache(&config);

@@ -66,10 +66,6 @@ struct DbArgs {
     /// leave memory for it.
     #[arg(long, default_value = "4g")]
     cache: ByteSize,
-    /// Use an LRU block cache instead of the (more scalable) hyper clock
-    /// cache.
-    #[arg(long)]
-    lru_cache: bool,
     /// Read SST files with O_DIRECT, bypassing the page cache.
     #[arg(long)]
     direct_reads: bool,
@@ -86,7 +82,6 @@ impl From<DbArgs> for DbConfig {
     fn from(args: DbArgs) -> DbConfig {
         DbConfig {
             cache_bytes: args.cache.into(),
-            lru_cache: args.lru_cache,
             direct_reads: args.direct_reads,
             statistics: args.db_statistics,
             file_opening_threads: args.file_opening_threads,
