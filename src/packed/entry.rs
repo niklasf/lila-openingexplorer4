@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use arbitrary::{Arbitrary, Unstructured};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut};
+use partial_sort::PartialSort;
 use shakmaty::{Color, KnownOutcome, packed::PackedUciMove};
 
 use crate::packed::{
@@ -239,11 +240,12 @@ impl Cell {
         }
     }
 
-    /// Sorts the games and keeps only the most recent ones.
+    /// Keeps only the most recent games, in ascending order.
     fn truncate_games(&mut self) {
-        self.games.sort_unstable();
-        self.games
-            .drain(..self.games.len().saturating_sub(GAMES_PER_CELL));
+        let keep = self.games.len().min(GAMES_PER_CELL);
+        self.games.partial_sort(keep, |a, b| b.cmp(a));
+        self.games.truncate(keep);
+        self.games.reverse();
     }
 }
 

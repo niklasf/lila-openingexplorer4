@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap},
 };
 
+use partial_sort::PartialSort;
 use shakmaty::packed::PackedUciMove;
 
 use crate::{
@@ -311,7 +312,8 @@ fn aggregate(
 }
 
 pub(crate) fn sort_moves_and_truncate(moves: &mut Vec<PreparedMove>, num: usize) {
-    moves.sort_by_key(|pm| Reverse(pm.stats.games()));
+    let num = num.min(moves.len());
+    moves.partial_sort(num, |a, b| b.stats.games().cmp(&a.stats.games()));
     moves.truncate(num);
 }
 

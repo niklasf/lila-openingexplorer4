@@ -1523,6 +1523,7 @@ dependencies = [
  "moka",
  "nohash-hasher",
  "parquet",
+ "partial_sort",
  "pgn-reader",
  "reqwest",
  "rocksdb",
@@ -1773,6 +1774,12 @@ dependencies = [
  "twox-hash",
  "zstd 0.14.3",
 ]
+
+[[package]]
+name = "partial_sort"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "911e0f25a1142e16a3ad3e16b15508823fe46a4f503c59bb4bcf61d5c467a06a"
 
 [[package]]
 name = "percent-encoding"

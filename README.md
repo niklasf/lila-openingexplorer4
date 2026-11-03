@@ -59,9 +59,8 @@ Critical performance work:
 * [ ] Document recommended options for each workload
 * [x] Investigate why LRU beats CLOCK
 * [x] Investigate cache admission policy
-* [ ] cold-path entry synthesis
 * [x] Make cold optional
-* [ ] Partial sorting
+* [x] Partial sorting
 * [ ] Recheck compression on latest SSTs
 * [x] Elias-Fano vs rice on cold entries
 * [x] Optimize SST block sizes

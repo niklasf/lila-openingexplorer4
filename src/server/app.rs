@@ -15,6 +15,7 @@ use axum::{
     routing::get,
 };
 use moka::future::Cache;
+use partial_sort::PartialSort;
 use rocksdb::DBPinnableSlice;
 use shakmaty::{EnPassantMode, fen::Fen, san::SanPlus, variant::VariantPosition};
 use tokio::{
@@ -359,8 +360,13 @@ impl AppState {
                 })
             })
             .collect();
-        top_games.sort_by_key(|&(sum, i)| (std::cmp::Reverse(sum), i));
-        top_games.truncate(query.limits.top_games.min(MAX_MASTERS_GAMES));
+        let num = query
+            .limits
+            .top_games
+            .min(MAX_MASTERS_GAMES)
+            .min(top_games.len());
+        top_games.partial_sort(num, |(a, _), (b, _)| b.cmp(a));
+        top_games.truncate(num);
         let top_games = top_games
             .into_iter()
             .map(|(_, i)| {
