@@ -81,7 +81,6 @@ stress_explorer requests.tsv.zst \
    parquet_to_games lichess_db_rated.parquet --out sst
    ```
 
-
 # Todo
 
 ## Indexing from scratch
@@ -112,6 +111,7 @@ Critical performance work:
 * [x] Recheck compression on latest SSTs
 * [x] Elias-Fano vs rice on cold entries
 * [x] Optimize SST block sizes
+* [ ] moka admission policy
 
 Needs HDDs:
 
@@ -124,7 +124,7 @@ Minor things:
 * [ ] Performance rating
 * [x] Banned player blacklist
 * [ ] Unify masters/lichess API
-* [ ] RocksDB PerfStatsLevel mismatch
+* [ ] RocksDB PerfStatsLevel mismatch (patch prepared)
 
 Pending documentation changes:
 
