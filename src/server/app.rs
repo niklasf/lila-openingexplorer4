@@ -32,6 +32,7 @@ use crate::{
         RatingGroup, unpack_game_value,
     },
     server::{
+        blacklist::{self, Blacklist, LilaConfig},
         db::Database,
         explore::{
             GameRef, MASTERS_TOP_CANDIDATES, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
@@ -101,6 +102,9 @@ pub struct AppConfig {
     pub openings_dir: Option<PathBuf>,
     /// Do not load opening names at all.
     pub no_openings: bool,
+    /// Lichess only: where to get the blacklist of marked players from
+    /// (`None` to show all games).
+    pub blacklist: Option<LilaConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,6 +144,7 @@ pub struct AppState {
     config: AppConfig,
     db: Arc<Database>,
     openings: RwLock<Openings>,
+    blacklist: Blacklist,
     cache: Cache<ExploreQuery, Bytes>,
     semaphore: Semaphore,
     metrics: Metrics,
@@ -263,6 +268,25 @@ impl AppState {
         Ok(games)
     }
 
+    /// Drops the games of blacklisted players, as if they were not found.
+    fn hide_blacklisted(&self, games: &mut [Option<Vec<u8>>]) {
+        if self.blacklist.is_empty() {
+            return;
+        }
+        for slot in games {
+            if let Some(game) = slot {
+                let (_, game) = unpack_game_value(game);
+                if self
+                    .blacklist
+                    .contains_any([game.players.white.name, game.players.black.name])
+                {
+                    self.metrics.blacklisted_games.inc();
+                    *slot = None;
+                }
+            }
+        }
+    }
+
     fn explorer_moves(
         &self,
         pos: &VariantPosition,
@@ -336,7 +360,8 @@ impl AppState {
         ids.extend(prepared.recent_games.iter().map(|g| g.id));
         let top_offset = ids.len();
         ids.extend(prepared.top_games.iter().map(|g| g.id));
-        let games = self.load_games(&ids, &self.metrics.response_games_loaded)?;
+        let mut games = self.load_games(&ids, &self.metrics.response_games_loaded)?;
+        self.hide_blacklisted(&mut games);
         attach_single_games(&mut moves, &games, false);
 
         let response = ExplorerResponse {
@@ -609,6 +634,9 @@ async fn monitor(State(state): State<Shared>) -> String {
             "openings={}u",
             state.openings.read().expect("read openings").len()
         ));
+        if state.config.blacklist.is_some() {
+            fields.push(format!("blacklist={}u", state.blacklist.len()));
+        }
         for (name, ticker) in [
             (
                 "block_cache_hit",
@@ -714,12 +742,20 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
             .build(),
         semaphore: Semaphore::new(config.blocking_threads),
         openings: RwLock::new(openings),
+        blacklist: Blacklist::default(),
         metrics: Metrics::default(),
         config,
         db: Arc::new(db),
     });
     if download_openings {
         task::spawn(periodic_openings_refresh(Arc::clone(&state)));
+    }
+    if let Some(lila) = state.config.blacklist.clone() {
+        let state = Arc::clone(&state);
+        task::spawn(async move {
+            blacklist::periodic_update(&state.blacklist, lila, || state.cache.invalidate_all())
+                .await
+        });
     }
 
     let app = Router::new()

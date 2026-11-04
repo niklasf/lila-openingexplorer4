@@ -98,6 +98,8 @@ pub struct Metrics {
     /// Loaded games that were not in the block cache, fetched with
     /// --parallel-fetch.
     pub parallel_fetch_games: Counter,
+    /// Lichess only: loaded games hidden because a player is blacklisted.
+    pub blacklisted_games: Counter,
     /// Masters only.
     pub pgn_requests: Counter,
     /// Computed responses: time spent computing on the blocking pool.
@@ -122,6 +124,9 @@ impl Metrics {
             ("response_games_loaded", &self.response_games_loaded),
             ("parallel_fetch_games", &self.parallel_fetch_games),
         ];
+        if kind == Kind::Lichess {
+            counters.push(("blacklisted_games", &self.blacklisted_games));
+        }
         if kind == Kind::Masters {
             counters.push(("pgn_requests", &self.pgn_requests));
         }

@@ -2,7 +2,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, process, thread, ti
 
 use clap::{Args, Parser, Subcommand};
 use lila_openingexplorer4::{
-    server::{AppConfig, Database, DbConfig, Kind, ingest, serve},
+    server::{AppConfig, Database, DbConfig, Kind, LilaConfig, ingest, serve},
     util::ByteSize,
 };
 use tikv_jemallocator::Jemalloc;
@@ -143,6 +143,29 @@ struct ServeArgs {
     /// Do not load opening names at all.
     #[arg(long, help_heading = "Server")]
     no_openings: bool,
+    #[command(flatten)]
+    lila: LilaArgs,
+}
+
+#[derive(Args)]
+#[command(next_help_heading = "Blacklist (lichess only)")]
+struct LilaArgs {
+    /// Base url of the lila instance to get the blacklist of marked
+    /// players from (/api/stream/mod-marked-since).
+    #[arg(long, env = "LILA_URL", default_value = "https://lichess.org")]
+    lila: String,
+    /// Token of https://lichess.org/@/OpeningExplorer, for the blacklist.
+    #[arg(long, env = "EXPLORER_BEARER", hide_env_values = true)]
+    lila_bearer: Option<String>,
+    /// File with the token, read before each update.
+    #[arg(long, env = "EXPLORER_BEARER_FILE", conflicts_with = "lila_bearer")]
+    lila_bearer_file: Option<PathBuf>,
+    /// Seconds between blacklist updates.
+    #[arg(long, default_value = "10380")]
+    blacklist_refresh: u64,
+    /// Do not hide games of blacklisted players.
+    #[arg(long)]
+    no_blacklist: bool,
 }
 
 fn raise_fd_limit() {
@@ -223,6 +246,12 @@ fn run(kind: Kind, args: ServeArgs) {
         cold: !args.no_cold,
         openings_dir: args.openings_dir,
         no_openings: args.no_openings,
+        blacklist: (kind == Kind::Lichess && !args.lila.no_blacklist).then(|| LilaConfig {
+            url: args.lila.lila.trim_end_matches('/').to_owned(),
+            bearer: args.lila.lila_bearer,
+            bearer_file: args.lila.lila_bearer_file,
+            refresh: Duration::from_secs(args.lila.blacklist_refresh),
+        }),
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

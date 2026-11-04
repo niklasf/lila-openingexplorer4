@@ -22,7 +22,8 @@ Serve them:
 explorer lichess --db /hdd/db_lichess --bind 127.0.0.1:9002 --cors \
     --cache 32g \
     --blocking-threads 16 \
-    --response-cache 300000
+    --response-cache 300000 \
+    --lila-bearer-file /etc/explorer-bearer
 
 explorer masters --db /hdd/db_masters --bind 127.0.0.1:9003 --cors \
     --max-ply 0 \
@@ -38,6 +39,13 @@ explorer masters --db /hdd/db_masters --bind 127.0.0.1:9003 --cors \
 * `--blocking-threads 16`: To be measured. On hard disks, it might be good
   to oversubscribe.
 * `--response-cache 100000`: 28% hit rate in 2026-11. More gains little.
+* `--lila-bearer-file`: Token of https://lichess.org/@/OpeningExplorer
+  (or `EXPLORER_BEARER_FILE`), for the blacklist of players marked by
+  moderators (`/api/stream/mod-marked-since`, all of it on startup, then
+  every `--blacklist-refresh` seconds, default 173 min). Their games are
+  left out of top, recent, and single-move games; statistics still count
+  them. Without access, updates fail and are retried every minute.
+  `--no-blacklist` to disable.
 * `--max-ply` must match the indexing run: 50 (the default) for lichess,
   0 (all plies) for masters.
 
@@ -114,7 +122,7 @@ Needs HDDs:
 Minor things:
 
 * [ ] Performance rating
-* [ ] Banned player blacklist
+* [x] Banned player blacklist
 * [ ] Unify masters/lichess API
 * [ ] RocksDB PerfStatsLevel mismatch
 
