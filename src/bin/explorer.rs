@@ -76,6 +76,11 @@ struct DbArgs {
     /// Threads for opening table files at startup.
     #[arg(long, default_value = "16")]
     file_opening_threads: usize,
+    /// Load all index and filter blocks when opening (sequentially, file
+    /// by file), and pin them in the block cache, instead of reading them
+    /// as lookups need them. Budget the block cache accordingly.
+    #[arg(long)]
+    pin_metadata: bool,
 }
 
 impl From<DbArgs> for DbConfig {
@@ -85,6 +90,7 @@ impl From<DbArgs> for DbConfig {
             direct_reads: args.direct_reads,
             statistics: args.db_statistics,
             file_opening_threads: args.file_opening_threads,
+            pin_metadata: args.pin_metadata,
         }
     }
 }

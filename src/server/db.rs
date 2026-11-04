@@ -5,8 +5,8 @@ use std::{
 };
 
 use rocksdb::{
-    Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBPinnableSlice, IngestExternalFileOptions,
-    Options, ReadOptions,
+    BlockBasedTablePinningTier, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBPinnableSlice,
+    ErrorKind, IngestExternalFileOptions, Options, ReadOptions, ReadTier,
     statistics::{StatsLevel, Ticker},
 };
 use thiserror::Error;
@@ -36,6 +36,9 @@ pub struct DbConfig {
     pub statistics: bool,
     /// Threads for opening table files at startup.
     pub file_opening_threads: usize,
+    /// Load all index and filter partitions when opening, and pin them in
+    /// the block cache.
+    pub pin_metadata: bool,
 }
 
 #[derive(Debug, Error)]
@@ -46,7 +49,7 @@ pub enum DbError {
     Io(#[from] io::Error),
 }
 
-fn descriptors(cache: &Cache) -> Vec<ColumnFamilyDescriptor> {
+fn descriptors(cache: &Cache, pin_metadata: bool) -> Vec<ColumnFamilyDescriptor> {
     [
         (GAMES_CF, false),
         (POSITIONS_CF, true),
@@ -60,6 +63,11 @@ fn descriptors(cache: &Cache) -> Vec<ColumnFamilyDescriptor> {
         table_opts.set_cache_index_and_filter_blocks(true);
         table_opts.set_cache_index_and_filter_blocks_with_high_priority(true);
         table_opts.set_pin_top_level_index_and_filter(true);
+        if pin_metadata {
+            table_opts.set_top_level_index_pinning_tier(BlockBasedTablePinningTier::All);
+            table_opts.set_partition_pinning_tier(BlockBasedTablePinningTier::All);
+            table_opts.set_unpartitioned_pinning_tier(BlockBasedTablePinningTier::All);
+        }
         let mut opts = Options::default();
         opts.set_block_based_table_factory(&table_opts);
         opts.set_disable_auto_compactions(true);
@@ -136,7 +144,7 @@ pub fn ingest(
     // ingested file (footer, properties, index and filter) when it applies
     // the version edit; with a limited one it only opens a few.
     opts.set_max_open_files(64);
-    let db = DB::open_cf_descriptors(&opts, path, descriptors(&cache))?;
+    let db = DB::open_cf_descriptors(&opts, path, descriptors(&cache, false))?;
     let staging = path.join(STAGING_DIR);
     fs::create_dir_all(&staging)?;
 
@@ -198,7 +206,12 @@ impl Database {
         let started = Instant::now();
         let cache = make_cache(config);
         let opts = db_options(config);
-        let db = DB::open_cf_descriptors_read_only(&opts, path, descriptors(&cache), false)?;
+        let db = DB::open_cf_descriptors_read_only(
+            &opts,
+            path,
+            descriptors(&cache, config.pin_metadata),
+            false,
+        )?;
         log::info!(
             "opened {} read-only in {:.1?}",
             path.display(),
