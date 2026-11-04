@@ -139,8 +139,9 @@ Response: `application/x-ndjson`, a stream of snapshots, each:
   updated `queuePosition`; while indexing, a fresh snapshot about every
   second; a last snapshot once indexing is complete, then the stream ends.
   Consecutive snapshots with the same `(queuePosition, total)` are
-  dropped. Possibly empty keep-alive lines (documented, but the old server
-  never sent them).
+  dropped. Empty keep-alive lines after 8 s without a line (the old
+  server's `NdJson` stream in `api/nd_json.rs` did that too, for example
+  while a player waited in the queue with an unchanged position).
 * No new indexing if the last run was less than the cooldown ago (2 min,
   as in the old code; the API doc says 1 min); previously ongoing games are revisited at most
   once per day. The stream then has a single snapshot.
@@ -245,6 +246,17 @@ candidates by replaying their moves (as the lichess server does), add up.
 Then **placement is only an optimization, never a correctness question**:
 any rule for what goes to warm or cold gives correct responses, so the rule
 (and a threshold like "cold up to T games") can be tuned freely.
+
+One constraint on placement keeps the union disjoint (found by the storage
+property test): **all visits of a game with the same cold fingerprint
+(color, bucket, 16 fingerprint bits) are either all cold or all warm**.
+Otherwise, if position P of a game is warm and position Q of the same game
+is cold with the same fingerprint, a read of P finds the game's cold item
+of Q, replay confirms that the game reached P, and the game is counted
+twice. With 0 bucket bits (small players) about 1.5% of games have such a
+collision. The placement step enforces it after choosing the bucket bits
+(colliding cold visits move to warm). Validation by replay is still needed
+for the other games of the group.
 
 Why not "trust a warm hit": then every write must first know whether the
 position is already warm (else a new warm entry would hide a cold game),
@@ -549,9 +561,9 @@ clean semantics rather than load; no experiment needed. Not done: waking
 only streams whose position was touched by a batch (would need per-batch
 key sets).
 
-Optionally an empty keep-alive line after ~30 s without a snapshot (the
-API documents them), for proxies with idle timeouts while a player waits
-in the queue.
+An empty keep-alive line after 8 s without a line, as before (the API
+documents them), for proxies with idle timeouts while a player waits in
+the queue.
 
 ## Mock lila (preparation step)
 

@@ -113,7 +113,10 @@ pub fn performance(stats: &SubStats, color: Color) -> Option<i32> {
     if games == 0 {
         return None;
     }
-    let average = 1500.0 + stats.rating_offset_sum as f64 / games as f64;
+    // Exactly as before (sum of absolute ratings over games), so that
+    // rounding at .5 agrees.
+    let rating_sum = stats.rating_offset_sum + 1500 * games as i64;
+    let average = rating_sum as f64 / games as f64;
     let wins = match color {
         Color::White => stats.white,
         Color::Black => stats.black,
