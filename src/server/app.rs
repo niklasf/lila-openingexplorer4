@@ -3,7 +3,6 @@ use std::{
     ops::Deref,
     path::PathBuf,
     sync::{Arc, RwLock},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -21,6 +20,7 @@ use rocksdb::DBPinnableSlice;
 use shakmaty::{EnPassantMode, fen::Fen, san::SanPlus, variant::VariantPosition};
 use tokio::{
     net::TcpListener,
+    runtime::Handle,
     signal::unix::{SignalKind, signal},
     sync::Semaphore,
     task, time,
@@ -138,7 +138,7 @@ impl IntoResponse for Error {
 
 pub struct AppState {
     config: AppConfig,
-    db: Database,
+    db: Arc<Database>,
     openings: RwLock<Openings>,
     cache: Cache<ExploreQuery, Bytes>,
     semaphore: Semaphore,
@@ -232,29 +232,33 @@ impl AppState {
                 }
             }
         }
-        self.metrics.games_fetched.add(missing.len() as u64);
+        self.metrics.parallel_fetch_games.add(missing.len() as u64);
         match missing[..] {
             [] => (),
             [i] => games[i] = self.db.game(ids[i])?.map(|game| game.to_vec()),
-            _ => thread::scope(|scope| {
+            _ => {
+                // Called on a thread of the blocking pool (outside of async
+                // contexts), so it can wait for the fetches, which run on
+                // further threads of the same pool.
+                let runtime = Handle::current();
                 let fetches: Vec<_> = missing
                     .iter()
                     .map(|&i| {
-                        (
-                            i,
-                            scope.spawn(move || {
-                                self.db
-                                    .game(ids[i])
-                                    .map(|game| game.map(|game| game.to_vec()))
-                            }),
-                        )
+                        let db = Arc::clone(&self.db);
+                        let id = ids[i];
+                        let fetch = runtime.spawn_blocking(move || {
+                            db.game(id).map(|game| game.map(|game| game.to_vec()))
+                        });
+                        (i, fetch)
                     })
                     .collect();
-                for (i, fetch) in fetches {
-                    games[i] = fetch.join().expect("game fetch")?;
-                }
-                Ok::<_, rocksdb::Error>(())
-            })?,
+                runtime.block_on(async {
+                    for (i, fetch) in fetches {
+                        games[i] = fetch.await.expect("game fetch")?;
+                    }
+                    Ok::<_, rocksdb::Error>(())
+                })?;
+            }
         }
         Ok(games)
     }
@@ -712,7 +716,7 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         openings: RwLock::new(openings),
         metrics: Metrics::default(),
         config,
-        db,
+        db: Arc::new(db),
     });
     if download_openings {
         task::spawn(periodic_openings_refresh(Arc::clone(&state)));

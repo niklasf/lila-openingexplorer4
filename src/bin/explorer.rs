@@ -227,6 +227,10 @@ fn run(kind: Kind, args: ServeArgs) {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .max_blocking_threads(
+            blocking_threads + // enforced by semaphore
+            512, // paralell game fetches
+        )
         .build()
         .expect("tokio runtime");
 
