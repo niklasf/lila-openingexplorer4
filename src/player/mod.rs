@@ -3,7 +3,12 @@
 pub mod aggregate;
 pub mod cold;
 pub mod db;
+pub mod indexer;
+#[cfg(test)]
+mod indexer_tests;
 pub mod keys;
+pub mod lila;
+pub mod queue;
 pub mod record;
 pub mod status;
 #[cfg(test)]

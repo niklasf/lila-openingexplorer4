@@ -28,20 +28,8 @@ use crate::{
     packed::{BorrowedLichessGame, LaxDate, PackedMovesDecoder, Speed},
     parquet::Input,
     player::UserId,
+    util::civil::{MS_PER_DAY, days_from_civil},
 };
-
-const MS_PER_DAY: u64 = 86_400_000;
-
-/// Days since 1970-01-01 of a proleptic Gregorian date.
-pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (i64::from(month) + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
 
 fn day_of(date: LaxDate) -> u32 {
     let days = days_from_civil(
@@ -365,13 +353,6 @@ pub fn prepare(config: PrepareConfig<'_>) -> Result<FixtureMeta, FixtureError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_days_from_civil() {
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
-        assert_eq!(days_from_civil(2026, 11, 3), 20_760);
-    }
 
     #[test]
     fn test_chess960() {

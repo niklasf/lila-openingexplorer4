@@ -452,6 +452,104 @@ impl Fixture {
     }
 }
 
+/// Writes a fixture of random games (for tests): `games` games per player,
+/// one per hour from `start` (ms), against opponents that are not in the
+/// fixture. Returns the games of each player.
+pub fn write_synthetic(
+    dir: &Path,
+    players: &[UserId],
+    games: impl Fn(usize) -> usize,
+    start: u64,
+    seed: u64,
+) -> Result<Vec<Vec<FixtureGame>>, FixtureError> {
+    use shakmaty::{Chess, Position, san::SanPlus};
+
+    let mut x = seed ^ 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut players: Vec<UserId> = players.to_vec();
+    players.sort();
+    let mut writer = FixtureWriter::create(dir)?;
+    let mut all = Vec::new();
+    let mut id = 0u64;
+    for (p, player) in players.iter().enumerate() {
+        let mut records = Vec::new();
+        let mut list = Vec::new();
+        for g in 0..games(p) {
+            let mut pos = Chess::default();
+            let mut sans = Vec::new();
+            for ply in 0..(next() % 80) {
+                let legals = pos.legal_moves();
+                if legals.is_empty() {
+                    break;
+                }
+                let i = if ply < 6 { next() % 3 } else { next() } as usize % legals.len();
+                sans.push(SanPlus::from_move_and_play_unchecked(&mut pos, legals[i]).to_string());
+            }
+            let me = FixturePlayer {
+                name: player.as_str().to_uppercase(),
+                title: None,
+                rating: Some(1500 + (next() % 500) as u16),
+            };
+            let opponent = FixturePlayer {
+                name: format!("opponent{}", next() % 50),
+                title: (next() % 10 == 0).then(|| "FM".to_owned()),
+                rating: Some(1200 + (next() % 1000) as u16),
+            };
+            let white = next() % 2 == 0;
+            id += 1;
+            let mut digits = [b'0'; 8];
+            let mut n = id + p as u64 * 1_000_000;
+            for d in digits.iter_mut().rev() {
+                *d = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    [(n % 62) as usize];
+                n /= 62;
+            }
+            let game = FixtureGame {
+                created_at: start + g as u64 * 3_600_000,
+                id: GameId::from_ascii(&digits).expect("game id"),
+                variant: LilaVariant::Standard,
+                speed: Speed::from_bits(1 + (next() % 6) as u8).expect("speed"),
+                outcome: match next() % 3 {
+                    0 => KnownOutcome::Draw,
+                    1 => KnownOutcome::Decisive {
+                        winner: Color::White,
+                    },
+                    _ => KnownOutcome::Decisive {
+                        winner: Color::Black,
+                    },
+                },
+                status: FinalStatus::Resign,
+                players: if white {
+                    ByColor {
+                        white: me,
+                        black: opponent,
+                    }
+                } else {
+                    ByColor {
+                        white: opponent,
+                        black: me,
+                    }
+                },
+                initial_fen: None,
+                sans: sans.join(" "),
+            };
+            let mut buf = Vec::new();
+            game.pack(&mut buf);
+            records.push(buf);
+            list.push(game);
+        }
+        writer.write_player(player, records.iter().map(Vec::as_slice))?;
+        all.push(list);
+    }
+    writer.finish()?;
+    Ok(all)
+}
+
 /// Iterates the bodies of packed records.
 pub fn record_bodies(mut buf: &[u8]) -> impl Iterator<Item = &[u8]> {
     std::iter::from_fn(move || {

@@ -28,10 +28,11 @@ use tokio::{net::TcpListener, sync::mpsc, task};
 use crate::{
     mock_lila::{
         fixture::{Fixture, FixtureGame, FixturePlayer, LilaVariant, record_bodies},
-        prepare::{days_from_civil, mix},
+        prepare::mix,
     },
     packed::Speed,
     player::UserId,
+    util::civil::{civil_from_days, days_from_civil},
 };
 
 /// Rates of synthesized irregularities, each in `0.0..=1.0`.
@@ -202,18 +203,6 @@ fn next_month_start(ms: u64) -> u64 {
         year += 1;
     }
     days_from_civil(year, month, 1) as u64 * 86_400_000
-}
-
-fn civil_from_days(days: i64) -> (i64, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month)
 }
 
 /// Milliseconds per ply, by speed, for synthesized game durations.
