@@ -2,6 +2,14 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, process, thread, ti
 
 use clap::{Args, Parser, Subcommand};
 use lila_openingexplorer4::{
+    player::{
+        PlayerDb, PlayerDbConfig,
+        aggregate::Placement,
+        indexer::{Indexer, IndexerConfig},
+        lila::{LilaClient, LilaClientConfig},
+        server::PlayerServerConfig,
+        status::RunPolicy,
+    },
     server::{AppConfig, Database, DbConfig, Kind, LilaConfig, ingest, serve},
     util::ByteSize,
 };
@@ -10,12 +18,15 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: Jemalloc = Jemalloc;
 
-/// Read-only opening explorer server for the SST files produced by
-/// parquet_to_games and parquet_to_positions.
+/// Opening explorer servers.
 ///
-/// First create a database directory with `ingest`, which hard-links the
-/// SST files (they must be on the same file system). Then serve it with
-/// `lichess` or `masters`, which open the database strictly read-only.
+/// `lichess` and `masters` serve the read-only SST files produced by
+/// parquet_to_games and parquet_to_positions: first create a database
+/// directory with `ingest`, which hard-links the SST files (they must be on
+/// the same file system), then serve it, strictly read-only.
+///
+/// `player` serves the personal opening explorer (/player) from its own
+/// live database, indexing players' games from lila on demand.
 ///
 /// Logging is configured with EXPLORER_LOG (like RUST_LOG), default info.
 #[derive(Parser)]
@@ -33,6 +44,113 @@ enum Command {
     /// Serves /masters and /masters/pgn/{id} from an ingested database of
     /// masters games.
     Masters(ServeArgs),
+    /// Serves /player (and /personal) from a writable database of indexed
+    /// players, created if missing.
+    Player(PlayerArgs),
+}
+
+#[derive(Args)]
+struct PlayerArgs {
+    /// Database directory (created if missing). Only one process may open
+    /// it.
+    #[arg(long)]
+    db: PathBuf,
+    /// Binding address. Administrative endpoints (/monitor) must be
+    /// protected by a reverse proxy.
+    #[arg(long, default_value = "127.0.0.1:9003")]
+    bind: SocketAddr,
+    /// Allow access from all origins.
+    #[arg(long)]
+    cors: bool,
+    /// Size of the RocksDB block cache.
+    #[arg(long, default_value = "4g")]
+    cache: ByteSize,
+    /// Plies indexed per game. Not meant to change on an existing database
+    /// (players are rebuilt with the next index run).
+    #[arg(long, default_value = "50")]
+    max_ply: usize,
+    /// Directory of the write ahead log (default: in the database).
+    #[arg(long)]
+    wal_dir: Option<PathBuf>,
+    /// Limit flushes and compactions to this many bytes per second, like
+    /// 64m.
+    #[arg(long)]
+    rate_limit: Option<ByteSize>,
+    /// Collect RocksDB statistics (tickers in /monitor).
+    #[arg(long)]
+    db_statistics: bool,
+    /// Positions with at least this many games of a player get a warm entry
+    /// (others a cold one), in rebuilds and in each chunk.
+    #[arg(long, default_value = "2")]
+    warm_threshold: usize,
+    /// Parallel index runs, which is also the most parallel streams from
+    /// lila (every request counts, retries included).
+    #[arg(long, default_value = "8", help_heading = "Indexer")]
+    indexers: usize,
+    /// Players waiting for indexing at most (503 when full).
+    #[arg(long, default_value = "2000", help_heading = "Indexer")]
+    queue_capacity: usize,
+    /// No new index run of a player within this many seconds.
+    #[arg(long, default_value = "120", help_heading = "Indexer")]
+    cooldown: u64,
+    /// Revisit ongoing games at most this often (seconds).
+    #[arg(long, default_value = "86400", help_heading = "Indexer")]
+    revisit_interval: u64,
+    /// Games per chunk (one atomic write) at most.
+    #[arg(long, default_value = "2000", help_heading = "Indexer")]
+    chunk_games: usize,
+    /// Write a chunk at least this often while indexing (milliseconds).
+    #[arg(long, default_value = "1000", help_heading = "Indexer")]
+    chunk_interval_ms: u64,
+    /// Give up the stream of a run after this many seconds and continue at
+    /// the end of the queue (0 to run until done).
+    #[arg(long, default_value = "0", help_heading = "Indexer")]
+    max_run: u64,
+    /// Rebuild a player after at least this many new games ...
+    #[arg(long, default_value = "1000", help_heading = "Indexer")]
+    rebuild_min_games: u32,
+    /// ... and this share of the games at the last rebuild.
+    #[arg(long, default_value = "0.5", help_heading = "Indexer")]
+    rebuild_factor: f64,
+    /// Parallel rebuilds at most.
+    #[arg(long, default_value = "1", help_heading = "Indexer")]
+    rebuilds: usize,
+    /// Seconds to wait for lila's response and between chunks of it.
+    #[arg(long, default_value = "60", help_heading = "Indexer")]
+    lila_timeout: u64,
+    /// Base url of the lila instance to index games from.
+    #[arg(
+        long,
+        env = "LILA_URL",
+        default_value = "https://lichess.org",
+        help_heading = "Indexer"
+    )]
+    lila: String,
+    /// Token of https://lichess.org/@/OpeningExplorer.
+    #[arg(
+        long,
+        env = "EXPLORER_BEARER",
+        hide_env_values = true,
+        help_heading = "Indexer"
+    )]
+    lila_bearer: Option<String>,
+    /// File with the token, read before each request.
+    #[arg(
+        long,
+        env = "EXPLORER_BEARER_FILE",
+        conflicts_with = "lila_bearer",
+        help_heading = "Indexer"
+    )]
+    lila_bearer_file: Option<PathBuf>,
+    /// Concurrent database reads of requests.
+    #[arg(long, default_value = "4", help_heading = "Server")]
+    blocking_threads: usize,
+    /// Directory with a.tsv to e.tsv of lichess-org/chess-openings.
+    #[arg(long, help_heading = "Server", conflicts_with = "no_openings")]
+    openings_dir: Option<PathBuf>,
+    /// Do not load opening names at all.
+    #[arg(long, help_heading = "Server")]
+    no_openings: bool,
 }
 
 #[derive(Args)]
@@ -225,6 +343,79 @@ fn main() {
         }
         Command::Lichess(args) => run(Kind::Lichess, args),
         Command::Masters(args) => run(Kind::Masters, args),
+        Command::Player(args) => run_player(args),
+    }
+}
+
+fn run_player(args: PlayerArgs) {
+    raise_fd_limit();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(args.blocking_threads + args.indexers + args.rebuilds + 16)
+        .build()
+        .expect("tokio runtime");
+    let db = match PlayerDb::open(
+        &args.db,
+        PlayerDbConfig {
+            cache_bytes: args.cache.into(),
+            max_ply: args.max_ply,
+            placement: Placement::Threshold(args.warm_threshold.max(1)),
+            rate_limit: args.rate_limit.map(u64::from),
+            wal_dir: args.wal_dir,
+            statistics: args.db_statistics,
+            ..PlayerDbConfig::default()
+        },
+    ) {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!("error: {err}");
+            process::exit(1);
+        }
+    };
+    let result = runtime.block_on(async {
+        let lila = std::sync::Arc::new(LilaClient::new(LilaClientConfig {
+            url: args.lila.trim_end_matches('/').to_owned(),
+            bearer: args.lila_bearer,
+            bearer_file: args.lila_bearer_file,
+            streams: args.indexers,
+            read_timeout: Duration::from_secs(args.lila_timeout),
+            ..LilaClientConfig::default()
+        }));
+        let indexer = Indexer::start(
+            std::sync::Arc::new(db),
+            lila,
+            IndexerConfig {
+                indexers: args.indexers,
+                queue_capacity: args.queue_capacity,
+                policy: RunPolicy {
+                    cooldown: args.cooldown * 1000,
+                    revisit_interval: args.revisit_interval * 1000,
+                },
+                chunk_games: args.chunk_games,
+                chunk_interval: Duration::from_millis(args.chunk_interval_ms),
+                max_run: (args.max_run > 0).then(|| Duration::from_secs(args.max_run)),
+                rebuild_min_games: args.rebuild_min_games,
+                rebuild_factor: args.rebuild_factor,
+                rebuilds: args.rebuilds,
+                ..IndexerConfig::default()
+            },
+        );
+        lila_openingexplorer4::player::server::serve(
+            PlayerServerConfig {
+                bind: args.bind,
+                cors: args.cors,
+                blocking_threads: args.blocking_threads,
+                openings_dir: args.openings_dir,
+                no_openings: args.no_openings,
+                ..PlayerServerConfig::default()
+            },
+            indexer,
+        )
+        .await
+    });
+    if let Err(err) = result {
+        eprintln!("error: {err}");
+        process::exit(1);
     }
 }
 

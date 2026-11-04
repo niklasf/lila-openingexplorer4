@@ -60,7 +60,7 @@ impl Histogram {
 
     /// Cumulative bucket counts, count, sum, and the maximum since the
     /// previous call.
-    fn fields(&self, prefix: &str, out: &mut Vec<String>) {
+    pub fn fields(&self, prefix: &str, out: &mut Vec<String>) {
         let mut count = 0;
         for (counter, max) in self.counts.iter().zip(BUCKETS) {
             count += counter.get();

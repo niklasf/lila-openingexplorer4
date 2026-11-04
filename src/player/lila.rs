@@ -307,14 +307,17 @@ impl ExportGame {
             return Classified::Skip(Skip::Invalid);
         };
         let mut pos = match &self.initial_fen {
-            Some(fen) => match fen.parse::<Fen>().map(Fen::into_setup).map(|setup| {
-                VariantPosition::from_setup(variant, setup, CastlingMode::Chess960)
-                    .or_else(PositionError::ignore_invalid_castling_rights)
-                    .or_else(PositionError::ignore_invalid_ep_square)
-            }) {
-                Ok(Ok(pos)) => pos,
-                _ => return Classified::Skip(Skip::Invalid),
-            },
+            Some(fen) => {
+                let Some(pos) = fen.parse::<Fen>().ok().and_then(|fen| {
+                    VariantPosition::from_setup(variant, fen.into_setup(), CastlingMode::Chess960)
+                        .or_else(PositionError::ignore_invalid_castling_rights)
+                        .or_else(PositionError::ignore_invalid_ep_square)
+                        .ok()
+                }) else {
+                    return Classified::Skip(Skip::Invalid);
+                };
+                pos
+            }
             None => VariantPosition::new(variant),
         };
         let setup = PlayerGame::setup_of(&pos);
