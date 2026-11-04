@@ -31,6 +31,9 @@ pub struct IndexerConfig {
     pub indexers: usize,
     /// Players waiting at most.
     pub queue_capacity: usize,
+    /// Queue players that have an index (incremental runs) before first
+    /// runs.
+    pub known_first: bool,
     pub policy: RunPolicy,
     /// Games per chunk at most.
     pub chunk_games: usize,
@@ -56,10 +59,11 @@ impl Default for IndexerConfig {
         IndexerConfig {
             indexers: 8,
             queue_capacity: 2000,
+            known_first: true,
             policy: RunPolicy::default(),
             chunk_games: 2000,
             chunk_interval: Duration::from_secs(1),
-            max_run: None,
+            max_run: Some(Duration::from_secs(30)),
             rebuild_min_games: 1000,
             rebuild_factor: 0.5,
             rebuilds: 1,
@@ -151,7 +155,7 @@ impl Indexer {
     /// Starts the indexer tasks.
     pub fn start(db: Arc<PlayerDb>, lila: Arc<LilaClient>, config: IndexerConfig) -> Arc<Indexer> {
         let indexer = Arc::new(Indexer {
-            queue: Arc::new(Queue::new(config.queue_capacity)),
+            queue: Arc::new(Queue::new(config.queue_capacity, config.known_first)),
             rebuilds: Arc::new(Semaphore::new(config.rebuilds.max(1))),
             db,
             lila,
@@ -208,7 +212,8 @@ impl Indexer {
         {
             return Ok(Ticket::completed());
         }
-        self.queue.submit(user.clone()).inspect_err(|_| {
+        let known = status.is_some_and(|status| status.games > 0);
+        self.queue.submit(user.clone(), known).inspect_err(|_| {
             inc(&self.metrics.queue_full);
         })
     }

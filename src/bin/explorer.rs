@@ -90,6 +90,10 @@ struct PlayerArgs {
     /// Players waiting for indexing at most (503 when full).
     #[arg(long, default_value = "2000", help_heading = "Indexer")]
     queue_capacity: usize,
+    /// Queue players strictly in order of arrival, instead of players that
+    /// already have an index (short incremental runs) before first runs.
+    #[arg(long, help_heading = "Indexer")]
+    fifo: bool,
     /// No new index run of a player within this many seconds.
     #[arg(long, default_value = "120", help_heading = "Indexer")]
     cooldown: u64,
@@ -103,8 +107,9 @@ struct PlayerArgs {
     #[arg(long, default_value = "1000", help_heading = "Indexer")]
     chunk_interval_ms: u64,
     /// Give up the stream of a run after this many seconds and continue at
-    /// the end of the queue (0 to run until done).
-    #[arg(long, default_value = "0", help_heading = "Indexer")]
+    /// the end of the queue (0 to run until done). 30 s with --fifo off was
+    /// best in the queue simulation of the launch (empty database).
+    #[arg(long, default_value = "30", help_heading = "Indexer")]
     max_run: u64,
     /// Rebuild a player after at least this many new games ...
     #[arg(long, default_value = "1000", help_heading = "Indexer")]
@@ -387,6 +392,7 @@ fn run_player(args: PlayerArgs) {
             IndexerConfig {
                 indexers: args.indexers,
                 queue_capacity: args.queue_capacity,
+                known_first: !args.fifo,
                 policy: RunPolicy {
                     cooldown: args.cooldown * 1000,
                     revisit_interval: args.revisit_interval * 1000,

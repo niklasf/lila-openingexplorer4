@@ -62,6 +62,8 @@ pub struct QueueFull;
 struct Entry {
     tx: Arc<watch::Sender<Progress>>,
     running: bool,
+    /// Has an index already (an incremental run), queued before first runs.
+    known: bool,
 }
 
 #[derive(Default)]
@@ -93,6 +95,7 @@ pub struct Queue {
     state: Mutex<State>,
     notify: Notify,
     capacity: usize,
+    known_first: bool,
 }
 
 /// Counts of the queue, for `/monitor`.
@@ -104,11 +107,12 @@ pub struct QueueStats {
 }
 
 impl Queue {
-    pub fn new(capacity: usize) -> Queue {
+    pub fn new(capacity: usize, known_first: bool) -> Queue {
         Queue {
             state: Mutex::new(State::default()),
             notify: Notify::new(),
             capacity,
+            known_first,
         }
     }
 
@@ -130,8 +134,9 @@ impl Queue {
     }
 
     /// Queues a player, or joins the ticket of the player if already
-    /// queued.
-    pub fn submit(&self, user: UserId) -> Result<Ticket, QueueFull> {
+    /// queued. With `known_first`, players that are `known` (have an index
+    /// already) are queued before the first waiting player that is not.
+    pub fn submit(&self, user: UserId, known: bool) -> Result<Ticket, QueueFull> {
         let mut state = self.state.lock().expect("queue");
         if let Some(entry) = state.entries.get(&user) {
             return Ok(Ticket {
@@ -151,9 +156,20 @@ impl Queue {
             Entry {
                 tx: Arc::new(tx),
                 running: false,
+                known,
             },
         );
-        state.waiting.push_back(user);
+        let position = if known && self.known_first {
+            state
+                .waiting
+                .iter()
+                .position(|other| state.entries.get(other).is_some_and(|e| !e.known))
+                .unwrap_or(state.waiting.len())
+        } else {
+            state.waiting.len()
+        };
+        state.waiting.insert(position, user);
+        state.update_positions();
         drop(state);
         self.notify.notify_one();
         Ok(Ticket { rx })
@@ -239,6 +255,7 @@ impl QueueItem {
         state.busy.remove(&self.user);
         if let Some(entry) = state.entries.get_mut(&self.user) {
             entry.running = false;
+            entry.known = true;
             state.waiting.push_back(self.user.clone());
         }
         state.update_positions();
@@ -324,11 +341,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue() {
-        let queue = Arc::new(Queue::new(2));
-        let a = queue.submit(user("a")).unwrap();
-        let b = queue.submit(user("b")).unwrap();
-        assert_eq!(queue.submit(user("c")).err(), Some(QueueFull));
-        let a2 = queue.submit(user("a")).unwrap();
+        let queue = Arc::new(Queue::new(2, false));
+        let a = queue.submit(user("a"), false).unwrap();
+        let b = queue.submit(user("b"), false).unwrap();
+        assert_eq!(queue.submit(user("c"), false).err(), Some(QueueFull));
+        let a2 = queue.submit(user("a"), false).unwrap();
         assert_eq!(a.progress().queue_position, 1);
         assert_eq!(b.progress().queue_position, 2);
 
@@ -353,7 +370,7 @@ mod tests {
         assert!(queue.watch(&user("a")).is_none());
 
         // Busy players wait.
-        let mut a3 = queue.submit(user("a")).unwrap();
+        let mut a3 = queue.submit(user("a"), false).unwrap();
         let waiting = tokio::time::timeout(Duration::from_millis(50), queue.acquire()).await;
         assert!(waiting.is_err());
         drop(busy);
@@ -362,5 +379,19 @@ mod tests {
         drop(item);
         assert!(a3.changed().await.done);
         assert_eq!(queue.stats().busy, 0);
+    }
+
+    #[tokio::test]
+    async fn test_known_first() {
+        let queue = Arc::new(Queue::new(10, true));
+        let a = queue.submit(user("a"), false).unwrap();
+        let b = queue.submit(user("b"), true).unwrap();
+        let c = queue.submit(user("c"), false).unwrap();
+        let d = queue.submit(user("d"), true).unwrap();
+        let order: Vec<u64> = [&a, &b, &c, &d]
+            .iter()
+            .map(|t| t.progress().queue_position)
+            .collect();
+        assert_eq!(order, [3, 1, 4, 2]);
     }
 }
