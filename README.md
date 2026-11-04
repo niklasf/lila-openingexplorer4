@@ -41,10 +41,11 @@ explorer masters --db /hdd/db_masters --bind 127.0.0.1:9003 --cors \
 * `--max-ply` must match the indexing run: 50 (the default) for lichess,
   0 (all plies) for masters.
 
-Replay a request log against both:
+Replay an nginx request log (tab separated `$msec`, `$status`,
+`$request_time`, `$upstream_response_time`, `$request_uri`) against both:
 
 ```sh
-stress_explorer sample-log.txt.zst \
+stress_explorer requests.tsv.zst \
     --lichess-url http://127.0.0.1:9002 \
     --masters-url http://127.0.0.1:9003
 ```
@@ -108,12 +109,14 @@ Needs HDDs:
 
 * [ ] Optimize blocking thread count
 * [ ] Recheck parallel game loading
+* [ ] Consider loading and pinning meta data on startup
 
 Minor things:
 
 * [ ] Performance rating
 * [ ] Banned player blacklist
 * [ ] Unify masters/lichess API
+* [ ] RocksDB PerfStatsLevel mismatch
 
 Pending documentation changes:
 

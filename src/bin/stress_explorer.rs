@@ -1,10 +1,10 @@
 use std::{
     collections::HashSet,
     fs,
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader, Read, Write},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -18,10 +18,12 @@ use tokio::task::JoinSet;
 /// Replays requests from a log against running explorer servers, and
 /// reports throughput, latency percentiles and invalid responses.
 ///
-/// The log has one path with query string per line, like
-/// `/lichess?fen=...`, and may be zstd compressed (`.zst`). Requests are
-/// sent in the order of the log. Requests that do not match a route of
-/// the given servers are skipped.
+/// The log has tab separated nginx log entries
+/// `$msec\t$status\t$request_time\t$upstream_response_time\t$request_uri`,
+/// and may be zstd compressed (`.zst`). Requests are sent in the order in
+/// which they started (`$msec - $request_time`), and `--speed` replays them
+/// with their original timing. Requests rejected by nginx (429) and
+/// requests that do not match a route of the given servers are skipped.
 #[derive(Parser)]
 #[command(group(ArgGroup::new("servers").required(true).multiple(true)))]
 struct Args {
@@ -53,6 +55,26 @@ struct Args {
     /// Timeout of each request in seconds.
     #[arg(long, default_value = "60")]
     timeout: u64,
+    /// Send the measured requests at this rate (requests per second, across
+    /// all targets), instead of as fast as possible. Latencies then count
+    /// from when a request was due, including time waiting for one of the
+    /// concurrent slots.
+    #[arg(long, conflicts_with = "speed")]
+    rate: Option<f64>,
+    /// Send the measured requests at their original times, sped up by this
+    /// factor. Latencies count from when a request
+    /// was due, as with `--rate`.
+    #[arg(long)]
+    speed: Option<f64>,
+    /// Print throughput and latencies of the last interval (in seconds) to
+    /// stderr, also during warm-up.
+    #[arg(long)]
+    interval: Option<f64>,
+    /// Write the latency of each measured request to this file, as lines
+    /// `index\tserver\tstatus\tmicroseconds` (index in the measured
+    /// requests; status 0 if the request failed).
+    #[arg(long)]
+    latency_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +108,22 @@ struct Request {
     target: usize,
     /// Path with query string.
     path: String,
+    /// Start time in the log, in seconds.
+    start: f64,
+    /// When to send the request, relative to the start of the replay (or as
+    /// soon as possible).
+    due: Option<Duration>,
+}
+
+/// Parses a log entry: the start time and the path with query string, or
+/// `None` for malformed entries and requests that nginx rejected.
+fn parse_entry(line: &str) -> Option<(f64, &str)> {
+    let mut fields = line.split('\t');
+    let msec: f64 = fields.next()?.parse().ok()?;
+    let status = fields.next()?;
+    let request_time: f64 = fields.next()?.parse().ok()?;
+    let path = fields.nth(1)?;
+    (status != "429").then_some((msec - request_time, path))
 }
 
 /// The requests for the targets, and the number of skipped lines.
@@ -101,6 +139,11 @@ fn read_requests(args: &Args, targets: &[Target]) -> io::Result<(Vec<Request>, u
     let mut skipped = 0;
     for line in BufReader::new(reader).lines() {
         let line = line?;
+        let Some((start, line)) = parse_entry(&line) else {
+            skipped += 1;
+            continue;
+        };
+        let line = line.to_owned();
         let path = line.split_once('?').map_or(line.as_str(), |(path, _)| path);
         let Some(target) = Kind::route(path)
             .and_then(|kind| targets.iter().position(|target| target.kind == kind))
@@ -111,8 +154,15 @@ fn read_requests(args: &Args, targets: &[Target]) -> io::Result<(Vec<Request>, u
         if args.unique && !seen.insert(line.clone()) {
             continue;
         }
-        requests.push(Request { target, path: line });
+        requests.push(Request {
+            target,
+            path: line,
+            start,
+            due: None,
+        });
     }
+    // The log is ordered by completion.
+    requests.sort_by(|a, b| a.start.total_cmp(&b.start));
     let requests = requests
         .into_iter()
         .skip(args.skip)
@@ -127,9 +177,20 @@ fn read_requests(args: &Args, targets: &[Target]) -> io::Result<(Vec<Request>, u
 /// Most examples of failed requests to report.
 const MAX_EXAMPLES: usize = 5;
 
+/// A request in the latency log.
+#[derive(Clone, Copy)]
+struct LogEntry {
+    /// Index in the measured requests.
+    index: usize,
+    /// HTTP status, or 0 if the request failed.
+    status: u16,
+    latency: Duration,
+}
+
 #[derive(Default, Clone)]
 struct Outcome {
     latencies: Vec<Duration>,
+    log: Vec<LogEntry>,
     ok: usize,
     client_errors: usize,
     server_errors: usize,
@@ -151,6 +212,7 @@ impl Outcome {
 
     fn merge(&mut self, other: &Outcome) {
         self.latencies.extend_from_slice(&other.latencies);
+        self.log.extend_from_slice(&other.log);
         self.ok += other.ok;
         self.client_errors += other.client_errors;
         self.server_errors += other.server_errors;
@@ -220,12 +282,23 @@ fn validate(body: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn request(client: &reqwest::Client, url: &str, outcome: &mut Outcome) {
-    let started = Instant::now();
+async fn request(
+    client: &reqwest::Client,
+    url: &str,
+    index: usize,
+    started: Instant,
+    outcome: &mut Outcome,
+    recent: &Mutex<Vec<Duration>>,
+) {
     let response = match client.get(url).send().await {
         Ok(response) => response,
         Err(err) => {
             outcome.failed += 1;
+            outcome.log.push(LogEntry {
+                index,
+                status: 0,
+                latency: started.elapsed(),
+            });
             outcome.example(format!("{url}: {err}"));
             return;
         }
@@ -239,11 +312,23 @@ async fn request(client: &reqwest::Client, url: &str, outcome: &mut Outcome) {
         Ok(body) => body,
         Err(err) => {
             outcome.failed += 1;
+            outcome.log.push(LogEntry {
+                index,
+                status: 0,
+                latency: started.elapsed(),
+            });
             outcome.example(format!("{url}: {err}"));
             return;
         }
     };
-    outcome.latencies.push(started.elapsed());
+    let latency = started.elapsed();
+    outcome.latencies.push(latency);
+    outcome.log.push(LogEntry {
+        index,
+        status: status.as_u16(),
+        latency,
+    });
+    recent.lock().expect("recent latencies").push(latency);
     outcome.bytes += body.len();
     if status.is_success() {
         outcome.ok += 1;
@@ -267,26 +352,49 @@ async fn request(client: &reqwest::Client, url: &str, outcome: &mut Outcome) {
     ));
 }
 
-/// Sends the requests with the given concurrency. Returns the outcome for
-/// each target.
+/// Sends the requests with the given concurrency, and at the given rate (or
+/// as fast as possible). Returns the outcome for each target.
 async fn replay(
     client: &reqwest::Client,
     targets: Arc<[Target]>,
     requests: Arc<[Request]>,
     concurrency: usize,
+    recent: Arc<Mutex<Vec<Duration>>>,
 ) -> Vec<Outcome> {
     let next = Arc::new(AtomicUsize::new(0));
+    let start = Instant::now();
     let mut tasks = JoinSet::new();
     for _ in 0..concurrency.max(1) {
         let client = client.clone();
         let targets = Arc::clone(&targets);
         let requests = Arc::clone(&requests);
         let next = Arc::clone(&next);
+        let recent = Arc::clone(&recent);
         tasks.spawn(async move {
             let mut outcomes = vec![Outcome::default(); targets.len()];
-            while let Some(req) = requests.get(next.fetch_add(1, Ordering::Relaxed)) {
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(req) = requests.get(i) else {
+                    break;
+                };
+                let started = match req.due {
+                    Some(due) => {
+                        let due = start + due;
+                        tokio::time::sleep_until(due.into()).await;
+                        due
+                    }
+                    None => Instant::now(),
+                };
                 let url = format!("{}{}", targets[req.target].url, req.path);
-                request(&client, &url, &mut outcomes[req.target]).await;
+                request(
+                    &client,
+                    &url,
+                    i,
+                    started,
+                    &mut outcomes[req.target],
+                    &recent,
+                )
+                .await;
             }
             outcomes
         });
@@ -306,6 +414,25 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     }
     let i = ((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len()) - 1;
     sorted[i]
+}
+
+/// Prints the throughput and latencies of each interval, until aborted.
+async fn report_intervals(interval: Duration, recent: Arc<Mutex<Vec<Duration>>>) {
+    let start = Instant::now();
+    let mut ticker = tokio::time::interval_at((start + interval).into(), interval);
+    loop {
+        ticker.tick().await;
+        let mut latencies = std::mem::take(&mut *recent.lock().expect("recent latencies"));
+        latencies.sort_unstable();
+        eprintln!(
+            "[{:.0}s] {:.0} req/s, p50 {:.2?}, p99 {:.2?}, max {:.2?}",
+            start.elapsed().as_secs_f64(),
+            latencies.len() as f64 / interval.as_secs_f64(),
+            percentile(&latencies, 0.5),
+            percentile(&latencies, 0.99),
+            latencies.last().copied().unwrap_or_default(),
+        );
+    }
 }
 
 fn report(name: &str, outcome: &mut Outcome, elapsed: Duration) {
@@ -340,6 +467,26 @@ fn report(name: &str, outcome: &mut Outcome, elapsed: Duration) {
     for example in &outcome.examples {
         println!("example: {example}");
     }
+}
+
+fn write_latency_log(path: &PathBuf, targets: &[Target], outcomes: &[Outcome]) -> io::Result<()> {
+    let mut entries: Vec<(&str, LogEntry)> = targets
+        .iter()
+        .zip(outcomes)
+        .flat_map(|(target, outcome)| outcome.log.iter().map(|&entry| (target.name, entry)))
+        .collect();
+    entries.sort_unstable_by_key(|(_, entry)| entry.index);
+    let mut out = io::BufWriter::new(fs::File::create(path)?);
+    for (name, entry) in entries {
+        writeln!(
+            out,
+            "{}\t{name}\t{}\t{}",
+            entry.index,
+            entry.status,
+            entry.latency.as_micros()
+        )?;
+    }
+    out.flush()
 }
 
 #[tokio::main]
@@ -387,7 +534,27 @@ async fn main() {
         .expect("http client");
     let targets: Arc<[Target]> = targets.into();
     let mut requests = requests;
-    let measured: Arc<[Request]> = requests.split_off(warm_up).into();
+    let mut measured = requests.split_off(warm_up);
+    if let Some(rate) = args.rate {
+        for (i, req) in measured.iter_mut().enumerate() {
+            req.due = Some(Duration::from_secs_f64(i as f64 / rate));
+        }
+    } else if let Some(speed) = args.speed {
+        let first = measured.first().map_or(0.0, |req| req.start);
+        for req in &mut measured {
+            req.due = Some(Duration::from_secs_f64(
+                (req.start - first).max(0.0) / speed,
+            ));
+        }
+    }
+    let measured: Arc<[Request]> = measured.into();
+    let recent = Arc::new(Mutex::new(Vec::new()));
+    let reporter = args.interval.map(|interval| {
+        tokio::spawn(report_intervals(
+            Duration::from_secs_f64(interval),
+            Arc::clone(&recent),
+        ))
+    });
 
     if warm_up > 0 {
         let started = Instant::now();
@@ -396,6 +563,7 @@ async fn main() {
             Arc::clone(&targets),
             requests.into(),
             args.concurrency,
+            Arc::clone(&recent),
         )
         .await;
         eprintln!(
@@ -406,8 +574,23 @@ async fn main() {
     }
 
     let started = Instant::now();
-    let mut outcomes = replay(&client, Arc::clone(&targets), measured, args.concurrency).await;
+    let mut outcomes = replay(
+        &client,
+        Arc::clone(&targets),
+        measured,
+        args.concurrency,
+        recent,
+    )
+    .await;
     let elapsed = started.elapsed();
+    if let Some(reporter) = reporter {
+        reporter.abort();
+    }
+    if let Some(path) = &args.latency_log
+        && let Err(err) = write_latency_log(path, &targets, &outcomes)
+    {
+        eprintln!("error: {}: {err}", path.display());
+    }
     for (target, outcome) in targets.iter().zip(&mut outcomes) {
         report(target.name, outcome, elapsed);
     }
