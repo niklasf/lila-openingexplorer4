@@ -42,22 +42,110 @@ impl ColdKey {
     /// The games of a group that may contain this position, from the value
     /// of the group.
     pub fn candidates(&self, value: &[u8]) -> Vec<GameIndex> {
-        let group = ColdGroupView::new(value);
-        let mut gaps = BitReader::at(
-            group.bits,
-            (group.count * u64::from(ColdGroup::INDEX_BITS)) as usize,
-        );
-        let mut candidates = Vec::new();
-        let mut suffix = 0u64;
-        for i in 0..group.count {
-            suffix += gaps.read_rice(group.k);
-            match suffix.cmp(&u64::from(self.suffix)) {
-                std::cmp::Ordering::Less => (),
-                std::cmp::Ordering::Equal => candidates.push(group.index(i)),
-                std::cmp::Ordering::Greater => break,
-            }
+        ColdItemsView::new(value, ColdGroup::INDEX_BITS)
+            .candidates(self.suffix)
+            .map(|index| GameIndex::new(index).expect("valid game index"))
+            .collect()
+    }
+}
+
+/// Packs items `(suffix, index)`, sorted by suffix, with indexes of
+/// `index_bits` bits (at most 56), in the format of `ColdGroup` values
+/// (see there).
+pub fn pack_cold_items(buf: &mut Vec<u8>, items: &[(u16, u64)], index_bits: u32) {
+    debug_assert!(index_bits <= 56);
+    debug_assert!(
+        items.is_sorted_by_key(|&(suffix, _)| suffix),
+        "cold items out of order"
+    );
+    let count = items.len() as u64;
+    let k = rice_parameter(count);
+    pack_uint(buf, count);
+    let mut bits = BitWriter::new(buf);
+    for &(_, index) in items {
+        bits.write(index, index_bits);
+    }
+    let mut previous = 0;
+    for &(suffix, _) in items {
+        bits.write_rice(u64::from(suffix - previous), k);
+        previous = suffix;
+    }
+    bits.finish_padded();
+}
+
+/// Items packed by `pack_cold_items()`, read in place.
+#[derive(Debug, Clone, Copy)]
+pub struct ColdItemsView<'a> {
+    k: u32,
+    count: u64,
+    index_bits: u32,
+    bits: &'a [u8],
+}
+
+impl<'a> ColdItemsView<'a> {
+    /// Views the entire slice as items with indexes of `index_bits` bits.
+    pub fn new(value: &'a [u8], index_bits: u32) -> ColdItemsView<'a> {
+        let mut rest = value;
+        let count = unpack_uint(&mut rest);
+        ColdItemsView {
+            k: rice_parameter(count),
+            count,
+            index_bits,
+            bits: rest,
         }
-        candidates
+    }
+
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn index(&self, i: u64) -> u64 {
+        BitReader::at(self.bits, (i * u64::from(self.index_bits)) as usize).read(self.index_bits)
+    }
+
+    fn gaps(&self) -> BitReader<'a> {
+        BitReader::at(
+            self.bits,
+            (self.count * u64::from(self.index_bits)) as usize,
+        )
+    }
+
+    /// The indexes of the items with the suffix, stopping to decode gaps
+    /// once past it.
+    pub fn candidates(self, suffix: u16) -> impl Iterator<Item = u64> + 'a {
+        let mut gaps = self.gaps();
+        let mut current = 0u64;
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            while i < self.count {
+                current += gaps.read_rice(self.k);
+                let item = i;
+                i += 1;
+                match current.cmp(&u64::from(suffix)) {
+                    std::cmp::Ordering::Less => (),
+                    std::cmp::Ordering::Equal => return Some(self.index(item)),
+                    std::cmp::Ordering::Greater => {
+                        i = self.count;
+                        break;
+                    }
+                }
+            }
+            None
+        })
+    }
+
+    /// All items `(suffix, index)`, in order.
+    pub fn items(self) -> impl Iterator<Item = (u16, u64)> + 'a {
+        let mut gaps = self.gaps();
+        let mut suffix = 0u64;
+        (0..self.count).map(move |i| {
+            suffix += gaps.read_rice(self.k);
+            (u16::try_from(suffix).expect("valid suffix"), self.index(i))
+        })
     }
 }
 
@@ -78,7 +166,7 @@ impl ColdKey {
 #[derive(Debug)]
 pub struct ColdGroup {
     prefix: Option<[u8; ColdKey::PREFIX_SIZE]>,
-    items: Vec<(u16, GameIndex)>,
+    items: Vec<(u16, u64)>,
     value: Vec<u8>,
 }
 
@@ -126,7 +214,7 @@ impl ColdGroup {
             }
             None => self.prefix = Some(key.prefix),
         }
-        self.items.push((key.suffix, game));
+        self.items.push((key.suffix, game.get()));
         Ok(())
     }
 
@@ -142,20 +230,8 @@ impl ColdGroup {
     /// is empty afterwards.
     pub fn finish(&mut self) -> Option<([u8; ColdKey::PREFIX_SIZE], &[u8])> {
         let prefix = self.prefix.take()?;
-        let count = self.items.len() as u64;
-        let k = rice_parameter(count);
         self.value.clear();
-        pack_uint(&mut self.value, count);
-        let mut bits = BitWriter::new(&mut self.value);
-        for &(_, game) in &self.items {
-            bits.write(game.get(), ColdGroup::INDEX_BITS);
-        }
-        let mut previous = 0;
-        for &(suffix, _) in &self.items {
-            bits.write_rice(u64::from(suffix - previous), k);
-            previous = suffix;
-        }
-        bits.finish_padded();
+        pack_cold_items(&mut self.value, &self.items, ColdGroup::INDEX_BITS);
         self.items.clear();
         Some((prefix, &self.value))
     }
@@ -169,33 +245,6 @@ impl ColdGroup {
 fn rice_parameter(count: u64) -> u32 {
     // asinh(1/2) * 65536 = 31536.7...
     (0..16).find(|k| (count + 1) << k >= 31537).unwrap_or(16)
-}
-
-/// The header and bits of a packed group.
-struct ColdGroupView<'a> {
-    k: u32,
-    count: u64,
-    bits: &'a [u8],
-}
-
-impl<'a> ColdGroupView<'a> {
-    fn new(value: &'a [u8]) -> ColdGroupView<'a> {
-        let mut rest = value;
-        let count = unpack_uint(&mut rest);
-        ColdGroupView {
-            k: rice_parameter(count),
-            count,
-            bits: rest,
-        }
-    }
-
-    fn index(&self, i: u64) -> GameIndex {
-        GameIndex::new(
-            BitReader::at(self.bits, (i * u64::from(ColdGroup::INDEX_BITS)) as usize)
-                .read(ColdGroup::INDEX_BITS),
-        )
-        .expect("valid game index")
-    }
 }
 
 #[cfg(test)]
@@ -289,6 +338,38 @@ mod tests {
             Ok(())
         })
         .budget_ms(2000);
+    }
+
+    /// Items with any index width decode to what was packed.
+    #[test]
+    fn test_items_roundtrip() {
+        arbtest(|u| {
+            let index_bits = u.int_in_range(0..=40)?;
+            let mut items: Vec<(u16, u64)> = (0..u.int_in_range(0..=200)?)
+                .map(|_| {
+                    let index = if index_bits == 0 {
+                        0
+                    } else {
+                        u.int_in_range(0..=(1u64 << index_bits) - 1)?
+                    };
+                    Ok((u.int_in_range(0..=40)? * 1000, index))
+                })
+                .collect::<arbitrary::Result<_>>()?;
+            items.sort_unstable();
+            let mut buf = Vec::new();
+            pack_cold_items(&mut buf, &items, index_bits);
+            let view = ColdItemsView::new(&buf, index_bits);
+            assert_eq!(view.len(), items.len() as u64);
+            assert_eq!(view.items().collect::<Vec<_>>(), items);
+            let probe = u.int_in_range(0..=40)? * 1000;
+            let expected: Vec<u64> = items
+                .iter()
+                .filter(|&&(suffix, _)| suffix == probe)
+                .map(|&(_, index)| index)
+                .collect();
+            assert_eq!(view.candidates(probe).collect::<Vec<_>>(), expected);
+            Ok(())
+        });
     }
 
     /// The integer Rice parameter matches its definition.

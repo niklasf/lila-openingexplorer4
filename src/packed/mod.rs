@@ -13,10 +13,11 @@ mod position_key;
 mod rating;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
-pub use cold::{ColdGroup, ColdKey};
+pub use cold::{ColdGroup, ColdItemsView, ColdKey, pack_cold_items};
 pub use entry::{
-    CellGames, CellHeader, CellKey, CellView, CellViews, EntryCell, EntryView, GAMES_PER_CELL,
-    GroupCells, GroupHeader, GroupView, GroupViews, LichessEntry, SUBTOTAL_MIN_MONTHS, SubStats,
+    CellGames, CellGroup, CellHeader, CellKey, CellView, CellViews, Entry, EntryCell, EntryView,
+    GAMES_PER_CELL, GroupCells, GroupHeader, GroupView, GroupViews, LichessEntry, PlayerEntry,
+    PlayerGroupHeader, SUBTOTAL_MIN_MONTHS, SubStats,
 };
 pub use game::{
     BorrowedEventInfo, BorrowedGamePlayer, BorrowedLichessGame, EventInfo, GamePlayer,

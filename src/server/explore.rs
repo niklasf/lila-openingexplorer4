@@ -7,7 +7,7 @@ use partial_sort::PartialSort;
 use shakmaty::packed::PackedUciMove;
 
 use crate::{
-    packed::{EntryView, GameIndex, Month, RatingGroup, Speed, SubStats},
+    packed::{EntryView, GameIndex, GroupHeader, Month, RatingGroup, Speed, SubStats},
     server::query::{LichessFilter, Limits},
 };
 
@@ -247,7 +247,7 @@ fn aggregate(
     let mut agg = Aggregate::default();
     let no_range = filter.since.is_none() && filter.until.is_none();
     let mut current: Option<PreparedMove> = None;
-    for group in EntryView::unpack_entire(bytes).groups() {
+    for group in EntryView::<GroupHeader>::unpack_entire(bytes).groups() {
         let m = group.uci_move();
         if current.as_ref().is_none_or(|pm| pm.m != m) {
             agg.moves
@@ -610,8 +610,8 @@ mod tests {
     ) -> Aggregate {
         let mut agg = Aggregate::default();
         let mut by_move: BTreeMap<[u8; 2], PreparedMove> = BTreeMap::new();
-        for cell in EntryView::unpack_entire(bytes).cells() {
-            let header = cell.key.group_header();
+        for cell in EntryView::<GroupHeader>::unpack_entire(bytes).cells() {
+            let header: GroupHeader = cell.key.group_header();
             let month = cell.key.month();
             if !filter.contains_speed(header.speed)
                 || !filter.contains_rating_group(header.rating_group)
@@ -696,7 +696,7 @@ mod tests {
             };
             let mut buf = Vec::new();
             entry.pack_entire(&mut buf);
-            let subtotals = EntryView::unpack_entire(&buf)
+            let subtotals = EntryView::<GroupHeader>::unpack_entire(&buf)
                 .groups()
                 .filter(|g| g.subtotal.is_some())
                 .count();
