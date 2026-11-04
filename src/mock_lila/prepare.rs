@@ -156,6 +156,9 @@ struct Rec {
     player: u32,
     row: u64,
     day: u32,
+    row_group: u32,
+    /// Index of the row among the rows of its day in its row group.
+    rank_in_row_group: u32,
     created_at: u64,
     arena: u32,
     offset: u64,
@@ -166,8 +169,8 @@ struct Rec {
 struct Collected {
     recs: Vec<Rec>,
     arena: Vec<u8>,
-    /// First and last row of each day.
-    days: HashMap<u32, (u64, u64)>,
+    /// Rows of each day in each row group.
+    days: HashMap<(u32, u32), u32>,
 }
 
 pub struct PrepareConfig<'a> {
@@ -226,23 +229,12 @@ pub fn prepare(config: PrepareConfig<'_>) -> Result<FixtureMeta, FixtureError> {
                         }
                     };
                     let first = input.first_row(rg);
-                    let mut last_day = (u32::MAX, 0, 0);
-                    let flush_day = |c: &mut Collected, (day, lo, hi): (u32, u64, u64)| {
-                        if day != u32::MAX {
-                            let e = c.days.entry(day).or_insert((lo, hi));
-                            e.0 = e.0.min(lo);
-                            e.1 = e.1.max(hi);
-                        }
-                    };
                     for (i, (id, game)) in batch.rows().enumerate() {
                         let row = first + i as u64;
                         let day = day_of(game.date);
-                        if day == last_day.0 {
-                            last_day.2 = row;
-                        } else {
-                            flush_day(&mut c, last_day);
-                            last_day = (day, row, row);
-                        }
+                        let count = c.days.entry((day, rg as u32)).or_insert(0);
+                        let rank_in_row_group = *count;
+                        *count += 1;
                         let selected: Vec<u32> = Color::ALL
                             .iter()
                             .filter_map(|&color| find(game.players.get(color).name))
@@ -259,6 +251,8 @@ pub fn prepare(config: PrepareConfig<'_>) -> Result<FixtureMeta, FixtureError> {
                                 player,
                                 row,
                                 day,
+                                row_group: rg as u32,
+                                rank_in_row_group,
                                 created_at: 0,
                                 arena: t as u32,
                                 offset,
@@ -267,7 +261,6 @@ pub fn prepare(config: PrepareConfig<'_>) -> Result<FixtureMeta, FixtureError> {
                             kept.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    flush_day(&mut c, last_day);
                     let d = done_rows.fetch_add(batch.len() as u64, Ordering::Relaxed)
                         + batch.len() as u64;
                     if rg % 1000 == 0 {
@@ -288,13 +281,20 @@ pub fn prepare(config: PrepareConfig<'_>) -> Result<FixtureMeta, FixtureError> {
 
     let mut collected = results.into_inner().expect("results");
     collected.sort_by_key(|(t, _)| *t);
-    let mut days: HashMap<u32, (u64, u64)> = HashMap::new();
-    for (_, c) in &collected {
-        for (&day, &(lo, hi)) in &c.days {
-            let e = days.entry(day).or_insert((lo, hi));
-            e.0 = e.0.min(lo);
-            e.1 = e.1.max(hi);
-        }
+    // Rank of the first row of a day in each row group among all rows of
+    // the day (in dump order), and rows per day. Dumps are ordered by the
+    // end of games, so the rows of a day are not contiguous.
+    let mut day_counts: Vec<((u32, u32), u32)> = collected
+        .iter()
+        .flat_map(|(_, c)| c.days.iter().map(|(&k, &v)| (k, v)))
+        .collect();
+    day_counts.sort_unstable();
+    let mut before: HashMap<(u32, u32), u64> = HashMap::with_capacity(day_counts.len());
+    let mut totals: HashMap<u32, u64> = HashMap::new();
+    for &((day, rg), count) in &day_counts {
+        let total = totals.entry(day).or_insert(0);
+        before.insert((day, rg), *total);
+        *total += u64::from(count);
     }
     let arenas: Vec<Vec<u8>> = collected
         .iter_mut()
@@ -308,10 +308,10 @@ pub fn prepare(config: PrepareConfig<'_>) -> Result<FixtureMeta, FixtureError> {
         players.len()
     );
 
-    // Time of day by position of the row within its day.
+    // Time of day by the rank of the row among the rows of its day.
     for rec in &mut recs {
-        let (lo, hi) = days[&rec.day];
-        let fraction = (rec.row - lo) as f64 / (hi - lo + 1) as f64;
+        let rank = before[&(rec.day, rec.row_group)] + u64::from(rec.rank_in_row_group);
+        let fraction = (rank as f64 + 0.5) / totals[&rec.day] as f64;
         rec.created_at = u64::from(rec.day) * MS_PER_DAY + (fraction * MS_PER_DAY as f64) as u64;
     }
     recs.sort_unstable_by_key(|rec| (rec.player, rec.created_at, rec.row));
