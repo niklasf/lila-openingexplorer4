@@ -129,7 +129,7 @@ pub fn fixture_game(id: crate::packed::GameId, game: &BorrowedLichessGame<'_>) -
         FinalStatus::VariantEnd
     } else if game.outcome == KnownOutcome::Draw {
         FinalStatus::Draw
-    } else if mix(id.to_bytes().iter().fold(7, |h, &b| h * 31 + u64::from(b))) % 3 == 0 {
+    } else if mix(id.to_bytes().iter().fold(7, |h, &b| h * 31 + u64::from(b))).is_multiple_of(3) {
         FinalStatus::OutOfTime
     } else {
         FinalStatus::Resign

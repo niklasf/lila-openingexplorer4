@@ -628,7 +628,10 @@ impl MockLila {
     /// Opens the fixture and starts serving in the background.
     pub async fn start(config: MockConfig) -> io::Result<MockLila> {
         let fixture = Fixture::open(&config.fixture).map_err(io::Error::other)?;
-        let shift = config.data_end as i64 - next_month_start(fixture.meta.max_created_at) as i64;
+        // An hour of slack, for times bumped past midnight to keep them
+        // strictly increasing per player.
+        let newest = fixture.meta.max_created_at.saturating_sub(3_600_000);
+        let shift = config.data_end as i64 - next_month_start(newest) as i64;
         let log = config
             .request_log
             .as_ref()

@@ -378,9 +378,11 @@ impl Fixture {
             return Err(FixtureError::Corrupt);
         }
         let index = raw
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|chunk| {
-                let mut chunk = chunk;
+                let mut chunk = &chunk[..];
                 (chunk.get_u64(), chunk.get_u64())
             })
             .collect();
