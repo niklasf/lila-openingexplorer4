@@ -64,6 +64,11 @@ pub struct PlayerDbConfig {
     pub rate_limit: Option<u64>,
     /// Directory of the write ahead log, if not the database directory.
     pub wal_dir: Option<PathBuf>,
+    /// Directories for SST files with target sizes: newer data (upper
+    /// levels) in the first, older data in later ones (like the NVMe for
+    /// upper levels and the HDDs for the last level). Empty for the
+    /// database directory.
+    pub db_paths: Vec<(PathBuf, u64)>,
     /// Collect RocksDB statistics.
     pub statistics: bool,
     /// Rebuilds with more output are written as SST files and ingested.
@@ -80,6 +85,7 @@ impl Default for PlayerDbConfig {
             placement: Placement::default(),
             rate_limit: None,
             wal_dir: None,
+            db_paths: Vec::new(),
             statistics: false,
             ingest_bytes: 64 << 20,
             batch_bytes: 4 << 20,
@@ -204,6 +210,14 @@ impl PlayerDb {
         }
         if let Some(wal_dir) = &config.wal_dir {
             opts.set_wal_dir(wal_dir);
+        }
+        if !config.db_paths.is_empty() {
+            let paths = config
+                .db_paths
+                .iter()
+                .map(|(path, size)| rocksdb::DBPath::new(path, *size))
+                .collect::<Result<Vec<_>, _>>()?;
+            opts.set_db_paths(&paths);
         }
         if config.statistics {
             opts.enable_statistics();

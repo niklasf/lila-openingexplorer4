@@ -72,6 +72,12 @@ struct PlayerArgs {
     /// Directory of the write ahead log (default: in the database).
     #[arg(long)]
     wal_dir: Option<PathBuf>,
+    /// Directory for SST files with a target size, like
+    /// /nvme/player:200g. Repeat for more: newer data (upper levels) goes
+    /// to the first ones, older data to later ones (for example the last
+    /// level on HDDs).
+    #[arg(long = "db-path", value_parser = parse_db_path)]
+    db_paths: Vec<(PathBuf, u64)>,
     /// Limit flushes and compactions to this many bytes per second, like
     /// 64m.
     #[arg(long)]
@@ -291,6 +297,14 @@ struct LilaArgs {
     no_blacklist: bool,
 }
 
+fn parse_db_path(s: &str) -> Result<(PathBuf, u64), String> {
+    let (path, size) = s
+        .rsplit_once(':')
+        .ok_or_else(|| "expected PATH:SIZE".to_owned())?;
+    let size: ByteSize = size.parse().map_err(|err| format!("{err}"))?;
+    Ok((PathBuf::from(path), size.into()))
+}
+
 fn raise_fd_limit() {
     // SAFETY: getrlimit and setrlimit only read and write the given struct.
     unsafe {
@@ -367,6 +381,7 @@ fn run_player(args: PlayerArgs) {
             placement: Placement::Threshold(args.warm_threshold.max(1)),
             rate_limit: args.rate_limit.map(u64::from),
             wal_dir: args.wal_dir,
+            db_paths: args.db_paths,
             statistics: args.db_statistics,
             ..PlayerDbConfig::default()
         },

@@ -279,3 +279,37 @@ fn test_delete_player() {
     db.delete_player(alice.hash()).unwrap();
     assert!(db.status(alice.hash()).unwrap().is_none());
 }
+
+#[test]
+fn test_db_paths() {
+    let dir = TempDir::new("paths");
+    let fast = dir.0.join("fast");
+    let slow = dir.0.join("slow");
+    std::fs::create_dir_all(&fast).unwrap();
+    std::fs::create_dir_all(&slow).unwrap();
+    let db = PlayerDb::open(
+        &dir.0.join("db"),
+        PlayerDbConfig {
+            db_paths: vec![(fast.clone(), 1 << 30), (slow, 1 << 40)],
+            ..PlayerDbConfig::default()
+        },
+    )
+    .unwrap();
+    let alice = UserId::from_name("alice").unwrap();
+    let mut status = PlayerStatus::new(alice, 50);
+    let mut u = Unstructured::new(&[3; 4096]);
+    let (game, _) = arbitrary_game(&mut u, 1).unwrap();
+    db.write_chunk(&mut status, &[game]).unwrap();
+    db.flush().unwrap();
+    let ssts = std::fs::read_dir(&fast)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "sst")
+        })
+        .count();
+    assert!(ssts > 0);
+}
