@@ -95,6 +95,9 @@ pub struct Metrics {
     pub cold_games_loaded: Counter,
     /// Games loaded for the moves, top and recent games of responses.
     pub response_games_loaded: Counter,
+    /// Loaded games that were not in the block cache (only counted with
+    /// parallel fetch).
+    pub games_fetched: Counter,
     /// Masters only.
     pub pgn_requests: Counter,
     /// Computed responses: time spent computing on the blocking pool.
@@ -117,6 +120,7 @@ impl Metrics {
             ("misses", &self.misses),
             ("cold_games_loaded", &self.cold_games_loaded),
             ("response_games_loaded", &self.response_games_loaded),
+            ("games_fetched", &self.games_fetched),
         ];
         if kind == Kind::Masters {
             counters.push(("pgn_requests", &self.pgn_requests));

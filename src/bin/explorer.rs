@@ -125,6 +125,11 @@ struct ServeArgs {
     /// do not add throughput but lengthen tail latencies.
     #[arg(long, help_heading = "Server")]
     blocking_threads: Option<usize>,
+    /// Read the games of a response that are not in the block cache in
+    /// parallel (one thread each), rather than one after the other. For
+    /// disks that serve concurrent reads faster, like hard disk arrays.
+    #[arg(long, help_heading = "Server")]
+    parallel_fetch: bool,
     /// Entries of the response cache.
     #[arg(long, default_value = "100000", help_heading = "Server")]
     response_cache: u64,
@@ -213,6 +218,7 @@ fn run(kind: Kind, args: ServeArgs) {
         cache_entries: args.response_cache,
         cache_ttl: Duration::from_secs(args.response_cache_ttl),
         blocking_threads,
+        parallel_fetch: args.parallel_fetch,
         max_ply: (args.max_ply > 0).then_some(args.max_ply),
         cold: !args.no_cold,
         openings_dir: args.openings_dir,

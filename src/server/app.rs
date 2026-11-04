@@ -3,6 +3,7 @@ use std::{
     ops::Deref,
     path::PathBuf,
     sync::{Arc, RwLock},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -89,6 +90,8 @@ pub struct AppConfig {
     pub cache_ttl: Duration,
     /// Concurrent database requests.
     pub blocking_threads: usize,
+    /// Read uncached games of a response in parallel.
+    pub parallel_fetch: bool,
     /// Games were indexed up to this ply (`None` for all plies).
     pub max_ply: Option<usize>,
     /// Look up cold positions (reached by a single game).
@@ -210,12 +213,50 @@ impl AppState {
         loaded: &Counter,
     ) -> Result<Vec<Option<Vec<u8>>>, rocksdb::Error> {
         loaded.add(ids.len() as u64);
-        Ok(self
-            .db
-            .games(ids)?
-            .into_iter()
-            .map(|game| game.map(|game| game.to_vec()))
-            .collect())
+        if !self.config.parallel_fetch {
+            return Ok(self
+                .db
+                .games(ids)?
+                .into_iter()
+                .map(|game| game.map(|game| game.to_vec()))
+                .collect());
+        }
+        let mut games = Vec::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for (i, cached) in self.db.cached_games(ids)?.into_iter().enumerate() {
+            match cached {
+                Some(game) => games.push(game.map(|game| game.to_vec())),
+                None => {
+                    games.push(None);
+                    missing.push(i);
+                }
+            }
+        }
+        self.metrics.games_fetched.add(missing.len() as u64);
+        match missing[..] {
+            [] => (),
+            [i] => games[i] = self.db.game(ids[i])?.map(|game| game.to_vec()),
+            _ => thread::scope(|scope| {
+                let fetches: Vec<_> = missing
+                    .iter()
+                    .map(|&i| {
+                        (
+                            i,
+                            scope.spawn(move || {
+                                self.db
+                                    .game(ids[i])
+                                    .map(|game| game.map(|game| game.to_vec()))
+                            }),
+                        )
+                    })
+                    .collect();
+                for (i, fetch) in fetches {
+                    games[i] = fetch.join().expect("game fetch")?;
+                }
+                Ok::<_, rocksdb::Error>(())
+            })?,
+        }
+        Ok(games)
     }
 
     fn explorer_moves(

@@ -276,6 +276,28 @@ impl Database {
             .collect()
     }
 
+    /// Like `games()`, but only from the block cache: `None` for games
+    /// that would have to be read from disk.
+    #[allow(clippy::type_complexity)]
+    pub fn cached_games(
+        &self,
+        indexes: &[GameIndex],
+    ) -> Result<Vec<Option<Option<DBPinnableSlice<'_>>>>, rocksdb::Error> {
+        let keys: Vec<[u8; GameIndex::SIZE]> =
+            indexes.iter().map(|index| index.to_bytes()).collect();
+        let mut opts = ReadOptions::default();
+        opts.set_read_tier(ReadTier::BlockCache);
+        self.db
+            .batched_multi_get_cf_opt(self.cf(GAMES_CF), &keys, false, &opts)
+            .into_iter()
+            .map(|result| match result {
+                Ok(game) => Ok(Some(game)),
+                Err(err) if err.kind() == ErrorKind::Incomplete => Ok(None),
+                Err(err) => Err(err),
+            })
+            .collect()
+    }
+
     pub fn cache_usage(&self) -> usize {
         self.cache.get_usage()
     }
