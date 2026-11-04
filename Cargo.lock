@@ -1517,6 +1517,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "env_logger",
+ "futures-util",
  "indicatif",
  "libc",
  "log",
