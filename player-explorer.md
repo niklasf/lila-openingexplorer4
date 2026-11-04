@@ -476,6 +476,49 @@ for casual games) at 300 games/s, comparing policies by time to first
 complete result, p50/p99 stream duration and slot utilization, for the
 launch (empty DB) and the steady state. Then implement the winner.
 
+### Simulation results (2026-11-05)
+
+`examples/player_queue_sim.rs` (uncommitted), games per player from the
+mock lila fixture. Client model from the log: **the UI aborts a stream
+when the user moves on** (78% of the streams > 2 s end within 0.3 s of the
+player's next request), so a ticket lives through a browsing burst and only
+the last request of a burst waits; plus a patience limit for that one.
+
+* Steady state (every player indexed up to the start of the log): the
+  21 h add only ~0.1 M games for these players, 2% slot utilization, every
+  policy alike (99.7% of requests complete, p99 0 s). Scheduling only
+  matters while there is a backlog, above all at the launch.
+* Launch (empty database), all 21 h, patience 600 s (120 s in brackets):
+
+| Policy | complete | run p50 | run p90 | util |
+| --- | --- | --- | --- | --- |
+| FIFO, run to the end (old) | 43% (57%) | 104 s | 420 s | 83% |
+| FIFO, stop abandoned runs | 50% (77%) | 56 s | 306 s | 80% |
+| quantum 30 s, requeue | 69% (82%) | 15 s | 81 s | 80% |
+| quantum 60 s | 63% (80%) | 24 s | 126 s | 79% |
+| quantum 30 s, known players first | **80% (85%)** | **4 s** | 71 s | 80% |
+| quantum 60 s, known players first | 78% (84%) | 5 s | 93 s | 79% |
+
+  "complete": requests that got their final snapshot before the client
+  closed; "run": time from the ticket to the end of indexing. The launch
+  backlog of these players alone is ~150 M games (x2 casual), 17 h of all
+  8 slots, so the first day is saturated whatever the policy.
+
+Check against the implementation (`examples/player_replay.rs`, uncommitted):
+first 2 h of the log at 10x against an empty database, mock lila at 3000
+games/s per stream (scaled), cooldown and quantum scaled: 7.9 M games
+streamed, 46% slot utilization, p99 time to the final snapshot 20 s, 79%
+of requests complete, 0 stream limit violations (max 8 streams), 538
+requeues. The simulation of the same window with the same volume (the mock
+marks half the rated games casual instead of doubling them, so
+`--casual-factor 1`): 7.9 M games, 44%, p99 19 s, 86%.
+
+**Implemented**: runs give up their slot after `--max-run` (default 30 s)
+at a chunk boundary and requeue at the end; players with an index
+(incremental runs) are queued before the first waiting first run;
+running runs stop at the next chunk once no request waits (resuming from
+the checkpoint later). `--fifo` and `--max-run 0` give the old order.
+
 ## Indexer
 
 Ported mostly as is:
@@ -804,6 +847,31 @@ measurement with ad-hoc byte formats.
 4. Prod-like database: population, bulk base, aging, checkpoints (above).
 5. Production layout: `wal_dir`/`cf_paths`, rate limiter, interference
    benchmark with lichess on the HDDs, on the prod-like database.
+
+## Status (2026-11-05)
+
+Branch `personal-explorer`:
+
+* Milestone 0 (mock lila): done. Fixture of the `requests.tsv` players in
+  `/mnt/workspace_nvme/agent/mock_lila/` (76.2 M games, 26.6 GB, 5 min).
+* Milestone 1 (storage): done, with the property test. Rebuilds by batches
+  or SST ingest (above 64 MB).
+* Milestone 2 (indexer): done, tested against the mock with faults.
+  Scheduling simulated and chosen (above).
+* Milestone 3 (server): done. Compatibility: final responses of 9,670
+  `requests.tsv` requests of 250 players, indexed by the old server and the
+  new one from the same mock, are identical after normalizing titles (new),
+  name case and the order of moves with equal counts.
+* Measured: 291 B per indexed game after compaction (warm 94, cold 124,
+  records with moves 62, game ids 12; the old server's database of the same
+  250 players is 6.5x larger); the writer does ~70k games/s per indexer,
+  far above lila's 300 games/s; a rebuild of a player with 1.7k games takes
+  14 ms.
+* Milestone 4 (prod-like database): not started (multi-hour runs, ~1 TB).
+* Milestone 5: `--wal-dir`, `--db-path PATH:SIZE` (upper levels on NVMe,
+  last level on HDD) and `--rate-limit` exist; the interference benchmark
+  on the HDDs is not done.
+* Not decided, not implemented: `DELETE /player/{id}`.
 
 ## Decided
 
