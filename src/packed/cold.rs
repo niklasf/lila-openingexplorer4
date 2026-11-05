@@ -1,5 +1,5 @@
 use crate::packed::{
-    GameIndex, PositionKey,
+    PositionKey,
     bits::{BitReader, BitWriter},
     pack_uint, unpack_uint,
 };
@@ -38,117 +38,73 @@ impl ColdKey {
     pub fn suffix(&self) -> u16 {
         self.suffix
     }
-
-    /// The games of a group that may contain this position, from the value
-    /// of the group.
-    pub fn candidates(&self, value: &[u8]) -> Vec<GameIndex> {
-        let group = ColdGroupView::new(value);
-        let mut gaps = BitReader::at(
-            group.bits,
-            (group.count * u64::from(ColdGroup::INDEX_BITS)) as usize,
-        );
-        let mut candidates = Vec::new();
-        let mut suffix = 0u64;
-        for i in 0..group.count {
-            suffix += gaps.read_rice(group.k);
-            match suffix.cmp(&u64::from(self.suffix)) {
-                std::cmp::Ordering::Less => (),
-                std::cmp::Ordering::Equal => candidates.push(group.index(i)),
-                std::cmp::Ordering::Greater => break,
-            }
-        }
-        candidates
-    }
 }
 
-/// The games of all positions whose hashes share a prefix, keyed by the
-/// prefix. The items are sorted by suffix.
+/// The games of positions that share a key, as items `(suffix, index)`: the
+/// suffix identifies the position within the group (like the bytes of a
+/// `ColdKey` after its prefix), the index the game (like a `GameIndex`).
 ///
 /// ```text
-/// value := uint(count) index* gap*   (bit-packed, least significant bit first)
-/// index := GameIndex, `ColdGroup::INDEX_BITS` bits
+/// value := uint(index bits) uint(count) index* gap*
+///          (index and gap bit-packed, least significant bit first)
+/// index := index bits wide: the bit length of the largest index
 /// gap   := suffix - previous suffix (the first from 0), Rice coded with
 ///          parameter `rice_parameter(count)`: (gap >> k) as unary ones, a
 ///          zero, the low k bits
 /// ```
 ///
-/// Indexes come first, at fixed width, so that a lookup can stop decoding
-/// gaps once it is past its suffix, and then read the indexes of the
-/// matching items directly.
-#[derive(Debug)]
+/// Items are sorted by suffix (then index) and unique. Indexes come first,
+/// at fixed width, so that a lookup can stop decoding gaps once it is past
+/// its suffix, and then read the indexes of the matching items directly.
+#[derive(Debug, Default, Clone)]
 pub struct ColdGroup {
-    prefix: Option<[u8; ColdKey::PREFIX_SIZE]>,
-    items: Vec<(u16, GameIndex)>,
-    value: Vec<u8>,
+    items: Vec<(u16, u64)>,
 }
 
 impl ColdGroup {
-    /// Bits of each game index: enough for 17.2 B games. Lichess had 8.34 B
-    /// games in 2026-11, growing by about 1.2 B a year, so this lasts until
-    /// about 2033.
-    pub const INDEX_BITS: u32 = 34;
+    /// Most bits of an index (of the bit packing).
+    pub const MAX_INDEX_BITS: u32 = 56;
 
-    /// A group builder for game indexes below `games`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if there are too many games for `INDEX_BITS`.
-    pub fn new(games: u64) -> ColdGroup {
-        assert!(
-            games <= 1 << ColdGroup::INDEX_BITS,
-            "{games} games do not fit into the {}-bit game indexes of cold positions",
-            ColdGroup::INDEX_BITS
-        );
-        ColdGroup {
-            prefix: None,
-            items: Vec::new(),
-            value: Vec::new(),
-        }
-    }
-
-    /// Adds an item. Must be called in key order. Returns `Err` with the key
-    /// if the item does not belong to the current group; the current group
-    /// must then be finished first.
-    pub fn push(&mut self, key: ColdKey, game: GameIndex) -> Result<(), ColdKey> {
-        debug_assert!(
-            game.get() >> ColdGroup::INDEX_BITS == 0,
-            "game index too large"
-        );
-        match self.prefix {
-            Some(prefix) if prefix != key.prefix => return Err(key),
-            Some(_) => {
-                debug_assert!(
-                    self.items
-                        .last()
-                        .is_none_or(|&(last, _)| last <= key.suffix),
-                    "cold items out of order"
-                );
-            }
-            None => self.prefix = Some(key.prefix),
-        }
-        self.items.push((key.suffix, game));
-        Ok(())
+    pub fn new() -> ColdGroup {
+        ColdGroup::default()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.prefix.is_none()
+        self.items.is_empty()
     }
 
-    pub fn items(&self) -> u64 {
-        self.items.len() as u64
+    pub fn clear(&mut self) {
+        self.items.clear();
     }
 
-    /// The RocksDB key and value of the group, if it has items. The group
-    /// is empty afterwards.
-    pub fn finish(&mut self) -> Option<([u8; ColdKey::PREFIX_SIZE], &[u8])> {
-        let prefix = self.prefix.take()?;
+    /// Adds an item, in any order. Duplicates collapse when packing.
+    pub fn add(&mut self, suffix: u16, index: u64) {
+        self.items.push((suffix, index));
+    }
+
+    /// Adds the items of a packed group (so that packing yields the union).
+    pub fn merge_unpack_entire(&mut self, value: &[u8]) {
+        self.items
+            .extend(ColdGroupView::unpack_entire(value).items());
+    }
+
+    /// Packs the items. Indexes may have up to `MAX_INDEX_BITS` bits.
+    pub fn pack_entire(&mut self, buf: &mut Vec<u8>) {
+        self.items.sort_unstable();
+        self.items.dedup();
+        let max = self.items.iter().map(|&(_, index)| index).max();
+        let index_bits = max.map_or(0, |max| u64::BITS - max.leading_zeros());
+        assert!(
+            index_bits <= ColdGroup::MAX_INDEX_BITS,
+            "cold index {max:?} too large"
+        );
         let count = self.items.len() as u64;
         let k = rice_parameter(count);
-        self.value.clear();
-        pack_uint(&mut self.value, count);
-        let mut bits = BitWriter::new(&mut self.value);
-        for &(_, game) in &self.items {
-            bits.write(game.get(), ColdGroup::INDEX_BITS);
+        pack_uint(buf, u64::from(index_bits));
+        pack_uint(buf, count);
+        let mut bits = BitWriter::new(buf);
+        for &(_, index) in &self.items {
+            bits.write(index, index_bits);
         }
         let mut previous = 0;
         for &(suffix, _) in &self.items {
@@ -156,8 +112,84 @@ impl ColdGroup {
             previous = suffix;
         }
         bits.finish_padded();
-        self.items.clear();
-        Some((prefix, &self.value))
+    }
+}
+
+/// A packed `ColdGroup`, read in place.
+#[derive(Debug, Clone, Copy)]
+pub struct ColdGroupView<'a> {
+    k: u32,
+    count: u64,
+    index_bits: u32,
+    bits: &'a [u8],
+}
+
+impl<'a> ColdGroupView<'a> {
+    /// Views the entire slice as a packed group.
+    pub fn unpack_entire(value: &'a [u8]) -> ColdGroupView<'a> {
+        let mut rest = value;
+        let index_bits = u32::try_from(unpack_uint(&mut rest)).expect("valid index bits");
+        debug_assert!(index_bits <= ColdGroup::MAX_INDEX_BITS);
+        let count = unpack_uint(&mut rest);
+        ColdGroupView {
+            k: rice_parameter(count),
+            count,
+            index_bits,
+            bits: rest,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn index(&self, i: u64) -> u64 {
+        BitReader::at(self.bits, (i * u64::from(self.index_bits)) as usize).read(self.index_bits)
+    }
+
+    fn gaps(&self) -> BitReader<'a> {
+        BitReader::at(
+            self.bits,
+            (self.count * u64::from(self.index_bits)) as usize,
+        )
+    }
+
+    /// The indexes of the items with the suffix (ascending), stopping to
+    /// decode gaps once past it.
+    pub fn candidates(self, suffix: u16) -> impl Iterator<Item = u64> + 'a {
+        let mut gaps = self.gaps();
+        let mut current = 0u64;
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            while i < self.count {
+                current += gaps.read_rice(self.k);
+                let item = i;
+                i += 1;
+                match current.cmp(&u64::from(suffix)) {
+                    std::cmp::Ordering::Less => (),
+                    std::cmp::Ordering::Equal => return Some(self.index(item)),
+                    std::cmp::Ordering::Greater => {
+                        i = self.count;
+                        break;
+                    }
+                }
+            }
+            None
+        })
+    }
+
+    /// All items `(suffix, index)`, in order.
+    pub fn items(self) -> impl Iterator<Item = (u16, u64)> + 'a {
+        let mut gaps = self.gaps();
+        let mut suffix = 0u64;
+        (0..self.count).map(move |i| {
+            suffix += gaps.read_rice(self.k);
+            (u16::try_from(suffix).expect("valid suffix"), self.index(i))
+        })
     }
 }
 
@@ -171,124 +203,119 @@ fn rice_parameter(count: u64) -> u32 {
     (0..16).find(|k| (count + 1) << k >= 31537).unwrap_or(16)
 }
 
-/// The header and bits of a packed group.
-struct ColdGroupView<'a> {
-    k: u32,
-    count: u64,
-    bits: &'a [u8],
-}
-
-impl<'a> ColdGroupView<'a> {
-    fn new(value: &'a [u8]) -> ColdGroupView<'a> {
-        let mut rest = value;
-        let count = unpack_uint(&mut rest);
-        ColdGroupView {
-            k: rice_parameter(count),
-            count,
-            bits: rest,
-        }
-    }
-
-    fn index(&self, i: u64) -> GameIndex {
-        GameIndex::new(
-            BitReader::at(self.bits, (i * u64::from(ColdGroup::INDEX_BITS)) as usize)
-                .read(ColdGroup::INDEX_BITS),
-        )
-        .expect("valid game index")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use arbtest::arbtest;
 
     use super::*;
 
-    fn hash(bytes: [u8; 6]) -> PositionKey {
-        let mut inner = [0xab; PositionKey::SIZE];
-        inner[..6].copy_from_slice(&bytes);
-        PositionKey::from_bytes(inner)
+    fn pack(group: &mut ColdGroup) -> Vec<u8> {
+        let mut buf = Vec::new();
+        group.pack_entire(&mut buf);
+        buf
     }
 
-    fn game(n: u64) -> GameIndex {
-        GameIndex::new(n).unwrap()
+    fn candidates(value: &[u8], suffix: u16) -> Vec<u64> {
+        ColdGroupView::unpack_entire(value)
+            .candidates(suffix)
+            .collect()
     }
 
     #[test]
     fn test_group_lookup() {
-        let mut group = ColdGroup::new(100);
-        let keys = [
-            ColdKey::new(&hash([1, 2, 3, 4, 0, 1])),
-            ColdKey::new(&hash([1, 2, 3, 4, 0, 1])), // same truncated hash
-            ColdKey::new(&hash([1, 2, 3, 4, 0, 7])),
-            ColdKey::new(&hash([1, 2, 3, 4, 9, 9])),
-        ];
-        for (i, key) in keys.iter().enumerate() {
-            group.push(*key, game(i as u64 + 1)).unwrap();
-        }
-        assert_eq!(group.items(), 4);
-        assert!(
-            group
-                .push(ColdKey::new(&hash([1, 2, 3, 5, 0, 0])), game(5))
-                .is_err()
-        );
-        let (prefix, value) = group.finish().unwrap();
-        assert_eq!(prefix, [1, 2, 3, 4]);
-        let value = value.to_vec();
-        let lookup = |key: ColdKey| key.candidates(&value);
-        assert_eq!(lookup(keys[0]), vec![game(1), game(2)]);
-        assert_eq!(lookup(keys[2]), vec![game(3)]);
-        assert_eq!(lookup(keys[3]), vec![game(4)]);
-        assert_eq!(lookup(ColdKey::new(&hash([1, 2, 3, 4, 0, 0]))), vec![]);
-        assert_eq!(lookup(ColdKey::new(&hash([1, 2, 3, 4, 0, 8]))), vec![]);
-        assert_eq!(lookup(ColdKey::new(&hash([1, 2, 3, 4, 255, 255]))), vec![]);
-        assert!(group.is_empty());
-        group.push(keys[0], game(9)).unwrap();
-        assert!(group.finish().is_some());
+        let mut group = ColdGroup::new();
+        group.add(1, 4);
+        group.add(1, 2); // same suffix
+        group.add(7, 3);
+        group.add(0x0909, 5);
+        group.add(7, 3); // duplicate
+        let value = pack(&mut group);
+        assert_eq!(ColdGroupView::unpack_entire(&value).len(), 4);
+        assert_eq!(candidates(&value, 1), vec![2, 4]);
+        assert_eq!(candidates(&value, 7), vec![3]);
+        assert_eq!(candidates(&value, 0x0909), vec![5]);
+        assert!(candidates(&value, 0).is_empty());
+        assert!(candidates(&value, 8).is_empty());
+        assert!(candidates(&value, u16::MAX).is_empty());
+
+        let value = pack(&mut ColdGroup::new());
+        assert!(ColdGroupView::unpack_entire(&value).is_empty());
+        assert!(candidates(&value, 0).is_empty());
     }
 
-    /// Lookups find exactly the items with the suffix, for any group.
+    /// Items of any width decode to what was added, sorted and unique, with
+    /// the least index bits, and lookups find exactly the items with the
+    /// suffix.
     #[test]
     fn test_group_roundtrip() {
         arbtest(|u| {
-            let games = u.int_in_range(1..=1u64 << ColdGroup::INDEX_BITS)?;
-            let mut items: Vec<(u16, u64)> = (0..u.int_in_range(1..=300)?)
-                .map(|_| {
-                    // Few distinct suffixes sometimes, to have duplicates.
-                    let suffix = if u.ratio(1, 4)? {
-                        u.int_in_range(0..=3)?
-                    } else {
-                        u.arbitrary()?
-                    };
-                    Ok((suffix, u.int_in_range(0..=games - 1)?))
-                })
-                .collect::<arbitrary::Result<_>>()?;
-            items.sort_by_key(|&(suffix, _)| suffix);
-            let mut group = ColdGroup::new(games);
-            for &(suffix, index) in &items {
-                let mut bytes = [7, 7, 7, 7, 0, 0];
-                bytes[4..].copy_from_slice(&suffix.to_be_bytes());
-                group.push(ColdKey::new(&hash(bytes)), game(index)).unwrap();
+            let index_bits = u.int_in_range(0..=ColdGroup::MAX_INDEX_BITS)?;
+            let mut group = ColdGroup::new();
+            let mut items: Vec<(u16, u64)> = Vec::new();
+            for _ in 0..u.int_in_range(0..=300)? {
+                // Few distinct suffixes sometimes, to have duplicates.
+                let suffix = if u.ratio(1, 4)? {
+                    u.int_in_range(0..=3)?
+                } else {
+                    u.arbitrary()?
+                };
+                let index = if index_bits == 0 {
+                    0
+                } else {
+                    u.int_in_range(0..=(1u64 << index_bits) - 1)?
+                };
+                group.add(suffix, index);
+                items.push((suffix, index));
             }
-            let value = group.finish().unwrap().1.to_vec();
+            items.sort_unstable();
+            items.dedup();
+
+            let value = pack(&mut group);
+            let view = ColdGroupView::unpack_entire(&value);
+            let max = items.iter().map(|&(_, index)| index).max();
+            assert_eq!(
+                view.index_bits,
+                max.map_or(0, |max| u64::BITS - max.leading_zeros())
+            );
+            assert_eq!(view.len(), items.len() as u64);
+            assert_eq!(view.items().collect::<Vec<_>>(), items);
             for probe in
                 items
                     .iter()
                     .map(|&(suffix, _)| suffix)
                     .chain([u.arbitrary()?, 0, u16::MAX])
             {
-                let mut bytes = [7, 7, 7, 7, 0, 0];
-                bytes[4..].copy_from_slice(&probe.to_be_bytes());
-                let expected: Vec<GameIndex> = items
+                let expected: Vec<u64> = items
                     .iter()
                     .filter(|&&(suffix, _)| suffix == probe)
-                    .map(|&(_, index)| game(index))
+                    .map(|&(_, index)| index)
                     .collect();
-                assert_eq!(ColdKey::new(&hash(bytes)).candidates(&value), expected);
+                assert_eq!(candidates(&value, probe), expected);
             }
             Ok(())
         })
         .budget_ms(2000);
+    }
+
+    /// Merging packed groups yields the union of their items.
+    #[test]
+    fn test_merge_is_union() {
+        arbtest(|u| {
+            let mut all = ColdGroup::new();
+            let mut merged = ColdGroup::new();
+            for _ in 0..u.int_in_range(0..=4)? {
+                let mut part = ColdGroup::new();
+                for _ in 0..u.int_in_range(0..=50)? {
+                    let suffix = u.int_in_range(0..=20)?;
+                    let index = u.int_in_range(0..=20)?;
+                    part.add(suffix, index);
+                    all.add(suffix, index);
+                }
+                merged.merge_unpack_entire(&pack(&mut part));
+            }
+            assert_eq!(pack(&mut merged), pack(&mut all));
+            Ok(())
+        });
     }
 
     /// The integer Rice parameter matches its definition.
@@ -309,35 +336,27 @@ mod tests {
     #[test]
     fn test_group_size() {
         let games = 8_337_694_503;
-        let mut group = ColdGroup::new(games);
+        let mut group = ColdGroup::new();
         let mut x = 1u64;
-        let mut suffixes: Vec<u16> = (0..45)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (x >> 48) as u16
-            })
-            .collect();
-        suffixes.sort_unstable();
-        for (i, &suffix) in suffixes.iter().enumerate() {
-            let mut bytes = [1, 1, 1, 1, 0, 0];
-            bytes[4..].copy_from_slice(&suffix.to_be_bytes());
-            group
-                .push(ColdKey::new(&hash(bytes)), game(i as u64 * 1000))
-                .unwrap();
+        for i in 0..45 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            group.add((x >> 48) as u16, games - 1 - i * 1000);
         }
-        let len = group.finish().unwrap().1.len();
-        // 1 header byte, 45 * 34 index bits, about 45 * 12 gap bits.
+        let len = pack(&mut group).len();
+        // 2 header bytes, 45 * 33 index bits, about 45 * 12 gap bits.
         assert!(
-            len <= 1 + (45usize * 34 + 45 * 25 / 2).div_ceil(8),
+            len <= 2 + (45usize * 33 + 45 * 25 / 2).div_ceil(8),
             "{len} bytes"
         );
     }
 
     #[test]
-    #[should_panic(expected = "do not fit")]
-    fn test_too_many_games() {
-        ColdGroup::new((1 << ColdGroup::INDEX_BITS) + 1);
+    #[should_panic(expected = "too large")]
+    fn test_index_too_large() {
+        let mut group = ColdGroup::new();
+        group.add(0, 1 << ColdGroup::MAX_INDEX_BITS);
+        pack(&mut group);
     }
 }

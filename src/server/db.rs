@@ -12,7 +12,7 @@ use rocksdb::{
 use thiserror::Error;
 
 use crate::{
-    packed::{ColdKey, GameId, GameIndex, PositionKey},
+    packed::{ColdGroupView, ColdKey, GameId, GameIndex, PositionKey},
     sst::read_table_options,
 };
 
@@ -246,7 +246,12 @@ impl Database {
         Ok(self
             .db
             .get_pinned_cf(self.cf(COLD_CF), key.prefix())?
-            .map_or_else(Vec::new, |group| key.candidates(&group)))
+            .map_or_else(Vec::new, |group| {
+                ColdGroupView::unpack_entire(&group)
+                    .candidates(key.suffix())
+                    .map(|index| GameIndex::new(index).expect("valid game index"))
+                    .collect()
+            }))
     }
 
     /// The value of a game (see `unpack_game_value`).

@@ -44,8 +44,6 @@ pub struct SstContext<'a> {
     pub out: &'a Path,
     /// Approximate size of the SST files.
     pub target_size: u64,
-    /// Upper bound for game indexes.
-    pub games: u64,
     /// Write the cold positions column family.
     pub cold: bool,
     pub stats: Mutex<OutputStats>,
@@ -175,6 +173,19 @@ fn hash_bytes(entry: &IntermediateEntry) -> &[u8] {
     &entry.0[..PositionKey::SIZE]
 }
 
+/// Writes a cold group, which is empty afterwards.
+fn put_cold_group(
+    writer: &mut RollingSstWriter<'_>,
+    prefix: &[u8; ColdKey::PREFIX_SIZE],
+    group: &mut ColdGroup,
+    buf: &mut Vec<u8>,
+) -> Result<(), SstError> {
+    buf.clear();
+    group.pack_entire(buf);
+    group.clear();
+    writer.put(prefix, buf)
+}
+
 /// Writes the keys of one column family for sorted buckets and sorted hot
 /// entries of one key range, split into the given number of files.
 #[allow(clippy::too_many_arguments)]
@@ -204,7 +215,10 @@ fn write_range(
     let mut next_file_at = total_records / files;
     let mut records = 0;
     let mut cold_records = 0;
-    let mut cold_group = ColdGroup::new(sst.games);
+    // The cold group being collected, and the prefix of its key.
+    let mut cold_group = ColdGroup::new();
+    let mut cold_prefix = [0; ColdKey::PREFIX_SIZE];
+    let mut cold_value = Vec::new();
     let mut position_records = 0;
     let mut skipped_cold_records = 0;
     let mut hot = hot.iter().peekable();
@@ -224,13 +238,11 @@ fn write_range(
         match (family, run) {
             (Family::Cold, [single]) => {
                 let key = ColdKey::from_hash_bytes(hash);
-                if let Err(key) = cold_group.push(key, single.game_index()) {
-                    let (prefix, value) = cold_group.finish().expect("non-empty group");
-                    writer.put(&prefix, value)?;
-                    cold_group
-                        .push(key, single.game_index())
-                        .expect("empty group");
+                if *key.prefix() != cold_prefix && !cold_group.is_empty() {
+                    put_cold_group(&mut writer, &cold_prefix, &mut cold_group, &mut cold_value)?;
                 }
+                cold_prefix = *key.prefix();
+                cold_group.add(key.suffix(), single.game_index().get());
                 cold_records += 1;
             }
             (Family::Cold, _) => (),
@@ -256,8 +268,8 @@ fn write_range(
             }
         }
     }
-    if let Some((prefix, value)) = cold_group.finish() {
-        writer.put(&prefix, value)?;
+    if !cold_group.is_empty() {
+        put_cold_group(&mut writer, &cold_prefix, &mut cold_group, &mut cold_value)?;
     }
     if family == Family::Positions {
         for (key, value) in hot {

@@ -4,8 +4,8 @@ use bytes::{Buf, BufMut};
 use shakmaty::{KnownOutcome, packed::PackedUciMove};
 
 use crate::packed::{
-    CellKey, GameIndex, GroupHeader, Month, PositionKey, Rating, RatingGroup, Speed, outcome_bits,
-    outcome_from_bits,
+    CellGroupHeader, CellKey, GameIndex, GroupHeader, Month, PositionKey, Rating, RatingGroup,
+    Speed, outcome_bits, outcome_from_bits,
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]

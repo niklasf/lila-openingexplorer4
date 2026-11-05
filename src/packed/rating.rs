@@ -126,6 +126,39 @@ impl RatingGroup {
         RatingGroup::Group3200,
     ];
 
+    pub fn bits(self) -> u8 {
+        match self {
+            RatingGroup::Low => 0,
+            RatingGroup::Group1000 => 1,
+            RatingGroup::Group1200 => 2,
+            RatingGroup::Group1400 => 3,
+            RatingGroup::Group1600 => 4,
+            RatingGroup::Group1800 => 5,
+            RatingGroup::Group2000 => 6,
+            RatingGroup::Group2200 => 7,
+            RatingGroup::Group2500 => 8,
+            RatingGroup::Group2800 => 9,
+            RatingGroup::Group3200 => 10,
+        }
+    }
+
+    pub fn from_bits(bits: u8) -> Option<RatingGroup> {
+        Some(match bits {
+            0 => RatingGroup::Low,
+            1 => RatingGroup::Group1000,
+            2 => RatingGroup::Group1200,
+            3 => RatingGroup::Group1400,
+            4 => RatingGroup::Group1600,
+            5 => RatingGroup::Group1800,
+            6 => RatingGroup::Group2000,
+            7 => RatingGroup::Group2200,
+            8 => RatingGroup::Group2500,
+            9 => RatingGroup::Group2800,
+            10 => RatingGroup::Group3200,
+            _ => return None,
+        })
+    }
+
     pub fn select(rating: Rating) -> RatingGroup {
         let rating = i32::from(rating);
 

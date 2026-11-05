@@ -21,7 +21,7 @@ pub use write::{COLD_DIR, OutputStats, POSITIONS_DIR};
 
 use crate::{
     intermediate::IntermediateEntry,
-    packed::{ColdGroup, GameIndex, PositionKey},
+    packed::{GameIndex, PositionKey},
     parquet::{Input, PrefetchTimes, Prefetcher},
     parquet_to_positions::{
         hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotEntries, HotMap, Sample},
@@ -44,15 +44,12 @@ const PARTITIONS_IN_MEMORY: u64 = 4;
 
 /// Zstd level of cold positions SST files. Their bit-packed game indexes
 /// and Rice codes are practically incompressible, unless there are few
-/// games: then the high bits of the game indexes are always zero, and
-/// groups are small (masters cold positions compress about 2x).
+/// games (masters cold positions compressed about 2x, back when the high
+/// bits of their game indexes were always zero, not yet re-measured since
+/// the index width is minimal).
 fn cold_zstd_level(games: u64) -> i32 {
     let bits = u64::BITS - games.saturating_sub(1).leading_zeros();
-    if bits + 4 <= ColdGroup::INDEX_BITS {
-        3
-    } else {
-        0
-    }
+    if bits <= 30 { 3 } else { 0 }
 }
 
 /// Assumed ratio of zstd compressed scratch chunks to record bytes. The ratio
@@ -391,7 +388,6 @@ pub fn convert(
         env_opts: &config.sst.env_options(),
         out,
         target_size: config.sst_target_size,
-        games: plan.input.all_rows(),
         cold: config.cold,
         stats: Mutex::new(OutputStats::default()),
     };
