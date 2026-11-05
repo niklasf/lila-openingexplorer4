@@ -21,7 +21,7 @@ pub use write::{COLD_DIR, OutputStats, POSITIONS_DIR};
 
 use crate::{
     intermediate::IntermediateEntry,
-    packed::{GameIndex, PositionKey},
+    packed::{ColdKey, GameIndex, PositionKey},
     parquet::{Input, PrefetchTimes, Prefetcher},
     parquet_to_positions::{
         hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotEntries, HotMap, Sample},
@@ -42,14 +42,17 @@ use crate::{
 /// which is temporarily held twice while it is distributed to buckets.
 const PARTITIONS_IN_MEMORY: u64 = 4;
 
-/// Zstd level of cold positions SST files. Their bit-packed game indexes
-/// and Rice codes are practically incompressible, unless there are few
-/// games (masters cold positions compressed about 2x, back when the high
-/// bits of their game indexes were always zero, not yet re-measured since
-/// the index width is minimal).
-fn cold_zstd_level(games: u64) -> i32 {
-    let bits = u64::BITS - games.saturating_sub(1).leading_zeros();
-    if bits <= 30 { 3 } else { 0 }
+/// Zstd level of cold positions SST files, given the estimated records.
+/// Cold groups are practically incompressible, unless there are fewer
+/// records than cold key prefixes: then most groups have a single item, so
+/// the keys and the headers of the values dominate (masters cold positions
+/// compress to 54%).
+fn cold_zstd_level(records: u64) -> i32 {
+    if records < 1 << (8 * ColdKey::PREFIX_SIZE) {
+        3
+    } else {
+        0
+    }
 }
 
 /// Assumed ratio of zstd compressed scratch chunks to record bytes. The ratio
@@ -379,7 +382,7 @@ pub fn convert(
         // Cold keys are dense prefixes of the hash space: every lookup
         // hits a group, so a filter would not help.
         cold_opts: &SstConfig {
-            zstd_level: cold_zstd_level(plan.input.all_rows()),
+            zstd_level: cold_zstd_level(estimate.records),
             zstd_dict: 0,
             ..config.sst
         }
@@ -807,11 +810,10 @@ mod tests {
 
     #[test]
     fn test_cold_zstd_level() {
-        // Masters, and lichess.
-        assert_eq!(cold_zstd_level(2_997_978), 3);
-        assert_eq!(cold_zstd_level(8_337_694_503), 0);
-        // The threshold: 30 bits are 4 spare bits of 34.
-        assert_eq!(cold_zstd_level(1 << 30), 3);
-        assert_eq!(cold_zstd_level((1 << 30) + 1), 0);
+        // Masters (all plies), and lichess (50 plies).
+        assert_eq!(cold_zstd_level(240_857_745), 3);
+        assert_eq!(cold_zstd_level(300_000_000_000), 0);
+        assert_eq!(cold_zstd_level((1 << 32) - 1), 3);
+        assert_eq!(cold_zstd_level(1 << 32), 0);
     }
 }
