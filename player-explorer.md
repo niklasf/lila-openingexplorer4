@@ -786,6 +786,76 @@ Then:
   request. If the old production server's `rocksdb.stats` of the `player`
   CF is available, compare the level shape with it.
 
+### Built (2026-11-05)
+
+`player_bulk` (`src/player/bulk/`, `src/bin/player_bulk.rs`), all in
+`/mnt/workspace_nvme/agent/scratch/bulk/`:
+
+1. `count` (6 min): 23.7 M players, 16.7 G (game, side) pairs in the
+   parquet. `select`: the 9,676 fixture players with games (76 M pairs)
+   plus 1.27 M players sampled with weight `games^0.268`, so that their
+   mean is 2,500 games (p50 176, p90 6.3k, p99 36k, max 608k): 1.28 M
+   players, 3.25 G pairs.
+2. `scatter` (12 min, 294 GB): the records the live indexer would write,
+   built directly from the parquet for standard games (`via export`, i.e.
+   the mock's `present` + `classify`, for the 2% variant and noisy games).
+   `--verify` on a slice: 14.9 M standard games identical on both paths.
+   The mock's rules (shift, durations, casual, noise) are shared in
+   `mock_lila::synth`.
+3. `build` (57 min, 30 GB RSS): plans per player, aging window
+   2026-08-01 .. 2026-11-03 (database time):
+   * requests players: 20% unindexed (first runs in the replay), 20%
+     dormant, 10% new, 50% active; sampled: 60% dormant, 30% active, 10%
+     new;
+   * dormant: last indexed at the window start minus an exponential delay
+     (mean 180 days); active: indexed to the window start, then visits
+     every 1-60 days (log-uniform); new: first run at a random time in the
+     window, then visits.
+   * Result: 748 k dormant, 402 k active, 128 k new, 1.9 k unindexed;
+     2.68 G base games (748 GB of SSTs, 279 B/game), 354 M tail games in
+     1.24 M visits; 188 M games after dormant cutoffs stay unindexed.
+4. `ingest` (11 s): everything in L6, 714 GB. Checkpoint `ckpt_base`.
+5. `age` (44 min, 16 workers, 8 background jobs): 352 M games through
+   `write_chunk`, 150 k first runs, 39 k rebuilds (4 by ingest), 140-280 k
+   games/s; write stalls 36% of the time (compaction behind at ~5000x the
+   production rate). Flushed 132 GB, compaction writes 1,275 GB (write
+   amplification ~9.7; old production: 91). Checkpoint `ckpt_aged`.
+
+Shape after aging (MB per level):
+
+| CF | L0 | L2-L4 | L5 | L6 |
+| --- | --- | --- | --- | --- |
+| games | 125 | 1,837 | 16,280 | 163,479 |
+| game_ids | 0 | 477 | 3,095 | 31,100 |
+| warm | 62 | 2,331 | 21,670 | 218,197 |
+| cold | 0 | 3,634 | 32,362 | 325,044 |
+
+801 GB for 3.03 G indexed games: **264 B per game** (cold 116, warm 78,
+games 58, ids 11). L5 is ~10% of L6 in every column family, as for a
+long-lived leveled LSM.
+
+`check` on 300 fixture players (233 indexed): their 1.56 M games are
+identical (records and order) to what the indexer gets from the mock up to
+their `latest createdAt`, and all 53.2 M of their positions read the same
+entries as a naive aggregation.
+
+Smoke benchmark from a hard-linked copy of `ckpt_aged` (`--cache 16g`, NVMe
+only), the first 2 h of `requests.tsv` at 10x with the mock at 300
+games/s per stream, as the replay on an initially empty database before:
+
+| | empty database | aged database |
+| --- | --- | --- |
+| complete / aborted by the next request / gave up | 21,794 / 5,692 / 2 | 21,140 / 6,326 / 22 |
+| p99 to the final snapshot | 20 s | 43 s |
+| requests that waited for indexing (p50 / p90 / p99) | 314 (20 / 90 / 308 s) | 548 (20 / 143 / 491 s) |
+| lila slot use | 46% | 78% (1,226 runs, 1.36 M games) |
+
+The aged database makes the indexer busier: dormant players come back
+with months of games, and 20% of the requests players need first runs.
+How realistic that is depends on the plan shares, which are guesses.
+Position reads: mean 0.7 ms, 92% within 1 ms, max 19 ms; block cache hit
+rate 52% from a cold 16 GB cache. No errors, no stream limit violations.
+
 ## Code conventions
 
 Consistent with the existing code: strong types, and binary formats
@@ -867,7 +937,11 @@ Branch `personal-explorer`:
   250 players is 6.5x larger); the writer does ~70k games/s per indexer,
   far above lila's 300 games/s; a rebuild of a player with 1.7k games takes
   14 ms.
-* Milestone 4 (prod-like database): not started (multi-hour runs, ~1 TB).
+* Milestone 4 (prod-like database): done (see [Built](#built-2026-11-05)):
+  1.28 M players, 3.03 G indexed games, 801 GB, aged LSM shape, checked
+  against the mock and a naive aggregation; checkpoints `ckpt_base` and
+  `ckpt_aged` in `/mnt/workspace_nvme/agent/scratch/bulk/` (about 2.5 h
+  end to end).
 * Milestone 5: `--wal-dir`, `--db-path PATH:SIZE` (upper levels on NVMe,
   last level on HDD) and `--rate-limit` exist; the interference benchmark
   on the HDDs is not done.
