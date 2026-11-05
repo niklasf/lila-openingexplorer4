@@ -856,6 +856,125 @@ How realistic that is depends on the plan shares, which are guesses.
 Position reads: mean 0.7 ms, 92% within 1 ms, max 19 ms; block cache hit
 rate 52% from a cold 16 GB cache. No errors, no stream limit violations.
 
+## Production layout on the HDDs (milestone 5, 2026-11-05)
+
+### Placement
+
+Production: WAL, upper levels (and the small column families) on the NVMe
+RAID 1, the last level on the HDDs, via `--db-path NVME:SIZE --db-path
+HDD:SIZE`. Findings:
+
+* **RocksDB ignores `level_compaction_dynamic_level_bytes` with several
+  db paths** (`column_family.cc`, only a warning in LOG: "multiple
+  cf_paths/db_paths and level_compaction_dynamic_level_bytes can't be used
+  together") and falls back to static targets from
+  `max_bytes_for_level_base` (x10). With a last level of hundreds of GB
+  that is the old production database's mistake (L6 ~350x L5, write
+  amplification ~91). So with several paths the server sets the targets
+  per column family itself (`tune_levels`, at open and every 10 minutes):
+  L1 128 MB, a multiplier such that L5 = L6 / `--level-ratio` (default
+  10). For the aged database: games x3.36, game ids x2.22, warm x3.61,
+  cold x3.99, status x2.
+* RocksDB places a compaction's output by the level targets: a level goes
+  to the first path whose remaining target size holds it and the levels
+  above. Each column family decides on its own against the whole path
+  size. With 64 GB for the NVMe path, L0-L5 of every column family and the
+  whole of `game_ids` and `status` (L6 targets 7 GB and less) stay on the
+  NVMe, L6 of games, warm and cold go to the HDDs. The thresholds move as
+  the database grows; recheck the NVMe path size about once a year.
+* **Ingested files always go to the first path** (`FileDescriptor(...,
+  0, ...)` in `external_sst_file_ingestion_job.cc`), also at L6. Rebuilds
+  of large players (SST ingest above 64 MB, 4 of 39 k rebuilds in aging)
+  land on the NVMe until a compaction rewrites them. Small; a bulk build
+  of a new database cannot be ingested onto the HDDs this way, though.
+* **Files are found only under the path id of their MANIFEST entry**, so
+  moving files between paths needs a rewrite. For the benchmarks: a copy
+  of `ckpt_aged` with the L6 files of games, warm and cold (741 GB) on the
+  HDD (`/mnt/workspace_hdd/agent/player_base`, 51 min at 267 MB/s with
+  the resync) and symlinks in the NVMe directory
+  (`scratch/bulk/ckpt_tiered`, 111 GB). New L6 output goes to a fresh
+  HDD directory per run; compactions delete only the symlinks, so the
+  base stays intact for the next run. Open: 33-53 s (footers of 6,034
+  files on the HDDs).
+
+### Interference with lichess (run5)
+
+lichess and masters on the HDDs (`--cache 16g`/`4g`, pinned metadata,
+parallel fetch, 32/12 blocking threads), all servers in one 100 GB memory
+slice on the production CPUs, the night log (`unsampled-2026-11-04`) at 4x
+(~240 req/s, ~1.2x the weekly average), the RAID resync running. The
+personal explorer (aged database, tiered, `--cache 8g`) at full indexing
+load in two 20 min windows: `requests.tsv` at 10x with the mock at 300
+games/s per stream, 8 streams (1.9 M games indexed per window, ~1,600/s,
+about 60x the production average).
+
+| phase (min) | HDD reads/s | lichess p50 / p90 / p99 ms | masters p50 / p99 ms |
+| --- | --- | --- | --- |
+| alone (10-31) | 973 | 11.0 / 193 / 466 | 8.6 / 338 |
+| personal, unthrottled (31-51) | 757 | 8.0 / 160 / 453 | 2.0 / 312 |
+| alone (51-65) | 597 | 5.9 / 120 / 464 | 1.8 / 298 |
+| personal, rate limit 8 MB/s (65-85) | 530 | 5.3 / 114 / 479 | 1.6 / 293 |
+| alone (85-100) | 524 | 3.4 / 104 / 479 | 1.6 / 272 |
+
+No measurable interference: lichess and masters follow their warm-up
+trend through both windows. The personal explorer wrote nothing to the
+HDDs (2 writes/s throughout): the 1.9 M games of a window stayed in the
+NVMe levels (0.67 GB flushed, 1.06 GB compacted, only up to L2), so the
+rate limiter had nothing to do. Its HDD load is reads: up to 110 block
+cache misses/s, position reads mean 17.6 ms (max 0.7 s) from a cold
+page cache in the first window, 0.2 ms in the second (same requests on a
+fresh copy, L6 blocks in the page cache). Personal responses as on NVMe
+only (p99 to the final snapshot 30-32 s, of 700 waiting for indexing p99
+485 s, all at 10x).
+
+### Compaction storms (run6, run7)
+
+The bursts above never reach L6: at the production rate L5 -> L6
+compactions start only after L5 has grown by a tenth of L6 (months), but
+then rewrite L6 on the HDDs. To provoke them, the personal explorer was
+started idle with `--level-ratio 40` (L5 4x over its target), so that it
+compacts L5 into L6 at full speed for 20 minutes (4 background jobs),
+under the same lichess load as above.
+
+* run6 (NVMe path 64 GB): at ratio 40 the multiplier drops to ~2.4 and
+  the L6 targets fit the NVMe path, so the new L6 files went to the NVMe
+  (placement by targets is fragile, see above). It still measured the
+  compaction reads of L6 from the HDDs: 850 -> 1,996 HDD reads/s (20 ->
+  73 MB/s), per-minute lichess + masters p50 5-8 ms and p99 340-440 ms,
+  the same as before the storm. Compaction reads are large and sequential.
+  (Stopped after 10 minutes of the storm.)
+* run7 (NVMe path 15 GB, so that L6 goes to the HDDs):
+
+| phase (min) | HDD reads/s (MB/s) | HDD writes (MB/s) | lichess p50 / p90 / p99 ms | masters p50 / p99 ms |
+| --- | --- | --- | --- | --- |
+| alone (10-31) | 963 (24.7) | 0 | 10.7 / 197 / 463 | 8.4 / 324 |
+| storm, unthrottled (31-51) | 1,350 (44.4) | 31.8 | 9.4 / 164 / 421 | 2.1 / 269 |
+| alone (51-66) | 741 (19.0) | 0 | 7.0 / 131 / 445 | 1.9 / 310 |
+| storm, `--rate-limit 8m` (66-86) | 815 (23.4) | 11.1 | 7.4 / 129 / 415 | 1.7 / 244 |
+| alone (86-100) | 639 (14.9) | 0 | 6.4 / 123 / 465 | 1.6 / 263 |
+
+  Unthrottled, the storm wrote 18 GB of new L6 in 20 minutes (25 GB
+  compaction writes, 26 GB reads), throttled 6.4 GB (8.4 GB, ~7 MB/s);
+  no write stalls in either. The alone phases reproduce run5 within a few
+  percent, and lichess and masters stay on that trend in both storms:
+  **no measurable interference** at ~240 req/s with the disks 82-85%
+  busy (including the resync).
+
+Conclusions:
+
+* The personal explorer on NVMe (WAL, upper levels, game ids) plus HDDs
+  (L6 of games, warm, cold) does not measurably slow down lichess or
+  masters at about the average production load, neither while indexing
+  at lila's full rate nor during a full-speed rewrite of L6.
+* Its own reads from the HDDs are the visible cost: 17.6 ms mean per
+  position read from a cold page cache, while the bursts stay on the NVMe.
+* Set a rate limiter anyway (`--rate-limit 16m` or so), as a bound for
+  peak hours: it costs nothing for indexing bursts, which do not reach
+  L6, and only stretches the rare L6 compactions.
+* Not measured: peak traffic close to disk saturation (the earlier HDD
+  series saw masters starve when lichess saturated the disks), and the
+  write path with lichess's monthly SST upload running.
+
 ## Code conventions
 
 Consistent with the existing code: strong types, and binary formats
@@ -942,9 +1061,13 @@ Branch `personal-explorer`:
   against the mock and a naive aggregation; checkpoints `ckpt_base` and
   `ckpt_aged` in `/mnt/workspace_nvme/agent/scratch/bulk/` (about 2.5 h
   end to end).
-* Milestone 5: `--wal-dir`, `--db-path PATH:SIZE` (upper levels on NVMe,
-  last level on HDD) and `--rate-limit` exist; the interference benchmark
-  on the HDDs is not done.
+* Milestone 5 (production layout): done (see [Production layout on the
+  HDDs](#production-layout-on-the-hdds-milestone-5-2026-11-05)). With
+  several `--db-path`, the server now sets the level targets itself
+  (RocksDB ignores dynamic level sizes there). No measurable interference
+  with lichess and masters on the HDDs, neither from indexing bursts nor
+  from a full-speed L6 rewrite; tiered checkpoint in
+  `scratch/bulk/ckpt_tiered` + `/mnt/workspace_hdd/agent/player_base`.
 * Not decided, not implemented: `DELETE /player/{id}`.
 
 ## Decided
