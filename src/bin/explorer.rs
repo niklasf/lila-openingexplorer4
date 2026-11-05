@@ -78,10 +78,12 @@ struct PlayerArgs {
     /// level on HDDs).
     #[arg(long = "db-path", value_parser = parse_db_path)]
     db_paths: Vec<(PathBuf, u64)>,
-    /// Limit flushes and compactions to this many bytes per second, like
-    /// 64m.
-    #[arg(long)]
-    rate_limit: Option<ByteSize>,
+    /// Limit flushes and compactions (on all paths) to this many bytes
+    /// per second (0 for no limit). Bounds the HDD writes when compactions
+    /// rewrite the last level, which are rare; indexing bursts stay in the
+    /// upper levels and wrote far less than this in the benchmarks.
+    #[arg(long, default_value = "16m")]
+    rate_limit: ByteSize,
     /// With several --db-path: the last level holds this many times the
     /// level above (RocksDB's dynamic level sizes are not available with
     /// several paths, so the server sets the level targets itself).
@@ -384,7 +386,7 @@ fn run_player(args: PlayerArgs) {
             cache_bytes: args.cache.into(),
             max_ply: args.max_ply,
             placement: Placement::Threshold(args.warm_threshold.max(1)),
-            rate_limit: args.rate_limit.map(u64::from),
+            rate_limit: (args.rate_limit.0 > 0).then_some(args.rate_limit.0),
             wal_dir: args.wal_dir,
             db_paths: args.db_paths.clone(),
             statistics: args.db_statistics,
