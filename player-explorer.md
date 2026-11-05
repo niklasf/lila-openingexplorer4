@@ -160,11 +160,21 @@ duration, bytes, ingested), RocksDB write stall/compaction stats.
 Similar to monitoring on `/lichess`. Can break compatibility with the old
 server, remove useless metrics, and add new ones.
 
-### Possible new internal endpoints (to decide)
+`/monitor` (and `/monitor/db/{prop}`, `/monitor/cf/{cf}/{prop}`) is served
+only on `--admin-bind`, a separate address to keep private, for all three
+servers (lichess, masters, player). Without `--admin-bind` there is no
+monitoring or administration at all.
 
-* `DELETE /player/{id}`: drop everything of a player (reset, for example
-  after a format change, or on request). One `DeleteRange` over the
-  player's key range. Closed accounts are not deleted (as before).
+### Internal endpoints (implemented)
+
+* `DELETE /player/{id}` (on `--admin-bind` only): drop everything of a
+  player (reset, for example after a format change, or on request). One
+  `DeleteRange` per column family over the player's key range, in one
+  write batch. It waits for a running index run (at most `--max-run`,
+  30 s) or rebuild of the player to end and keeps new runs from starting
+  meanwhile; requests waiting for the player then get a new first run.
+  204, or 404 if the player was not indexed. Closed accounts are not
+  deleted (as before).
 
 ## Architecture
 
@@ -1068,7 +1078,8 @@ Branch `personal-explorer`:
   with lichess and masters on the HDDs, neither from indexing bursts nor
   from a full-speed L6 rewrite; tiered checkpoint in
   `scratch/bulk/ckpt_tiered` + `/mnt/workspace_hdd/agent/player_base`.
-* Not decided, not implemented: `DELETE /player/{id}`.
+* `--rate-limit 16m` by default; `/monitor` only on `--admin-bind` (all
+  servers); `DELETE /player/{id}` implemented there (2026-11-05).
 
 ## Decided
 

@@ -70,9 +70,12 @@ struct Entry {
 struct State {
     entries: HashMap<UserId, Entry>,
     waiting: VecDeque<UserId>,
-    /// Players being indexed or rebuilt, who must not be indexed again
-    /// meanwhile.
+    /// Players being indexed, rebuilt or deleted, who must not be indexed
+    /// again meanwhile.
     busy: HashSet<UserId>,
+    /// Players waiting for exclusive access (see `Queue::reserve`), who are
+    /// not indexed meanwhile either.
+    reserving: HashMap<UserId, usize>,
 }
 
 impl State {
@@ -94,6 +97,8 @@ impl State {
 pub struct Queue {
     state: Mutex<State>,
     notify: Notify,
+    /// Notified whenever a player stops being busy.
+    released: Notify,
     capacity: usize,
     known_first: bool,
 }
@@ -111,6 +116,7 @@ impl Queue {
         Queue {
             state: Mutex::new(State::default()),
             notify: Notify::new(),
+            released: Notify::new(),
             capacity,
             known_first,
         }
@@ -188,7 +194,7 @@ impl Queue {
                 state.entries.remove(&user);
                 continue;
             }
-            if state.busy.contains(user) {
+            if state.busy.contains(user) || state.reserving.contains_key(user) {
                 i += 1;
                 continue;
             }
@@ -208,6 +214,47 @@ impl Queue {
         }
         state.update_positions();
         acquired
+    }
+
+    /// Waits until no index run or rebuild of the player is in progress,
+    /// and keeps new ones from starting until the guard is dropped (for
+    /// exclusive access, like deleting the player). Index runs of the
+    /// player do not start while this waits.
+    pub async fn reserve(self: &Arc<Self>, user: &UserId) -> BusyGuard {
+        *self
+            .state
+            .lock()
+            .expect("queue")
+            .reserving
+            .entry(user.clone())
+            .or_default() += 1;
+        loop {
+            let released = self.released.notified();
+            {
+                let mut state = self.state.lock().expect("queue");
+                if !state.busy.contains(user) {
+                    state.busy.insert(user.clone());
+                    if let Some(n) = state.reserving.get_mut(user) {
+                        *n -= 1;
+                        if *n == 0 {
+                            state.reserving.remove(user);
+                        }
+                    }
+                    return BusyGuard {
+                        user: user.clone(),
+                        queue: Arc::clone(self),
+                    };
+                }
+            }
+            released.await;
+        }
+    }
+
+    /// Wakes the indexers and reservations after a player stopped being
+    /// busy.
+    fn wake(&self) {
+        self.notify.notify_one();
+        self.released.notify_waiters();
     }
 
     /// Waits for the next player to index.
@@ -260,7 +307,7 @@ impl QueueItem {
         }
         state.update_positions();
         drop(state);
-        self.queue.notify.notify_one();
+        self.queue.wake();
     }
 
     /// Completes the ticket, but keeps the player busy (not indexed again)
@@ -286,7 +333,7 @@ impl QueueItem {
         });
         drop(state);
         if release {
-            self.queue.notify.notify_one();
+            self.queue.wake();
         }
     }
 }
@@ -313,7 +360,7 @@ impl Drop for BusyGuard {
             .expect("queue")
             .busy
             .remove(&self.user);
-        self.queue.notify.notify_one();
+        self.queue.wake();
     }
 }
 
@@ -378,6 +425,34 @@ mod tests {
         assert_eq!(item.user(), &user("a"));
         drop(item);
         assert!(a3.changed().await.done);
+        assert_eq!(queue.stats().busy, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reserve() {
+        let queue = Arc::new(Queue::new(10, false));
+        let _a = queue.submit(user("a"), false).unwrap();
+        let item = queue.acquire().await;
+
+        // Waits for the run to end.
+        let reserve = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.reserve(&user("a")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!reserve.is_finished());
+
+        // A requeued run does not start again while the reservation waits.
+        item.requeue();
+        let guard = reserve.await.unwrap();
+        let waiting = tokio::time::timeout(Duration::from_millis(50), queue.acquire()).await;
+        assert!(waiting.is_err());
+
+        // It continues after the reservation.
+        drop(guard);
+        let item = queue.acquire().await;
+        assert_eq!(item.user(), &user("a"));
+        drop(item);
         assert_eq!(queue.stats().busy, 0);
     }
 

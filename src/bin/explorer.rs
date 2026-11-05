@@ -55,10 +55,14 @@ struct PlayerArgs {
     /// it.
     #[arg(long)]
     db: PathBuf,
-    /// Binding address. Administrative endpoints (/monitor) must be
-    /// protected by a reverse proxy.
+    /// Binding address of the public endpoints.
     #[arg(long, default_value = "127.0.0.1:9003")]
     bind: SocketAddr,
+    /// Binding address of administration and monitoring (/monitor and
+    /// DELETE /player/{id}), to be kept private. Without it, these are not
+    /// served at all.
+    #[arg(long)]
+    admin_bind: Option<SocketAddr>,
     /// Allow access from all origins.
     #[arg(long)]
     cors: bool,
@@ -236,10 +240,13 @@ struct ServeArgs {
     /// Database directory created by `ingest`.
     #[arg(long)]
     db: PathBuf,
-    /// Binding address. Administrative endpoints (/monitor) must be
-    /// protected by a reverse proxy.
+    /// Binding address of the public endpoints.
     #[arg(long, default_value = "127.0.0.1:9002")]
     bind: SocketAddr,
+    /// Binding address of administration and monitoring (/monitor), to be
+    /// kept private. Without it, these are not served at all.
+    #[arg(long)]
+    admin_bind: Option<SocketAddr>,
     /// Allow access from all origins.
     #[arg(long)]
     cors: bool,
@@ -448,6 +455,7 @@ fn run_player(args: PlayerArgs) {
         lila_openingexplorer4::player::server::serve(
             PlayerServerConfig {
                 bind: args.bind,
+                admin_bind: args.admin_bind,
                 cors: args.cors,
                 blocking_threads: args.blocking_threads,
                 openings_dir: args.openings_dir,
@@ -473,6 +481,7 @@ fn run(kind: Kind, args: ServeArgs) {
     let config = AppConfig {
         kind,
         bind: args.bind,
+        admin_bind: args.admin_bind,
         cors: args.cors,
         cache_entries: args.response_cache,
         cache_ttl: Duration::from_secs(args.response_cache_ttl),

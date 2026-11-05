@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::{
     player::{
-        PlayerDb, UserId,
+        PlayerDb, PlayerDbError, UserId,
         lila::{Classified, ExportGame, LilaClient, LilaError, Skip},
         queue::{ProgressHandle, Queue, QueueFull, QueueItem, Ticket},
         record::PlayerGame,
@@ -216,6 +216,28 @@ impl Indexer {
         self.queue.submit(user.clone(), known).inspect_err(|_| {
             inc(&self.metrics.queue_full);
         })
+    }
+
+    /// Deletes all data of the player, after waiting for a running index
+    /// run or rebuild of the player to end. Requests waiting for the player
+    /// get a new first run afterwards. Returns whether the player was
+    /// indexed.
+    pub async fn delete(&self, user: &UserId) -> Result<bool, PlayerDbError> {
+        let _busy = self.queue.reserve(user).await;
+        let db = Arc::clone(&self.db);
+        let uh = user.hash();
+        let existed = task::spawn_blocking(move || -> Result<bool, PlayerDbError> {
+            let existed = db.status(uh)?.is_some();
+            db.delete_player(uh)?;
+            Ok(existed)
+        })
+        .await
+        .expect("delete task")?;
+        log::info!(
+            "deleted {user}{}",
+            if existed { "" } else { " (was not indexed)" }
+        );
+        Ok(existed)
     }
 
     async fn index(self: &Arc<Self>, idx: usize, item: QueueItem) {

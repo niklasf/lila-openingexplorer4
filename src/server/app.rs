@@ -18,13 +18,7 @@ use moka::future::Cache;
 use partial_sort::PartialSort;
 use rocksdb::DBPinnableSlice;
 use shakmaty::{EnPassantMode, fen::Fen, san::SanPlus, variant::VariantPosition};
-use tokio::{
-    net::TcpListener,
-    runtime::Handle,
-    signal::unix::{SignalKind, signal},
-    sync::Semaphore,
-    task, time,
-};
+use tokio::{runtime::Handle, sync::Semaphore, task, time};
 
 use crate::{
     packed::{
@@ -38,6 +32,7 @@ use crate::{
             GameRef, MASTERS_TOP_CANDIDATES, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
             prepare_masters,
         },
+        listen,
         metrics::{Counter, Metrics},
         openings::Openings,
         pgn::masters_pgn,
@@ -85,6 +80,8 @@ impl ExploreQuery {
 pub struct AppConfig {
     pub kind: Kind,
     pub bind: SocketAddr,
+    /// Address for /monitor (`None`: no monitoring).
+    pub admin_bind: Option<SocketAddr>,
     pub cors: bool,
     /// Entries of the response cache.
     pub cache_entries: u64,
@@ -710,16 +707,7 @@ async fn periodic_openings_refresh(state: Shared) {
     }
 }
 
-/// Waits for SIGINT (Ctrl-C) or SIGTERM (like from systemd).
-async fn shutdown_signal() {
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => log::info!("received SIGINT, shutting down"),
-        _ = sigterm.recv() => log::info!("received SIGTERM, shutting down"),
-    }
-}
-
-/// Runs the server until it is interrupted.
+/// Runs the server until it is interrupted (SIGINT or SIGTERM).
 pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::error::Error>> {
     let openings = match &config.openings_dir {
         Some(dir) => {
@@ -758,10 +746,7 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         });
     }
 
-    let app = Router::new()
-        .route("/monitor", get(monitor))
-        .route("/monitor/db/{prop}", get(db_prop))
-        .route("/monitor/cf/{cf}/{prop}", get(cf_prop));
+    let app = Router::new();
     let app = match state.config.kind {
         Kind::Lichess => app
             .route("/lichess", get(lichess))
@@ -782,10 +767,14 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         app
     };
 
-    let listener = TcpListener::bind(state.config.bind).await?;
-    log::info!("listening on {}", state.config.bind);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let admin = state.config.admin_bind.map(|addr| {
+        let router = Router::new()
+            .route("/monitor", get(monitor))
+            .route("/monitor/db/{prop}", get(db_prop))
+            .route("/monitor/cf/{cf}/{prop}", get(cf_prop))
+            .with_state(Arc::clone(&state));
+        (addr, router)
+    });
+    listen::serve_until_signal(state.config.bind, app, admin).await?;
     Ok(())
 }

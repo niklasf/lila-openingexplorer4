@@ -1,4 +1,5 @@
-//! The `explorer player` server: `/player` (and `/personal`) and `/monitor`.
+//! The `explorer player` server: `/player` (and `/personal`), and on the
+//! administration address `/monitor` and `DELETE /player/{id}`.
 
 use std::{
     convert::Infallible,
@@ -17,15 +18,10 @@ use axum::{
     extract::{Path, Query, State, rejection::QueryRejection},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{delete, get},
 };
 use shakmaty::{Color, EnPassantMode, Position, fen::Fen, san::SanPlus, variant::VariantPosition};
-use tokio::{
-    net::TcpListener,
-    signal::unix::{SignalKind, signal},
-    sync::Semaphore,
-    task,
-};
+use tokio::{sync::Semaphore, task};
 
 use crate::{
     packed::SubStats,
@@ -40,8 +36,10 @@ use crate::{
         keys::GameSeq,
         query::PlayerQuery,
         queue::{Progress, Ticket},
+        user::{InvalidUserName, UserId},
     },
     server::{
+        listen,
         metrics::{Counter, Histogram},
         openings::{Opening, Openings},
         query::PlayError,
@@ -52,6 +50,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct PlayerServerConfig {
     pub bind: SocketAddr,
+    /// Address for /monitor and DELETE /player/{id} (`None`: neither).
+    pub admin_bind: Option<SocketAddr>,
     pub cors: bool,
     /// Concurrent database reads.
     pub blocking_threads: usize,
@@ -67,6 +67,7 @@ impl Default for PlayerServerConfig {
     fn default() -> PlayerServerConfig {
         PlayerServerConfig {
             bind: "127.0.0.1:9003".parse().expect("address"),
+            admin_bind: None,
             cors: false,
             blocking_threads: 4,
             openings_dir: None,
@@ -83,6 +84,8 @@ pub enum Error {
     Query(#[from] QueryRejection),
     #[error("bad request: {0}")]
     Play(#[from] PlayError),
+    #[error("bad request: {0}")]
+    User(#[from] InvalidUserName),
     #[error("indexing queue is full")]
     QueueFull,
     #[error("not found")]
@@ -94,7 +97,7 @@ pub enum Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
-            Error::Query(_) | Error::Play(_) => StatusCode::BAD_REQUEST,
+            Error::Query(_) | Error::Play(_) | Error::User(_) => StatusCode::BAD_REQUEST,
             Error::QueueFull => StatusCode::SERVICE_UNAVAILABLE,
             Error::NotFound => StatusCode::NOT_FOUND,
             Error::Db(_) => {
@@ -130,6 +133,7 @@ pub struct ServerMetrics {
     pub warm_hits: Counter,
     pub cold_candidates: Counter,
     pub cold_validated: Counter,
+    pub players_deleted: Counter,
 }
 
 pub struct PlayerState {
@@ -450,6 +454,7 @@ async fn monitor(State(state): State<Shared>) -> String {
         ("warm_hits", &m.warm_hits),
         ("cold_candidates", &m.cold_candidates),
         ("cold_validated", &m.cold_validated),
+        ("players_deleted", &m.players_deleted),
     ] {
         add(name, counter.get());
     }
@@ -568,6 +573,24 @@ async fn monitor(State(state): State<Shared>) -> String {
     format!("opening_explorer_player {}\n", fields.join(","))
 }
 
+/// `DELETE /player/{id}`: drops everything of a player (204, or 404 if
+/// the player was not indexed). Waits for a running index run (at most
+/// `--max-run`) or rebuild of the player to end. The next request indexes
+/// the player anew.
+async fn delete_player(
+    State(state): State<Shared>,
+    Path(user): Path<String>,
+) -> Result<StatusCode, Error> {
+    let user = UserId::from_name(&user)?;
+    let existed = state.indexer.delete(&user).await?;
+    Ok(if existed {
+        state.metrics.players_deleted.inc();
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
 async fn db_prop(State(state): State<Shared>, Path(prop): Path<String>) -> Result<String, Error> {
     blocking(&state, move |state| {
         state
@@ -613,20 +636,13 @@ async fn periodic_openings_refresh(state: Shared) {
     }
 }
 
-async fn shutdown_signal() {
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => log::info!("received SIGINT, shutting down"),
-        _ = sigterm.recv() => log::info!("received SIGTERM, shutting down"),
-    }
-}
-
-/// The router and state of the server (without listening), for tests.
+/// The public and the administration routers and the state of the server
+/// (without listening), for tests.
 pub fn router(
     config: PlayerServerConfig,
     indexer: Arc<Indexer>,
     openings: Openings,
-) -> (Router, Shared) {
+) -> (Router, Router, Shared) {
     let state: Shared = Arc::new(PlayerState {
         semaphore: Semaphore::new(config.blocking_threads),
         openings: RwLock::new(openings),
@@ -638,9 +654,12 @@ pub fn router(
     let app = Router::new()
         .route("/player", get(player))
         .route("/personal", get(player))
+        .with_state(Arc::clone(&state));
+    let admin = Router::new()
         .route("/monitor", get(monitor))
         .route("/monitor/db/{prop}", get(db_prop))
         .route("/monitor/cf/{cf}/{prop}", get(cf_prop))
+        .route("/player/{id}", delete(delete_player))
         .with_state(Arc::clone(&state));
     let app = if state.config.cors {
         app.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
@@ -650,7 +669,7 @@ pub fn router(
     } else {
         app
     };
-    (app, state)
+    (app, admin, state)
 }
 
 /// Runs the server until it is interrupted.
@@ -671,15 +690,11 @@ pub async fn serve(
         None => Openings::default(),
     };
     let download = config.openings_dir.is_none() && !config.no_openings;
-    let bind = config.bind;
-    let (app, state) = router(config, indexer, openings);
+    let (bind, admin_bind) = (config.bind, config.admin_bind);
+    let (app, admin, state) = router(config, indexer, openings);
     if download {
         task::spawn(periodic_openings_refresh(Arc::clone(&state)));
     }
-    let listener = TcpListener::bind(bind).await?;
-    log::info!("listening on {bind}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    listen::serve_until_signal(bind, app, admin_bind.map(|addr| (addr, admin))).await?;
     Ok(())
 }
