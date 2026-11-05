@@ -123,7 +123,7 @@ fn color_bit(color: Color) -> u8 {
 }
 
 /// A `PlayerGame` borrowing its data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BorrowedPlayerGame<'a> {
     pub id: GameId,
     pub speed: Speed,

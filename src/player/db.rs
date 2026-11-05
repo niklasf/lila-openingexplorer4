@@ -75,6 +75,8 @@ pub struct PlayerDbConfig {
     pub ingest_bytes: u64,
     /// Bytes per write batch of a rebuild.
     pub batch_bytes: usize,
+    /// Background threads for flushes and compactions.
+    pub background_jobs: i32,
 }
 
 impl Default for PlayerDbConfig {
@@ -89,6 +91,7 @@ impl Default for PlayerDbConfig {
             statistics: false,
             ingest_bytes: 64 << 20,
             batch_bytes: 4 << 20,
+            background_jobs: 4,
         }
     }
 }
@@ -201,7 +204,7 @@ impl PlayerDb {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        opts.set_max_background_jobs(4);
+        opts.set_max_background_jobs(config.background_jobs);
         opts.set_bytes_per_sync(1 << 20);
         opts.set_db_write_buffer_size(512 << 20);
         opts.set_max_total_wal_size(1 << 30);
@@ -516,6 +519,37 @@ impl PlayerDb {
         c.rebuild_micros
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Ok(Some(stats))
+    }
+
+    /// Options of a column family for writing SST files to ingest (for the
+    /// bulk build), with their own small block cache.
+    pub fn sst_options(cf: &str) -> Options {
+        cf_options(cf, &Cache::new_lru_cache(8 << 20))
+    }
+
+    /// Ingests SST files into a column family, moving (hard linking) them.
+    /// Files that overlap nothing go to the bottom level.
+    pub fn ingest(&self, cf: &str, files: Vec<PathBuf>) -> Result<(), PlayerDbError> {
+        let mut ingest_opts = IngestExternalFileOptions::default();
+        ingest_opts.set_move_files(true);
+        self.db
+            .ingest_external_file_cf_opts(self.cf(cf), &ingest_opts, files)?;
+        Ok(())
+    }
+
+    /// Creates a checkpoint (hard links of the SST files) in a new
+    /// directory.
+    pub fn checkpoint(&self, path: &Path) -> Result<(), PlayerDbError> {
+        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path)?;
+        Ok(())
+    }
+
+    /// Waits until no flush or compaction is pending or running.
+    pub fn wait_for_compactions(&self) -> Result<(), PlayerDbError> {
+        let mut opts = rocksdb::WaitForCompactOptions::default();
+        opts.set_flush(true);
+        self.db.wait_for_compact(&opts)?;
+        Ok(())
     }
 
     /// Deletes all data of a player.

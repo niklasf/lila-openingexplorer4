@@ -1,6 +1,7 @@
 //! The personal opening explorer (`/player`).
 
 pub mod aggregate;
+pub mod bulk;
 pub mod cold;
 pub mod db;
 pub mod explore;

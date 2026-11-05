@@ -29,10 +29,9 @@ use crate::{
     mock_lila::{
         fixture::{Fixture, FixtureGame, FixturePlayer, LilaVariant, record_bodies},
         prepare::mix,
+        synth::{Synth, game_number, unit},
     },
-    packed::Speed,
     player::UserId,
-    util::civil::{civil_from_days, days_from_civil},
 };
 
 /// Rates of synthesized irregularities, each in `0.0..=1.0`.
@@ -160,8 +159,7 @@ impl Clock {
 struct MockState {
     config: MockConfig,
     fixture: Fixture,
-    /// Added to `createdAt` of the fixture.
-    shift: i64,
+    synth: Synth,
     clock: Clock,
     counters: Counters,
     log: Option<Mutex<BufWriter<File>>>,
@@ -191,35 +189,6 @@ impl Drop for StreamGuard {
     fn drop(&mut self) {
         self.0.counters.active.fetch_sub(1, Ordering::SeqCst);
     }
-}
-
-/// Milliseconds of the first day of the month after the month of `ms`.
-fn next_month_start(ms: u64) -> u64 {
-    let days = (ms / 86_400_000) as i64;
-    let (mut year, mut month) = civil_from_days(days);
-    month += 1;
-    if month > 12 {
-        month = 1;
-        year += 1;
-    }
-    days_from_civil(year, month, 1) as u64 * 86_400_000
-}
-
-/// Milliseconds per ply, by speed, for synthesized game durations.
-fn ms_per_ply(speed: Speed) -> u64 {
-    match speed {
-        Speed::UltraBullet => 400,
-        Speed::Bullet => 1_800,
-        Speed::Blitz => 5_000,
-        Speed::Rapid => 13_000,
-        Speed::Classical => 35_000,
-        Speed::Correspondence => 4 * 3_600_000,
-    }
-}
-
-/// A uniform number in `0.0..1.0` from the inputs.
-fn unit(seed: u64, a: u64, salt: u64) -> f64 {
-    (mix(seed ^ mix(a ^ mix(salt))) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 #[derive(Serialize)]
@@ -265,7 +234,7 @@ struct LilaGame<'a> {
 }
 
 /// What became of a game at the current time.
-enum Presented {
+pub enum Presented {
     /// Not created yet.
     Future,
     /// Ongoing, but ongoing games were not requested.
@@ -275,108 +244,15 @@ enum Presented {
 
 impl MockState {
     fn shifted(&self, created_at: u64) -> u64 {
-        created_at.saturating_add_signed(self.shift)
+        self.synth.shifted(created_at)
     }
 
     fn unshifted(&self, created_at: u64) -> u64 {
-        created_at.saturating_add_signed(-self.shift)
+        self.synth.unshifted(created_at)
     }
 
     fn present(&self, game: &FixtureGame, user: &UserId, now: u64, ongoing: bool) -> Presented {
-        let seed = self.config.seed;
-        let id = u64::from_be_bytes({
-            let mut b = [0; 8];
-            b[2..].copy_from_slice(&game.id.to_bytes());
-            b
-        });
-        let created_at = self.shifted(game.created_at);
-        if created_at > now {
-            return Presented::Future;
-        }
-        let noise = &self.config.noise;
-        let plies = game.plies() as u64;
-        let duration =
-            (plies * ms_per_ply(game.speed)).max(10_000) + (unit(seed, id, 1) * 10_000.0) as u64;
-        let finished_at = created_at + duration;
-        let is_ongoing = now < finished_at;
-        if is_ongoing && !ongoing {
-            return Presented::Hidden;
-        }
-
-        let mut sans: Vec<&str> = game.sans.split_ascii_whitespace().collect();
-        let mut status = game.status.key();
-        let mut winner = game.outcome.winner();
-        let mut last_move_at = finished_at;
-        if is_ongoing {
-            let done = (now - created_at) as f64 / duration as f64;
-            sans.truncate((plies as f64 * done) as usize);
-            status = "started";
-            winner = None;
-            last_move_at = now;
-        } else if unit(seed, id, 2) < noise.aborted {
-            sans.truncate(1);
-            status = "aborted";
-            winner = None;
-        } else if unit(seed, id, 3) < noise.no_start {
-            sans.clear();
-            status = "noStart";
-            winner = None;
-        }
-        if unit(seed, id, 4) < noise.illegal_san && sans.len() > 2 {
-            let ply = 1 + (unit(seed, id, 5) * (sans.len() - 1) as f64) as usize;
-            sans[ply] = "O-O-O";
-        }
-        let moves = sans.join(" ");
-
-        let me = Color::ALL
-            .into_iter()
-            .find(|&c| user.is_name(&game.players.get(c).name))
-            .unwrap_or(Color::White);
-        let player = |color: Color| -> LilaPlayer<'_> {
-            let p: &FixturePlayer = game.players.get(color);
-            let opponent = color != me;
-            LilaPlayer {
-                user: (!(opponent && unit(seed, id, 6) < noise.no_account)).then(|| LilaUser {
-                    name: &p.name,
-                    id: p.name.to_ascii_lowercase(),
-                    title: p.title.as_deref(),
-                }),
-                rating: p
-                    .rating
-                    .filter(|_| !(opponent && unit(seed, id, 7) < noise.no_rating)),
-            }
-        };
-        let rated = unit(seed, id, 8) >= self.config.casual;
-        let variant = game.variant.key();
-        let speed = game.speed.as_str();
-        let perf = match game.variant {
-            LilaVariant::Standard | LilaVariant::FromPosition => speed,
-            other => other.key(),
-        };
-        let json = LilaGame {
-            id: game.id.to_string(),
-            rated,
-            variant,
-            speed,
-            perf,
-            created_at,
-            last_move_at,
-            status,
-            source: "pool",
-            players: LilaPlayers {
-                white: player(Color::White),
-                black: player(Color::Black),
-            },
-            winner: winner.map(|c| match c {
-                Color::White => "white",
-                Color::Black => "black",
-            }),
-            moves: &moves,
-            initial_fen: game.initial_fen.as_deref(),
-        };
-        let mut line = serde_json::to_vec(&json).expect("serialize game");
-        line.push(b'\n');
-        Presented::Line(line)
+        present(&self.synth, &self.config.noise, game, user, now, ongoing)
     }
 
     fn log_request(&self, line: std::fmt::Arguments<'_>) {
@@ -396,6 +272,106 @@ struct ExportQuery {
     max: Option<u64>,
     sort: Option<String>,
     ongoing: Option<bool>,
+}
+
+/// The export line of a game for the user at mock time `now` (with shifted
+/// times), as the mock serves it.
+pub fn present(
+    synth: &Synth,
+    noise: &Noise,
+    game: &FixtureGame,
+    user: &UserId,
+    now: u64,
+    ongoing: bool,
+) -> Presented {
+    let seed = synth.seed;
+    let id = game_number(game.id);
+    let created_at = synth.shifted(game.created_at);
+    if created_at > now {
+        return Presented::Future;
+    }
+    let plies = game.plies() as u64;
+    let duration = synth.duration(id, plies, game.speed);
+    let finished_at = created_at + duration;
+    let is_ongoing = now < finished_at;
+    if is_ongoing && !ongoing {
+        return Presented::Hidden;
+    }
+
+    let mut sans: Vec<&str> = game.sans.split_ascii_whitespace().collect();
+    let mut status = game.status.key();
+    let mut winner = game.outcome.winner();
+    let mut last_move_at = finished_at;
+    if is_ongoing {
+        let done = (now - created_at) as f64 / duration as f64;
+        sans.truncate((plies as f64 * done) as usize);
+        status = "started";
+        winner = None;
+        last_move_at = now;
+    } else if unit(seed, id, 2) < noise.aborted {
+        sans.truncate(1);
+        status = "aborted";
+        winner = None;
+    } else if unit(seed, id, 3) < noise.no_start {
+        sans.clear();
+        status = "noStart";
+        winner = None;
+    }
+    if unit(seed, id, 4) < noise.illegal_san && sans.len() > 2 {
+        let ply = 1 + (unit(seed, id, 5) * (sans.len() - 1) as f64) as usize;
+        sans[ply] = "O-O-O";
+    }
+    let moves = sans.join(" ");
+
+    let me = Color::ALL
+        .into_iter()
+        .find(|&c| user.is_name(&game.players.get(c).name))
+        .unwrap_or(Color::White);
+    let player = |color: Color| -> LilaPlayer<'_> {
+        let p: &FixturePlayer = game.players.get(color);
+        let opponent = color != me;
+        LilaPlayer {
+            user: (!(opponent && unit(seed, id, 6) < noise.no_account)).then(|| LilaUser {
+                name: &p.name,
+                id: p.name.to_ascii_lowercase(),
+                title: p.title.as_deref(),
+            }),
+            rating: p
+                .rating
+                .filter(|_| !(opponent && unit(seed, id, 7) < noise.no_rating)),
+        }
+    };
+    let rated = synth.rated(id);
+    let variant = game.variant.key();
+    let speed = game.speed.as_str();
+    let perf = match game.variant {
+        LilaVariant::Standard | LilaVariant::FromPosition => speed,
+        other => other.key(),
+    };
+    let json = LilaGame {
+        id: game.id.to_string(),
+        rated,
+        variant,
+        speed,
+        perf,
+        created_at,
+        last_move_at,
+        status,
+        source: "pool",
+        players: LilaPlayers {
+            white: player(Color::White),
+            black: player(Color::Black),
+        },
+        winner: winner.map(|c| match c {
+            Color::White => "white",
+            Color::Black => "black",
+        }),
+        moves: &moves,
+        initial_fen: game.initial_fen.as_deref(),
+    };
+    let mut line = serde_json::to_vec(&json).expect("serialize game");
+    line.push(b'\n');
+    Presented::Line(line)
 }
 
 /// Answers `/api/games/user/{id}`.
@@ -617,10 +593,11 @@ impl MockLila {
     /// Opens the fixture and starts serving in the background.
     pub async fn start(config: MockConfig) -> io::Result<MockLila> {
         let fixture = Fixture::open(&config.fixture).map_err(io::Error::other)?;
-        // An hour of slack, for times bumped past midnight to keep them
-        // strictly increasing per player.
-        let newest = fixture.meta.max_created_at.saturating_sub(3_600_000);
-        let shift = config.data_end as i64 - next_month_start(newest) as i64;
+        let synth = Synth {
+            seed: config.seed,
+            casual: config.casual,
+            shift: Synth::shift_for(fixture.meta.max_created_at, config.data_end),
+        };
         let log = config
             .request_log
             .as_ref()
@@ -643,7 +620,7 @@ impl MockLila {
             },
             config,
             fixture,
-            shift,
+            synth,
             counters: Counters::default(),
             log,
             request_number: AtomicU64::new(0),
@@ -652,7 +629,7 @@ impl MockLila {
             "mock lila: {} players, {} games, shift {:.1} days, clock at {}",
             state.fixture.meta.players,
             state.fixture.meta.games,
-            shift as f64 / 86_400_000.0,
+            state.synth.shift as f64 / 86_400_000.0,
             state.clock.now()
         );
         let app = Router::new()
@@ -709,9 +686,14 @@ mod tests {
     use shakmaty::{ByColor, KnownOutcome};
 
     use super::*;
-    use crate::mock_lila::{
-        FixtureWriter,
-        fixture::{FinalStatus, FixtureGame},
+    use crate::{
+        mock_lila::{
+            FixtureWriter,
+            fixture::{FinalStatus, FixtureGame},
+            synth::next_month_start,
+        },
+        packed::Speed,
+        util::civil::{civil_from_days, days_from_civil},
     };
 
     const DAY: u64 = 86_400_000;

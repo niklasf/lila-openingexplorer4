@@ -4,6 +4,7 @@
 pub mod fixture;
 pub mod prepare;
 pub mod serve;
+pub mod synth;
 
 pub use fixture::{Fixture, FixtureGame, FixtureMeta, FixturePlayer, FixtureWriter, LilaVariant};
 pub use serve::{Faults, MockConfig, MockLila, MockStats, Noise};
