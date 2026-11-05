@@ -82,6 +82,11 @@ struct PlayerArgs {
     /// 64m.
     #[arg(long)]
     rate_limit: Option<ByteSize>,
+    /// With several --db-path: the last level holds this many times the
+    /// level above (RocksDB's dynamic level sizes are not available with
+    /// several paths, so the server sets the level targets itself).
+    #[arg(long, default_value = "10")]
+    level_ratio: f64,
     /// Collect RocksDB statistics (tickers in /monitor).
     #[arg(long)]
     db_statistics: bool,
@@ -383,6 +388,7 @@ fn run_player(args: PlayerArgs) {
             wal_dir: args.wal_dir,
             db_paths: args.db_paths.clone(),
             statistics: args.db_statistics,
+            level_ratio: args.level_ratio,
             ..PlayerDbConfig::default()
         },
     ) {

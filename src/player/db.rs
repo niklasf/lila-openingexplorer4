@@ -77,6 +77,9 @@ pub struct PlayerDbConfig {
     pub batch_bytes: usize,
     /// Background threads for flushes and compactions.
     pub background_jobs: i32,
+    /// With several `db_paths`: the last level holds this many times its
+    /// upper level (see `tune_levels`).
+    pub level_ratio: f64,
 }
 
 impl Default for PlayerDbConfig {
@@ -92,6 +95,7 @@ impl Default for PlayerDbConfig {
             ingest_bytes: 64 << 20,
             batch_bytes: 4 << 20,
             background_jobs: 4,
+            level_ratio: 10.0,
         }
     }
 }
@@ -563,7 +567,7 @@ impl PlayerDb {
     /// lets the last level grow far beyond 10x its upper level (write
     /// amplification ~90 in the old production database). This emulates
     /// dynamic sizing: per column family, the level above the last gets a
-    /// tenth of the last level, with the levels above in a geometric series
+    /// tenth (`level_ratio`) of the last level, with the levels above in a geometric series
     /// from `LEVEL_BASE`. Called at open and periodically, as the database
     /// grows. Does nothing with a single path.
     pub fn tune_levels(&self) -> Result<(), PlayerDbError> {
@@ -573,7 +577,7 @@ impl PlayerDb {
         for cf in ALL_CFS {
             let levels = self.level_bytes(cf)?;
             let last = levels[NUM_LEVELS - 1];
-            let (base, multiplier) = static_levels(last);
+            let (base, multiplier) = static_levels(last, self.config.level_ratio);
             self.db.set_options_cf(
                 self.cf(cf),
                 &[
@@ -678,9 +682,9 @@ const NUM_LEVELS: usize = 7;
 const LEVEL_BASE: u64 = 128 << 20;
 
 /// Static level sizes for a last level of `last` bytes: level base and
-/// multiplier such that the level above the last has a tenth of it.
-fn static_levels(last: u64) -> (u64, f64) {
-    let upper = last as f64 / 10.0;
+/// multiplier such that the level above the last has `1 / ratio` of it.
+fn static_levels(last: u64, ratio: f64) -> (u64, f64) {
+    let upper = last as f64 / ratio;
     // Levels 1 ..= NUM_LEVELS - 2.
     let steps = (NUM_LEVELS - 3) as f64;
     let multiplier = (upper / LEVEL_BASE as f64)
@@ -816,12 +820,12 @@ mod level_tests {
     #[test]
     fn test_static_levels() {
         // A tenth of the last level in level 5, levels 1 ..= 5 geometric.
-        let (base, multiplier) = static_levels(340_000_000_000);
+        let (base, multiplier) = static_levels(340_000_000_000, 10.0);
         let level5 = base as f64 * multiplier.powi(4);
         assert!((level5 / 34e9 - 1.0).abs() < 0.01, "{level5}");
         // Small databases: the smallest multiplier.
-        assert_eq!(static_levels(50_000_000), (LEVEL_BASE, 2.0));
+        assert_eq!(static_levels(50_000_000, 10.0), (LEVEL_BASE, 2.0));
         // Huge ones: at most 10.
-        assert_eq!(static_levels(u64::MAX / 2).1, 10.0);
+        assert_eq!(static_levels(u64::MAX / 2, 10.0).1, 10.0);
     }
 }
