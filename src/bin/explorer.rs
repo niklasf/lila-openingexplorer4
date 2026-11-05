@@ -100,10 +100,13 @@ struct ServeArgs {
     /// Database directory created by `ingest`.
     #[arg(long)]
     db: PathBuf,
-    /// Binding address. Administrative endpoints (/monitor) must be
-    /// protected by a reverse proxy.
+    /// Binding address of the public endpoints.
     #[arg(long, default_value = "127.0.0.1:9002")]
     bind: SocketAddr,
+    /// Binding address for optional administration and monitoring endpoints.
+    /// Should not be exposed publicly.
+    #[arg(long)]
+    admin_bind: Option<SocketAddr>,
     /// Allow access from all origins.
     #[arg(long)]
     cors: bool,
@@ -237,6 +240,7 @@ fn run(kind: Kind, args: ServeArgs) {
     let config = AppConfig {
         kind,
         bind: args.bind,
+        admin_bind: args.admin_bind,
         cors: args.cors,
         cache_entries: args.response_cache,
         cache_ttl: Duration::from_secs(args.response_cache_ttl),

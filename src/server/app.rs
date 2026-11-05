@@ -18,13 +18,7 @@ use moka::future::Cache;
 use partial_sort::PartialSort;
 use rocksdb::DBPinnableSlice;
 use shakmaty::{EnPassantMode, fen::Fen, san::SanPlus, variant::VariantPosition};
-use tokio::{
-    net::TcpListener,
-    runtime::Handle,
-    signal::unix::{SignalKind, signal},
-    sync::Semaphore,
-    task, time,
-};
+use tokio::{runtime::Handle, sync::Semaphore, task, time};
 
 use crate::{
     packed::{
@@ -38,6 +32,7 @@ use crate::{
             GameRef, MASTERS_TOP_CANDIDATES, MAX_MASTERS_GAMES, PreparedMove, prepare_lichess,
             prepare_masters,
         },
+        listen,
         metrics::{Counter, Metrics},
         openings::Openings,
         pgn::masters_pgn,
@@ -85,25 +80,16 @@ impl ExploreQuery {
 pub struct AppConfig {
     pub kind: Kind,
     pub bind: SocketAddr,
+    pub admin_bind: Option<SocketAddr>,
     pub cors: bool,
-    /// Entries of the response cache.
     pub cache_entries: u64,
     pub cache_ttl: Duration,
-    /// Concurrent database requests.
     pub blocking_threads: usize,
-    /// Read uncached games of a response in parallel.
     pub parallel_fetch: bool,
-    /// Games were indexed up to this ply (`None` for all plies).
     pub max_ply: Option<usize>,
-    /// Look up cold positions (reached by a single game).
     pub cold: bool,
-    /// Directory with a.tsv to e.tsv of chess-openings, instead of
-    /// downloading them.
     pub openings_dir: Option<PathBuf>,
-    /// Do not load opening names at all.
     pub no_openings: bool,
-    /// Lichess only: where to get the blacklist of marked players from
-    /// (`None` to show all games).
     pub blacklist: Option<LilaConfig>,
 }
 
@@ -710,16 +696,6 @@ async fn periodic_openings_refresh(state: Shared) {
     }
 }
 
-/// Waits for SIGINT (Ctrl-C) or SIGTERM (like from systemd).
-async fn shutdown_signal() {
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => log::info!("received SIGINT, shutting down"),
-        _ = sigterm.recv() => log::info!("received SIGTERM, shutting down"),
-    }
-}
-
-/// Runs the server until it is interrupted.
 pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::error::Error>> {
     let openings = match &config.openings_dir {
         Some(dir) => {
@@ -733,7 +709,6 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         }
         None => Openings::default(),
     };
-    let download_openings = config.openings_dir.is_none() && !config.no_openings;
 
     let state: Shared = Arc::new(AppState {
         cache: Cache::builder()
@@ -747,9 +722,11 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         config,
         db: Arc::new(db),
     });
-    if download_openings {
+
+    if state.config.openings_dir.is_none() && !state.config.no_openings {
         task::spawn(periodic_openings_refresh(Arc::clone(&state)));
     }
+
     if let Some(lila) = state.config.blacklist.clone() {
         let state = Arc::clone(&state);
         task::spawn(async move {
@@ -758,10 +735,7 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         });
     }
 
-    let app = Router::new()
-        .route("/monitor", get(monitor))
-        .route("/monitor/db/{prop}", get(db_prop))
-        .route("/monitor/cf/{cf}/{prop}", get(cf_prop));
+    let app = Router::new();
     let app = match state.config.kind {
         Kind::Lichess => app
             .route("/lichess", get(lichess))
@@ -782,10 +756,15 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
         app
     };
 
-    let listener = TcpListener::bind(state.config.bind).await?;
-    log::info!("listening on {}", state.config.bind);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let admin = state.config.admin_bind.map(|addr| {
+        let router = Router::new()
+            .route("/monitor", get(monitor))
+            .route("/monitor/db/{prop}", get(db_prop))
+            .route("/monitor/cf/{cf}/{prop}", get(cf_prop))
+            .with_state(Arc::clone(&state));
+        (addr, router)
+    });
+
+    listen::serve_until_signal(state.config.bind, app, admin).await?;
     Ok(())
 }

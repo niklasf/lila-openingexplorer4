@@ -7,7 +7,7 @@ use partial_sort::PartialSort;
 use shakmaty::packed::PackedUciMove;
 
 use crate::{
-    packed::{EntryView, GameIndex, Month, RatingGroup, Speed, SubStats},
+    packed::{EntryView, GameIndex, GroupHeader, Month, RatingGroup, Speed, SubStats},
     server::query::{LichessFilter, Limits},
 };
 
