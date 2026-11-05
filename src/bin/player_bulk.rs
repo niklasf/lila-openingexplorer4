@@ -209,8 +209,16 @@ struct BuildArgs {
     requests_unindexed: f64,
     #[arg(long, default_value = "0.2")]
     requests_dormant: f64,
+    #[arg(long, default_value = "0.1")]
+    requests_new: f64,
+    #[arg(long, default_value = "0.1")]
+    sample_new: f64,
     #[arg(long, default_value = "0.3")]
     sample_active: f64,
+    /// Mean days from the last index run of dormant players to the start of
+    /// the window.
+    #[arg(long, default_value = "180")]
+    dormant_delay_days: f64,
     /// Bounds of the visit interval of active players, in days.
     #[arg(long, default_value = "1")]
     min_interval_days: f64,
@@ -433,7 +441,10 @@ fn main() {
                     window_end: synth.unshifted(window_end),
                     requests_unindexed: args.requests_unindexed,
                     requests_dormant: args.requests_dormant,
+                    requests_new: args.requests_new,
+                    sample_new: args.sample_new,
                     sample_active: args.sample_active,
+                    dormant_delay: (args.dormant_delay_days * day) as u64,
                     min_interval: (args.min_interval_days * day) as u64,
                     max_interval: (args.max_interval_days * day) as u64,
                     seed: args.synth.seed,

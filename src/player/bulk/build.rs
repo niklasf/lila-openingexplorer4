@@ -6,12 +6,15 @@
 //! Per player, a plan (deterministic from the user hash and the seed):
 //!
 //! * unindexed: nothing is written (first runs when the log is replayed);
-//! * dormant: indexed once, at a time between the first game and the start
-//!   of the aging window, never since;
+//! * dormant: indexed once, at the start of the aging window minus an
+//!   exponentially distributed delay, never since;
 //! * active: indexed up to the start of the aging window, then visited
 //!   every `interval` (log-uniform between the bounds, random phase) until
 //!   the end of the window, each visit indexing the games created since the
-//!   previous one.
+//!   previous one;
+//! * new: not indexed before the window, the first index run at a random
+//!   time in the window (all games so far), then visited like active
+//!   players.
 //!
 //! ```text
 //! tail  := entry*   (by visit, user hash, createdAt)
@@ -65,12 +68,18 @@ pub struct AgingPlan {
     /// Start and end of the aging window (fixture time, ms).
     pub window_start: u64,
     pub window_end: u64,
-    /// Requests players: share that is not indexed at all, share that is
-    /// dormant (the rest is active).
+    /// Requests players: shares that are not indexed at all, dormant, and
+    /// new (the rest is active).
     pub requests_unindexed: f64,
     pub requests_dormant: f64,
-    /// Sampled players: share that is active (the rest is dormant).
+    pub requests_new: f64,
+    /// Sampled players: shares that are new and active (the rest is
+    /// dormant).
+    pub sample_new: f64,
     pub sample_active: f64,
+    /// Mean time from the last index run of a dormant player to the start
+    /// of the window (ms, exponentially distributed).
+    pub dormant_delay: u64,
     /// Bounds of the visit interval of active players (ms).
     pub min_interval: u64,
     pub max_interval: u64,
@@ -80,8 +89,16 @@ pub struct AgingPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
     Unindexed,
-    Dormant { cutoff: u64 },
-    Active { first_visit: u64, interval: u64 },
+    Dormant {
+        cutoff: u64,
+    },
+    /// Indexed up to `cutoff` (0 for a new player, whose first index run is
+    /// the first visit in the window), then visited.
+    Active {
+        cutoff: u64,
+        first_visit: u64,
+        interval: u64,
+    },
 }
 
 impl AgingPlan {
@@ -91,23 +108,50 @@ impl AgingPlan {
 
     /// The plan of a player with games created from `first`.
     pub fn plan(&self, uh: UserHash, origin: Origin, first: u64) -> Plan {
+        #[derive(PartialEq)]
+        enum Kind {
+            Dormant,
+            New,
+            Active,
+        }
         let u = self.unit(uh, 100);
-        let active = match origin {
-            Origin::Requests if u < self.requests_unindexed => return Plan::Unindexed,
-            Origin::Requests => u >= self.requests_unindexed + self.requests_dormant,
-            Origin::Sample => u < self.sample_active,
-        };
-        if active || first >= self.window_start {
-            let (lo, hi) = (self.min_interval as f64, self.max_interval as f64);
-            let interval = (lo.ln() + self.unit(uh, 101) * (hi.ln() - lo.ln())).exp() as u64;
-            let first_visit = self.window_start + (self.unit(uh, 102) * interval as f64) as u64;
-            Plan::Active {
-                first_visit,
-                interval: interval.max(1),
+        let kind = match origin {
+            Origin::Requests => {
+                let dormant = self.requests_unindexed + self.requests_dormant;
+                if u < self.requests_unindexed {
+                    return Plan::Unindexed;
+                } else if u < dormant {
+                    Kind::Dormant
+                } else if u < dormant + self.requests_new {
+                    Kind::New
+                } else {
+                    Kind::Active
+                }
             }
-        } else {
-            let cutoff = first + (self.unit(uh, 103) * (self.window_start - first) as f64) as u64;
-            Plan::Dormant { cutoff }
+            Origin::Sample if u < self.sample_new => Kind::New,
+            Origin::Sample if u < self.sample_new + self.sample_active => Kind::Active,
+            Origin::Sample => Kind::Dormant,
+        };
+        let (lo, hi) = (self.min_interval as f64, self.max_interval as f64);
+        let interval = ((lo.ln() + self.unit(uh, 101) * (hi.ln() - lo.ln())).exp() as u64).max(1);
+        match kind {
+            Kind::New => Plan::Active {
+                cutoff: 0,
+                first_visit: self.window_start
+                    + (self.unit(uh, 104) * (self.window_end - self.window_start) as f64) as u64,
+                interval,
+            },
+            Kind::Dormant if first < self.window_start => {
+                let delay = -(1.0 - self.unit(uh, 103)).ln() * self.dormant_delay as f64;
+                Plan::Dormant {
+                    cutoff: self.window_start.saturating_sub(delay as u64).max(first),
+                }
+            }
+            _ => Plan::Active {
+                cutoff: self.window_start,
+                first_visit: self.window_start + (self.unit(uh, 102) * interval as f64) as u64,
+                interval,
+            },
         }
     }
 }
@@ -216,7 +260,8 @@ pub struct BuildConfig<'a> {
     pub synth: Synth,
     pub plan: AgingPlan,
     pub sst_target_bytes: u64,
-    /// Only plan and count (SST sizes are raw key and value bytes).
+    /// Only plan and count games (no aggregation; SST sizes are raw bytes
+    /// of the records).
     pub dry_run: bool,
 }
 
@@ -225,6 +270,7 @@ pub struct BuildStats {
     pub players_unindexed: AtomicU64,
     pub players_dormant: AtomicU64,
     pub players_active: AtomicU64,
+    pub players_new: AtomicU64,
     pub players_with_base: AtomicU64,
     pub base_games: AtomicU64,
     pub tail_games: AtomicU64,
@@ -249,10 +295,11 @@ impl BuildStats {
             .map(|(cf, b)| format!("{cf} {:.2} GB", l(b) as f64 / 1e9))
             .collect();
         format!(
-            "players: {} unindexed, {} dormant, {} active, {} with a base; games: {} base, {} tail in {} visits, {} of unindexed players, {} after the cutoff not indexed, {} duplicates; {} warm entries, {} cold groups; {}; tails {:.2} GB",
+            "players: {} unindexed, {} dormant, {} active, {} new, {} with a base; games: {} base, {} tail in {} visits, {} of unindexed players, {} after the cutoff not indexed, {} duplicates; {} warm entries, {} cold groups; {}; tails {:.2} GB",
             l(&self.players_unindexed),
             l(&self.players_dormant),
             l(&self.players_active),
+            l(&self.players_new),
             l(&self.players_with_base),
             l(&self.base_games),
             l(&self.tail_games),
@@ -421,11 +468,16 @@ fn build_partition(
                 (cutoff, None)
             }
             Plan::Active {
+                cutoff,
                 first_visit,
                 interval,
             } => {
-                stats.players_active.fetch_add(1, Ordering::Relaxed);
-                (config.plan.window_start, Some((first_visit, interval)))
+                if cutoff == 0 {
+                    stats.players_new.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats.players_active.fetch_add(1, Ordering::Relaxed);
+                }
+                (cutoff, Some((first_visit, interval)))
             }
         };
 
@@ -462,7 +514,9 @@ fn build_partition(
                     .put(GameKey::new(uh, seq).as_ref(), &buf)
                     .map_err(rocks)?;
                 ids.push((game.id, seq));
-                aggregation.add_game(seq, game, max_ply);
+                if !config.dry_run {
+                    aggregation.add_game(seq, game, max_ply);
+                }
             }
             stats
                 .base_games
