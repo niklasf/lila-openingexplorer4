@@ -381,7 +381,7 @@ fn run_player(args: PlayerArgs) {
             placement: Placement::Threshold(args.warm_threshold.max(1)),
             rate_limit: args.rate_limit.map(u64::from),
             wal_dir: args.wal_dir,
-            db_paths: args.db_paths,
+            db_paths: args.db_paths.clone(),
             statistics: args.db_statistics,
             ..PlayerDbConfig::default()
         },
@@ -401,8 +401,24 @@ fn run_player(args: PlayerArgs) {
             read_timeout: Duration::from_secs(args.lila_timeout),
             ..LilaClientConfig::default()
         }));
+        let db = std::sync::Arc::new(db);
+        if !args.db_paths.is_empty() {
+            // Static level sizes follow the growth of the last level.
+            let db = std::sync::Arc::downgrade(&db);
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(600));
+                    let Some(db) = db.upgrade() else {
+                        break;
+                    };
+                    if let Err(err) = db.tune_levels() {
+                        log::error!("tuning levels: {err}");
+                    }
+                }
+            });
+        }
         let indexer = Indexer::start(
-            std::sync::Arc::new(db),
+            db,
             lila,
             IndexerConfig {
                 indexers: args.indexers,

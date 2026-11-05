@@ -236,7 +236,7 @@ impl PlayerDb {
             fs::remove_dir_all(&rebuild_dir)?;
         }
         log::info!("opened {} in {:.1?}", path.display(), started.elapsed());
-        Ok(PlayerDb {
+        let db = PlayerDb {
             db,
             path: path.to_owned(),
             warm_opts: cf_options(WARM_CF, &cache),
@@ -245,7 +245,9 @@ impl PlayerDb {
             opts,
             config,
             counters: DbCounters::default(),
-        })
+        };
+        db.tune_levels()?;
+        Ok(db)
     }
 
     pub fn config(&self) -> &PlayerDbConfig {
@@ -544,6 +546,55 @@ impl PlayerDb {
         Ok(())
     }
 
+    /// Bytes of the live SST files of a column family, per level.
+    pub fn level_bytes(&self, cf: &str) -> Result<Vec<u64>, PlayerDbError> {
+        let mut levels = vec![0; NUM_LEVELS];
+        for file in self.db.live_files()? {
+            if file.column_family_name == cf {
+                levels[(file.level.max(0) as usize).min(NUM_LEVELS - 1)] += file.size as u64;
+            }
+        }
+        Ok(levels)
+    }
+
+    /// With several `db_paths`, RocksDB ignores
+    /// `level_compaction_dynamic_level_bytes` (only logging a warning) and
+    /// sizes the levels statically, from `max_bytes_for_level_base`, which
+    /// lets the last level grow far beyond 10x its upper level (write
+    /// amplification ~90 in the old production database). This emulates
+    /// dynamic sizing: per column family, the level above the last gets a
+    /// tenth of the last level, with the levels above in a geometric series
+    /// from `LEVEL_BASE`. Called at open and periodically, as the database
+    /// grows. Does nothing with a single path.
+    pub fn tune_levels(&self) -> Result<(), PlayerDbError> {
+        if self.config.db_paths.len() < 2 {
+            return Ok(());
+        }
+        for cf in ALL_CFS {
+            let levels = self.level_bytes(cf)?;
+            let last = levels[NUM_LEVELS - 1];
+            let (base, multiplier) = static_levels(last);
+            self.db.set_options_cf(
+                self.cf(cf),
+                &[
+                    ("max_bytes_for_level_base", &base.to_string()),
+                    (
+                        "max_bytes_for_level_multiplier",
+                        &format!("{multiplier:.3}"),
+                    ),
+                ],
+            )?;
+            log::info!(
+                "{cf}: last level {:.1} GB, level base {} MB, multiplier {multiplier:.2} (level {} target {:.1} GB)",
+                last as f64 / 1e9,
+                base >> 20,
+                NUM_LEVELS - 2,
+                base as f64 * multiplier.powi(NUM_LEVELS as i32 - 3) / 1e9,
+            );
+        }
+        Ok(())
+    }
+
     /// Waits until no flush or compaction is pending or running.
     pub fn wait_for_compactions(&self) -> Result<(), PlayerDbError> {
         let mut opts = rocksdb::WaitForCompactOptions::default();
@@ -618,6 +669,24 @@ impl PlayerDb {
                 .compact_range_cf(self.cf(cf), None::<&[u8]>, None::<&[u8]>);
         }
     }
+}
+
+/// Levels of the column families (RocksDB's default).
+const NUM_LEVELS: usize = 7;
+
+/// Target of level 1 for static level sizes.
+const LEVEL_BASE: u64 = 128 << 20;
+
+/// Static level sizes for a last level of `last` bytes: level base and
+/// multiplier such that the level above the last has a tenth of it.
+fn static_levels(last: u64) -> (u64, f64) {
+    let upper = last as f64 / 10.0;
+    // Levels 1 ..= NUM_LEVELS - 2.
+    let steps = (NUM_LEVELS - 3) as f64;
+    let multiplier = (upper / LEVEL_BASE as f64)
+        .powf(1.0 / steps)
+        .clamp(2.0, 10.0);
+    (LEVEL_BASE, multiplier)
 }
 
 fn hex(uh: UserHash) -> String {
@@ -737,5 +806,22 @@ impl PlayerReader<'_> {
             .into_iter()
             .map(|value| value.map(|value| BorrowedPlayerGame::unpack(&value).into_owned()))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    #[test]
+    fn test_static_levels() {
+        // A tenth of the last level in level 5, levels 1 ..= 5 geometric.
+        let (base, multiplier) = static_levels(340_000_000_000);
+        let level5 = base as f64 * multiplier.powi(4);
+        assert!((level5 / 34e9 - 1.0).abs() < 0.01, "{level5}");
+        // Small databases: the smallest multiplier.
+        assert_eq!(static_levels(50_000_000), (LEVEL_BASE, 2.0));
+        // Huge ones: at most 10.
+        assert_eq!(static_levels(u64::MAX / 2).1, 10.0);
     }
 }

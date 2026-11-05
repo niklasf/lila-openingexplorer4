@@ -59,6 +59,9 @@ enum Command {
     Age(AgeArgs),
     /// Creates a checkpoint of a database.
     Checkpoint(CheckpointArgs),
+    /// Lists the live SST files of a database (read-only): column family,
+    /// level, file name, bytes.
+    Files(FilesArgs),
     /// Checks a sample of the fixture players against the mock and a naive
     /// aggregation.
     Check(CheckArgs),
@@ -312,6 +315,12 @@ struct CheckArgs {
 }
 
 #[derive(Args)]
+struct FilesArgs {
+    #[arg(long)]
+    db: PathBuf,
+}
+
+#[derive(Args)]
 struct CheckpointArgs {
     #[command(flatten)]
     db: DbArgs,
@@ -542,6 +551,24 @@ fn main() {
             log::info!("{stats:?}");
             if stats.game_mismatches > 0 || stats.position_mismatches > 0 {
                 process::exit(2);
+            }
+        }
+        Command::Files(args) => {
+            let db = rocksdb::DB::open_cf_for_read_only(
+                &rocksdb::Options::default(),
+                &args.db,
+                PlayerDb::column_families(),
+                false,
+            )
+            .unwrap_or_else(|err| fail(err));
+            for file in db.live_files().unwrap_or_else(|err| fail(err)) {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    file.column_family_name,
+                    file.level,
+                    file.name.trim_start_matches('/'),
+                    file.size
+                );
             }
         }
         Command::Checkpoint(args) => {
