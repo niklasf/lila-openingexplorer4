@@ -4,6 +4,7 @@ pub mod game;
 pub mod keys;
 pub mod lila;
 pub mod policy;
+pub mod queue;
 pub mod status;
 #[cfg(test)]
 mod tests;
