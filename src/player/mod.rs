@@ -1,7 +1,11 @@
 pub mod aggregate;
+pub mod db;
 pub mod game;
 pub mod keys;
 pub mod status;
+#[cfg(test)]
+mod tests;
 mod user;
 
+pub use db::{PlayerDb, PlayerDbConfig, PlayerDbError};
 pub use user::{InvalidUserName, UserHash, UserHasher, UserId};

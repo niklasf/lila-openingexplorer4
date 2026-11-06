@@ -33,7 +33,7 @@ use crate::{
             prepare_masters,
         },
         listen,
-        metrics::{Counter, Metrics},
+        metrics::Metrics,
         openings::Openings,
         pgn::masters_pgn,
         query::{LichessQuery, Limits, MastersQuery, Play, PlayError, PlayPosition},
@@ -42,6 +42,7 @@ use crate::{
             ExplorerGame, ExplorerGameWithUci, ExplorerMove, ExplorerResponse, HistoryEntry, Stats,
         },
     },
+    util::Counter,
 };
 
 /// Which database the server serves.

@@ -1,6 +1,7 @@
 //! Status of a player: indexing progress and the current generation of the
 //! warm and cold index.
 
+use arbitrary::{Arbitrary, Unstructured};
 use bytes::{Buf, BufMut};
 use shakmaty::ByColor;
 
@@ -71,7 +72,11 @@ impl PlayerStatus {
         pack_uint(buf, u64::from(self.games));
         pack_uint(buf, u64::from(self.games_at_rebuild));
         pack_uint(buf, self.latest_created_at);
-        pack_uint(buf, self.revisit_ongoing.map_or(0, |t| t + 1));
+        pack_uint(
+            buf,
+            self.revisit_ongoing
+                .map_or(0, |t| t.checked_add(1).expect("valid revisit time")),
+        );
         pack_uint(buf, self.indexed_at);
         pack_uint(buf, self.revisited_at);
         pack_string(buf, self.user.as_str());
@@ -113,25 +118,57 @@ impl PlayerStatus {
     }
 }
 
+impl Arbitrary<'_> for PlayerStatus {
+    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<PlayerStatus> {
+        let user: UserId = u.arbitrary()?;
+        let name = user
+            .as_str()
+            .chars()
+            .map(|c| {
+                u.arbitrary::<bool>()
+                    .map(|upper| if upper { c.to_ascii_uppercase() } else { c })
+            })
+            .collect::<arbitrary::Result<String>>()?;
+        let games = u.arbitrary()?;
+        Ok(PlayerStatus {
+            user,
+            name,
+            generation: u.arbitrary()?,
+            cold_bits: ByColor {
+                white: u.int_in_range(0..=MAX_COLD_BITS)?,
+                black: u.int_in_range(0..=MAX_COLD_BITS)?,
+            },
+            games,
+            games_at_rebuild: u.int_in_range(0..=games)?,
+            latest_created_at: u.arbitrary()?,
+            revisit_ongoing: u
+                .arbitrary::<bool>()?
+                .then(|| u.int_in_range(0..=u64::MAX - 1))
+                .transpose()?,
+            indexed_at: u.arbitrary()?,
+            revisited_at: u.arbitrary()?,
+        })
+    }
+}
+
 fn unpack_u32(buf: &mut &[u8]) -> u32 {
     u32::try_from(unpack_uint(buf)).expect("u32")
 }
 
 #[cfg(test)]
 mod tests {
+    use arbtest::arbtest;
+
     use super::*;
 
     #[test]
     fn test_roundtrip() {
-        let mut status = PlayerStatus::new(UserId::from_name("alice").unwrap());
-        status.name = "Alice".to_owned();
-        status.generation = Generation(3);
-        status.cold_bits.black = 7;
-        status.games = 1234;
-        status.revisit_ongoing = Some(0);
-        status.indexed_at = 1_700_000_000_000;
-        let mut buf = Vec::new();
-        status.pack(&mut buf);
-        assert_eq!(PlayerStatus::unpack(&buf), status);
+        arbtest(|u| {
+            let status: PlayerStatus = u.arbitrary()?;
+            let mut buf = Vec::new();
+            status.pack(&mut buf);
+            assert_eq!(PlayerStatus::unpack(&buf), status);
+            Ok(())
+        });
     }
 }

@@ -13,6 +13,7 @@
 
 use std::fmt;
 
+use arbitrary::Arbitrary;
 use shakmaty::Color;
 
 use crate::{
@@ -61,7 +62,7 @@ impl TryFrom<GameIndex> for PlayerGameIndex {
 
 /// Generation of the warm and cold index of a player. Rebuilds write the
 /// next generation and then switch to it.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Generation(pub u32);
 
 impl Generation {

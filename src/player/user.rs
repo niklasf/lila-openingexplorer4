@@ -1,5 +1,6 @@
-use std::{fmt, fs, io, path::Path, str::FromStr};
+use std::{fmt, str::FromStr};
 
+use arbitrary::{Arbitrary, Unstructured};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use thiserror::Error;
@@ -35,6 +36,17 @@ impl UserId {
     /// Whether the name (as in game records) is the name of this user.
     pub fn is_name(&self, name: &str) -> bool {
         self.0.eq_ignore_ascii_case(name)
+    }
+}
+
+impl Arbitrary<'_> for UserId {
+    fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<UserId> {
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_-";
+        let len = u.int_in_range(1..=UserId::MAX_LEN)?;
+        let name = (0..len)
+            .map(|_| u.choose(CHARS).map(|&c| char::from(c)))
+            .collect::<arbitrary::Result<String>>()?;
+        Ok(UserId(name.into_boxed_str()))
     }
 }
 
@@ -102,19 +114,6 @@ impl UserHasher {
         bytes.try_into().ok().map(UserHasher::from_key)
     }
 
-    pub fn load(path: &Path) -> io::Result<UserHasher> {
-        UserHasher::from_key_bytes(&fs::read(path)?).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid user hash key in {}", path.display()),
-            )
-        })
-    }
-
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        fs::write(path, self.key)
-    }
-
     pub fn hash(&self, user: &UserId) -> UserHash {
         let mut mac = self.mac.clone();
         mac.update(user.as_str().as_bytes());
@@ -123,9 +122,18 @@ impl UserHasher {
     }
 }
 
+impl fmt::Display for UserHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Debug for UserHasher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("UserHasher { .. }")
+        f.debug_struct("UserHasher").finish_non_exhaustive()
     }
 }
 
