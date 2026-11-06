@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod game;
 pub mod keys;
 pub mod status;

@@ -112,6 +112,7 @@ Critical performance work:
 * [x] Elias-Fano vs rice on cold entries
 * [x] Optimize SST block sizes
 * [ ] Truncate Lichess game moves
+* [ ] Tune warm/cold threshold for player database
 
 Needs HDDs:
 

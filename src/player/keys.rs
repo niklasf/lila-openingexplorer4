@@ -7,7 +7,7 @@
 //! games     uh | PlayerGameIndex                -> PlayerGame
 //! game_ids  uh | GameId                         -> PlayerGameIndex
 //! warm      uh | gen | color | PositionKey      -> PlayerEntry
-//! cold      uh | gen | color | bucket           -> PlayerColdGroup
+//! cold      uh | gen | color | bucket           -> ColdGroup
 //! meta      name                                -> value (no player)
 //! ```
 
@@ -177,8 +177,8 @@ pub struct ColdBucket(pub u32);
 pub const MAX_COLD_BITS: u8 = 24;
 
 impl ColdBucket {
-    /// The bucket and the fingerprint suffix (the 16 bits after the bucket
-    /// bits) of a position.
+    /// The bucket and the suffix (the 16 bits after the bucket bits, see
+    /// `ColdGroup`) of a position.
     pub fn of(pos: &PositionKey, bits: u8) -> (ColdBucket, u16) {
         debug_assert!(bits <= MAX_COLD_BITS);
         let prefix = pos.prefix();
