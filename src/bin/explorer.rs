@@ -1,11 +1,4 @@
-use std::{
-    fs,
-    net::SocketAddr,
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    process, thread,
-    time::Duration,
-};
+use std::{fs, net::SocketAddr, num::NonZeroUsize, path::PathBuf, process, thread, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
 use lila_openingexplorer4::{
@@ -149,22 +142,8 @@ struct PlayerArgs {
         help_heading = "Indexer"
     )]
     lila: String,
-    /// Token of https://lichess.org/@/OpeningExplorer.
-    #[arg(
-        long,
-        env = "EXPLORER_BEARER",
-        hide_env_values = true,
-        help_heading = "Indexer"
-    )]
-    lila_bearer: Option<String>,
-    /// File with the token, read once at startup.
-    #[arg(
-        long,
-        env = "EXPLORER_BEARER_FILE",
-        conflicts_with = "lila_bearer",
-        help_heading = "Indexer"
-    )]
-    lila_bearer_file: Option<PathBuf>,
+    #[command(flatten, next_help_heading = "Indexer")]
+    bearer: LilaBearerArgs,
     /// Concurrent database reads of requests.
     #[arg(long, default_value = "4", help_heading = "Server")]
     blocking_threads: usize,
@@ -291,6 +270,33 @@ struct ServeArgs {
     lila: LilaArgs,
 }
 
+/// The token for lila.
+#[derive(Args)]
+struct LilaBearerArgs {
+    /// Token of https://lichess.org/@/OpeningExplorer.
+    #[arg(long, env = "EXPLORER_BEARER", hide_env_values = true)]
+    lila_bearer: Option<String>,
+    /// File with the token, read once at startup.
+    #[arg(long, env = "EXPLORER_BEARER_FILE", conflicts_with = "lila_bearer")]
+    lila_bearer_file: Option<PathBuf>,
+}
+
+impl LilaBearerArgs {
+    /// The token, or the token from the file (exits if it cannot be read).
+    fn bearer(self) -> Option<String> {
+        self.lila_bearer.or_else(|| {
+            self.lila_bearer_file
+                .map(|file| match fs::read_to_string(&file) {
+                    Ok(bearer) => bearer.trim().to_owned(),
+                    Err(err) => {
+                        eprintln!("error: reading bearer file {}: {err}", file.display());
+                        process::exit(1);
+                    }
+                })
+        })
+    }
+}
+
 #[derive(Args)]
 #[command(next_help_heading = "Blacklist (lichess only)")]
 struct LilaArgs {
@@ -298,12 +304,8 @@ struct LilaArgs {
     /// players from (/api/stream/mod-marked-since).
     #[arg(long, env = "LILA_URL", default_value = "https://lichess.org")]
     lila: String,
-    /// Token of https://lichess.org/@/OpeningExplorer, for the blacklist.
-    #[arg(long, env = "EXPLORER_BEARER", hide_env_values = true)]
-    lila_bearer: Option<String>,
-    /// File with the token, read once at startup.
-    #[arg(long, env = "EXPLORER_BEARER_FILE", conflicts_with = "lila_bearer")]
-    lila_bearer_file: Option<PathBuf>,
+    #[command(flatten)]
+    bearer: LilaBearerArgs,
     /// Seconds between blacklist updates.
     #[arg(long, default_value = "10380")]
     blacklist_refresh: u64,
@@ -381,19 +383,6 @@ fn main() {
     }
 }
 
-/// The token, or the token from the file (exits if it cannot be read).
-fn bearer(bearer: Option<String>, file: Option<&Path>) -> Option<String> {
-    bearer.or_else(|| {
-        file.map(|file| match fs::read_to_string(file) {
-            Ok(bearer) => bearer.trim().to_owned(),
-            Err(err) => {
-                eprintln!("error: reading bearer file {}: {err}", file.display());
-                process::exit(1);
-            }
-        })
-    })
-}
-
 fn run_player(args: PlayerArgs) {
     raise_fd_limit();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -423,7 +412,7 @@ fn run_player(args: PlayerArgs) {
     let result = runtime.block_on(async {
         let lila = std::sync::Arc::new(LilaClient::new(LilaClientConfig {
             url: args.lila.trim_end_matches('/').to_owned(),
-            bearer: bearer(args.lila_bearer, args.lila_bearer_file.as_deref()),
+            bearer: args.bearer.bearer(),
             streams: args.indexers,
             read_timeout: Duration::from_secs(args.lila_timeout),
             ..LilaClientConfig::default()
@@ -505,7 +494,7 @@ fn run(kind: Kind, args: ServeArgs) {
         no_openings: args.no_openings,
         blacklist: (kind == Kind::Lichess && !args.lila.no_blacklist).then(|| LilaConfig {
             url: args.lila.lila.trim_end_matches('/').to_owned(),
-            bearer: bearer(args.lila.lila_bearer, args.lila.lila_bearer_file.as_deref()),
+            bearer: args.lila.bearer.bearer(),
             refresh: Duration::from_secs(args.lila.blacklist_refresh),
         }),
     };

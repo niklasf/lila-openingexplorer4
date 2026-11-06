@@ -1,4 +1,4 @@
-use std::{fs, io, path::Path, time::Duration};
+use std::{fs, io, path::Path, sync::RwLock, time::Duration};
 
 use nohash_hasher::IntMap;
 use serde::Serialize;
@@ -43,6 +43,21 @@ impl Openings {
 
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// The opening names to start with: from the directory, if any (logged),
+    /// or none.
+    pub fn initial(dir: Option<&Path>) -> Result<Openings, OpeningsError> {
+        let Some(dir) = dir else {
+            return Ok(Openings::default());
+        };
+        let openings = Openings::load_dir(dir)?;
+        log::info!(
+            "loaded {} opening names from {}",
+            openings.len(),
+            dir.display()
+        );
+        Ok(openings)
     }
 
     pub fn load_dir(dir: &Path) -> Result<Openings, OpeningsError> {
@@ -120,6 +135,25 @@ impl Openings {
             self.data.get(&pos.zobrist_hash(EnPassantMode::Legal))
         } else {
             None
+        }
+    }
+}
+
+/// Keeps the opening names up to date (downloading them about every three
+/// hours), calling `on_change` after each update.
+pub async fn periodic_refresh(openings: &RwLock<Openings>, on_change: impl Fn()) {
+    loop {
+        match Openings::download().await {
+            Ok(downloaded) => {
+                log::info!("refreshed {} opening names", downloaded.len());
+                *openings.write().expect("write openings") = downloaded;
+                on_change();
+                tokio::time::sleep(Duration::from_secs(60 * 167)).await;
+            }
+            Err(err) => {
+                log::error!("failed to refresh opening names: {err}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
         }
     }
 }

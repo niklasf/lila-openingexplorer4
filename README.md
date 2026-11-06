@@ -3,7 +3,7 @@
 Next generation opening explorer for lichess.org, indexing billions of
 chess games (currently ~10 B rated games across all variants, growing fast).
 
-# Usage
+## Usage
 
 Production: 128 GB RAM, 12 hardware threads, SST files on hard disks,
 two instances running intermittently.
@@ -58,7 +58,7 @@ stress_explorer requests.tsv.zst \
     --masters-url http://127.0.0.1:9003
 ```
 
-# Indexing
+## Indexing
 
 1. Convert PGN files to a more compact parquet file. Inputs must be in
    chronological order by month.
@@ -81,16 +81,16 @@ stress_explorer requests.tsv.zst \
    parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games
    ```
 
-# Todo
+# #Todo
 
-## Indexing from scratch
+### Indexing from scratch
 
 * [x] `pgn_to_parquet`: Convert `.pgn` or `.pgn.zst` files to a single
   `.parquet` file optimized for the following stages.
 * [x] `parquet_to_games`: Produce RocksDB SST files for games.
 * [x] `parquet_to_positions`: Produce RocksDB SST files for positions.
 
-## Live server
+### Live server
 
 Overall features:
 
@@ -131,13 +131,13 @@ Pending documentation changes:
 
 * [ ] title on GamePlayer
 
-# Production hardware
+## Production hardware
 
 * AMD Ryzen 5 PRO 3600 (12 threads @ 3.6 GHz)
 * 128 GB RAM
 * 4x HGST HUS726T6TAL (5.46 TB) in RAID 10
 * 2x WDC CL SN720 SDAQNTW-512G-2000 (512 GB) in RAID 1
 
-# License
+## License
 
 * [ ] TODO

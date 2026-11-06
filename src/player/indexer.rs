@@ -18,7 +18,7 @@ use crate::{
         status::PlayerStatus,
         time::UnixMillis,
     },
-    util::Counter,
+    util::{Counter, push_counters},
 };
 
 fn micros(duration: Duration) -> u64 {
@@ -100,6 +100,35 @@ pub struct IndexerMetrics {
     pub stream_micros: Counter,
     pub rebuild_errors: Counter,
     pub queue_full: Counter,
+}
+
+impl IndexerMetrics {
+    /// The fields for `/monitor`.
+    pub fn fields(&self, out: &mut Vec<String>) {
+        push_counters(
+            out,
+            [
+                ("runs", &self.runs),
+                ("runs_complete", &self.runs_complete),
+                ("runs_not_found", &self.runs_not_found),
+                ("runs_failed", &self.runs_failed),
+                ("runs_abandoned", &self.runs_abandoned),
+                ("runs_requeued", &self.runs_requeued),
+                ("games_received", &self.games_received),
+                ("skipped_ongoing", &self.skipped_ongoing),
+                ("skipped_unfinished", &self.skipped_unfinished),
+                ("skipped_anonymous", &self.skipped_anonymous),
+                ("skipped_invalid", &self.skipped_invalid),
+                ("malformed_lines", &self.malformed_lines),
+                ("lila_errors", &self.lila_errors),
+                ("lila_timeouts", &self.lila_timeouts),
+                ("stream_retries", &self.stream_retries),
+                ("writer_wait_us", &self.writer_wait_micros),
+                ("lila_stream_us", &self.stream_micros),
+                ("rebuild_errors", &self.rebuild_errors),
+            ],
+        );
+    }
 }
 
 /// How an index run ended.

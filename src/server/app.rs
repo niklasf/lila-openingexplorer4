@@ -18,7 +18,7 @@ use moka::future::Cache;
 use partial_sort::PartialSort;
 use rocksdb::DBPinnableSlice;
 use shakmaty::{EnPassantMode, fen::Fen, san::SanPlus, variant::VariantPosition};
-use tokio::{runtime::Handle, sync::Semaphore, task, time};
+use tokio::{runtime::Handle, sync::Semaphore, task};
 
 use crate::{
     packed::{
@@ -34,7 +34,7 @@ use crate::{
         },
         listen,
         metrics::Metrics,
-        openings::Openings,
+        openings::{self, Openings},
         pgn::masters_pgn,
         query::{LichessQuery, Limits, MastersQuery, Play, PlayError, PlayPosition},
         replay::find_visit,
@@ -42,7 +42,7 @@ use crate::{
             ExplorerGame, ExplorerGameWithUci, ExplorerMove, ExplorerResponse, HistoryEntry, Stats,
         },
     },
-    util::Counter,
+    util::{Counter, push_field},
 };
 
 /// Which database the server serves.
@@ -611,18 +611,24 @@ async fn masters_pgn_handler(
 async fn monitor(State(state): State<Shared>) -> String {
     let fields = {
         let mut fields = state.metrics.fields(state.config.kind);
-        fields.push(format!("response_cache={}u", state.cache.entry_count()));
-        fields.push(format!("block_cache_usage={}u", state.db.cache_usage()));
-        fields.push(format!(
-            "block_cache_pinned={}u",
-            state.db.cache_pinned_usage()
-        ));
-        fields.push(format!(
-            "openings={}u",
-            state.openings.read().expect("read openings").len()
-        ));
+        push_field(&mut fields, "response_cache", state.cache.entry_count());
+        push_field(
+            &mut fields,
+            "block_cache_usage",
+            state.db.cache_usage() as u64,
+        );
+        push_field(
+            &mut fields,
+            "block_cache_pinned",
+            state.db.cache_pinned_usage() as u64,
+        );
+        push_field(
+            &mut fields,
+            "openings",
+            state.openings.read().expect("read openings").len() as u64,
+        );
         if state.config.blacklist.is_some() {
-            fields.push(format!("blacklist={}u", state.blacklist.len()));
+            push_field(&mut fields, "blacklist", state.blacklist.len() as u64);
         }
         for (name, ticker) in [
             (
@@ -651,7 +657,7 @@ async fn monitor(State(state): State<Shared>) -> String {
             ),
         ] {
             if let Some(count) = state.db.ticker(ticker) {
-                fields.push(format!("{name}={count}u"));
+                push_field(&mut fields, name, count);
             }
         }
         fields
@@ -680,36 +686,8 @@ async fn cf_prop(
     .await
 }
 
-async fn periodic_openings_refresh(state: Shared) {
-    loop {
-        match Openings::download().await {
-            Ok(openings) => {
-                log::info!("refreshed {} opening names", openings.len());
-                *state.openings.write().expect("write openings") = openings;
-                state.cache.invalidate_all();
-                time::sleep(Duration::from_secs(60 * 167)).await;
-            }
-            Err(err) => {
-                log::error!("failed to refresh opening names: {err}");
-                time::sleep(Duration::from_secs(60)).await;
-            }
-        }
-    }
-}
-
 pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::error::Error>> {
-    let openings = match &config.openings_dir {
-        Some(dir) => {
-            let openings = Openings::load_dir(dir)?;
-            log::info!(
-                "loaded {} opening names from {}",
-                openings.len(),
-                dir.display()
-            );
-            openings
-        }
-        None => Openings::default(),
-    };
+    let openings = Openings::initial(config.openings_dir.as_deref())?;
 
     let state: Shared = Arc::new(AppState {
         cache: Cache::builder()
@@ -725,7 +703,10 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
     });
 
     if state.config.openings_dir.is_none() && !state.config.no_openings {
-        task::spawn(periodic_openings_refresh(Arc::clone(&state)));
+        let state = Arc::clone(&state);
+        task::spawn(async move {
+            openings::periodic_refresh(&state.openings, || state.cache.invalidate_all()).await;
+        });
     }
 
     if let Some(lila) = state.config.blacklist.clone() {

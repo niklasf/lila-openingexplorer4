@@ -134,6 +134,43 @@ impl SubStats {
         })
     }
 
+    /// Performance rating from the point of view of `color`, after
+    /// <https://handbook.fide.com/chapter/B022017>, as before.
+    pub fn performance(&self, color: Color) -> Option<i32> {
+        const DELTAS: [f64; 101] = [
+            -800.0, -677.0, -589.0, -538.0, -501.0, -470.0, -444.0, -422.0, -401.0, -383.0, -366.0,
+            -351.0, -336.0, -322.0, -309.0, -296.0, -284.0, -273.0, -262.0, -251.0, -240.0, -230.0,
+            -220.0, -211.0, -202.0, -193.0, -184.0, -175.0, -166.0, -158.0, -149.0, -141.0, -133.0,
+            -125.0, -117.0, -110.0, -102.0, -95.0, -87.0, -80.0, -72.0, -65.0, -57.0, -50.0, -43.0,
+            -36.0, -29.0, -21.0, -14.0, -7.0, 0.0, 7.0, 14.0, 21.0, 29.0, 36.0, 43.0, 50.0, 57.0,
+            65.0, 72.0, 80.0, 87.0, 95.0, 102.0, 110.0, 117.0, 125.0, 133.0, 141.0, 149.0, 158.0,
+            166.0, 175.0, 184.0, 193.0, 202.0, 211.0, 220.0, 230.0, 240.0, 251.0, 262.0, 273.0,
+            284.0, 296.0, 309.0, 322.0, 336.0, 351.0, 366.0, 383.0, 401.0, 422.0, 444.0, 470.0,
+            501.0, 538.0, 589.0, 677.0, 800.0,
+        ];
+        let games = self.games();
+        if games == 0 {
+            return None;
+        }
+        // Exactly as before (sum of absolute ratings over games), so that
+        // rounding at .5 agrees.
+        let rating_sum = self.rating_offset_sum + 1500 * games as i64;
+        let average = rating_sum as f64 / games as f64;
+        let wins = match color {
+            Color::White => self.white,
+            Color::Black => self.black,
+        };
+        let score = 100 * wins + 50 * self.draws;
+        let p = score as f64 / games as f64;
+        let idx = p.trunc() as usize;
+        Some(
+            (average
+                + DELTAS[idx] * (1.0 - p.fract())
+                + DELTAS.get(idx + 1).copied().unwrap_or(800.0) * p.fract())
+            .round() as i32,
+        )
+    }
+
     /// Packs the statistics, with the rating sum relative to `typical`
     /// ratings.
     pub fn pack<B: BufMut>(&self, buf: &mut B, typical: Rating) {
@@ -861,6 +898,30 @@ mod tests {
         assert_eq!(average(-1, 2), Some(1500));
         assert_eq!(average(-3, 2), Some(1499));
         assert_eq!(average(-2, 3), Some(1499));
+    }
+
+    #[test]
+    fn test_performance() {
+        let stats = |white: u64, draws: u64, black: u64, rating_sum: i64| SubStats {
+            rating_offset_sum: rating_sum - 1500 * (white + draws + black) as i64,
+            white,
+            draws,
+            black,
+        };
+
+        let single = stats(1, 0, 0, 1500);
+        assert_eq!(single.performance(Color::White), Some(2300));
+        assert_eq!(single.performance(Color::Black), Some(700));
+
+        let symmetrical = stats(123, 10, 123, (123 + 10 + 123) * 987);
+        assert_eq!(symmetrical.performance(Color::White), Some(987));
+        assert_eq!(symmetrical.performance(Color::Black), Some(987));
+
+        let p5 = stats(5, 0, 95, 0);
+        assert_eq!(p5.performance(Color::White), Some(-470));
+        assert_eq!(p5.performance(Color::Black), Some(470));
+
+        assert_eq!(SubStats::default().performance(Color::White), None);
     }
 
     #[test]

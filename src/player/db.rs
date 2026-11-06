@@ -29,7 +29,7 @@ use crate::{
         status::PlayerStatus,
     },
     sst::SstConfig,
-    util::Counter,
+    util::{Counter, push_counters},
 };
 
 pub const STATUS_CF: &str = "player_status";
@@ -185,6 +185,27 @@ pub struct DbCounters {
     pub rebuilds_ingested: Counter,
     pub rebuild_micros: Counter,
     pub rebuild_bytes: Counter,
+}
+
+impl DbCounters {
+    /// The fields for `/monitor`.
+    pub fn fields(&self, out: &mut Vec<String>) {
+        push_counters(
+            out,
+            [
+                ("chunks", &self.chunks),
+                ("games_indexed", &self.games_written),
+                ("games_known", &self.games_known),
+                ("warm_operands", &self.warm_operands),
+                ("cold_operands", &self.cold_operands),
+                ("cold_false", &self.cold_false),
+                ("rebuilds", &self.rebuilds),
+                ("rebuilds_ingested", &self.rebuilds_ingested),
+                ("rebuild_us", &self.rebuild_micros),
+                ("rebuild_bytes", &self.rebuild_bytes),
+            ],
+        );
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

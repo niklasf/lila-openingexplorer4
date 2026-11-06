@@ -267,21 +267,21 @@ impl FromStr for Speed {
 
 #[derive(Arbitrary, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum RatingMode {
-    Unrated,
+    Casual,
     Rated,
 }
 
 impl RatingMode {
     pub fn bits(self) -> u8 {
         match self {
-            RatingMode::Unrated => 0,
+            RatingMode::Casual => 0,
             RatingMode::Rated => 1,
         }
     }
 
     pub fn from_bits(bits: u8) -> Option<RatingMode> {
         Some(match bits {
-            0 => RatingMode::Unrated,
+            0 => RatingMode::Casual,
             1 => RatingMode::Rated,
             _ => return None,
         })
@@ -289,14 +289,14 @@ impl RatingMode {
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            RatingMode::Unrated => "unrated",
+            RatingMode::Casual => "casual",
             RatingMode::Rated => "rated",
         }
     }
 
     pub fn from_ascii(bytes: &[u8]) -> Result<RatingMode, InvalidRatingMode> {
         Ok(match bytes {
-            b"unrated" => RatingMode::Unrated,
+            b"casual" => RatingMode::Casual,
             b"rated" => RatingMode::Rated,
             _ => return Err(InvalidRatingMode),
         })
@@ -312,6 +312,38 @@ impl fmt::Display for RatingMode {
 #[derive(Debug, Error)]
 #[error("invalid rating mode")]
 pub struct InvalidRatingMode;
+
+impl FromStr for RatingMode {
+    type Err = InvalidRatingMode;
+
+    fn from_str(s: &str) -> Result<RatingMode, InvalidRatingMode> {
+        RatingMode::from_ascii(s.as_bytes())
+    }
+}
+
+bitflags! {
+    /// A set of rating modes.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+    pub struct RatingModes: u8 {
+        const CASUAL = 1 << 0;
+        const RATED = 1 << 1;
+    }
+}
+
+impl From<RatingMode> for RatingModes {
+    fn from(mode: RatingMode) -> RatingModes {
+        match mode {
+            RatingMode::Casual => RatingModes::CASUAL,
+            RatingMode::Rated => RatingModes::RATED,
+        }
+    }
+}
+
+impl FromIterator<RatingMode> for RatingModes {
+    fn from_iter<I: IntoIterator<Item = RatingMode>>(iter: I) -> RatingModes {
+        iter.into_iter().map(RatingModes::from).collect()
+    }
+}
 
 /// Packs the speed into the low 3 bits (0 if missing), the rating mode
 /// into the next bit, and whether event tags follow into the bit after
@@ -561,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_rating_mode_str_roundtrip() {
-        for rating_mode in [RatingMode::Unrated, RatingMode::Rated] {
+        for rating_mode in [RatingMode::Casual, RatingMode::Rated] {
             assert_eq!(
                 RatingMode::from_ascii(rating_mode.as_str().as_bytes()).unwrap(),
                 rating_mode

@@ -1,14 +1,11 @@
 //! Query parameters of `/player`.
 
-use std::str::FromStr;
-
 use serde::Deserialize;
 use serde_with::{DisplayFromStr, StringWithSeparator, formats::CommaSeparator, serde_as};
 use shakmaty::Color;
-use thiserror::Error;
 
 use crate::{
-    packed::{LaxMonth, Month, RatingMode, Speed, Speeds},
+    packed::{LaxMonth, Month, RatingMode, RatingModes, Speed, Speeds},
     player::UserId,
     server::query::Play,
 };
@@ -16,46 +13,10 @@ use crate::{
 /// Most recent games of a response.
 pub const MAX_RECENT_GAMES: usize = 8;
 
-/// A mode in queries and responses: `casual` or `rated`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct Mode(pub RatingMode);
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self.0 {
-            RatingMode::Rated => "rated",
-            RatingMode::Unrated => "casual",
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-#[error("invalid mode")]
-pub struct InvalidMode;
-
-impl FromStr for Mode {
-    type Err = InvalidMode;
-
-    fn from_str(s: &str) -> Result<Mode, InvalidMode> {
-        Ok(Mode(match s {
-            "rated" => RatingMode::Rated,
-            "casual" => RatingMode::Unrated,
-            _ => return Err(InvalidMode),
-        }))
-    }
-}
-
-impl std::fmt::Display for Mode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct PlayerFilter {
     pub speeds: Option<Speeds>,
-    /// Rated, casual (`None` for both).
-    pub modes: Option<(bool, bool)>,
+    pub modes: Option<RatingModes>,
     pub since: Option<Month>,
     pub until: Option<Month>,
 }
@@ -67,10 +28,7 @@ impl PlayerFilter {
     }
 
     pub fn contains_mode(&self, mode: RatingMode) -> bool {
-        self.modes.is_none_or(|(rated, casual)| match mode {
-            RatingMode::Rated => rated,
-            RatingMode::Unrated => casual,
-        })
+        self.modes.is_none_or(|modes| modes.contains(mode.into()))
     }
 
     pub fn contains_month(&self, month: Month) -> bool {
@@ -106,8 +64,8 @@ struct RawPlayerQuery {
     play: Play,
     #[serde_as(as = "Option<StringWithSeparator<CommaSeparator, Speed>>")]
     speeds: Option<Speeds>,
-    #[serde_as(as = "Option<StringWithSeparator<CommaSeparator, Mode>>")]
-    modes: Option<Vec<Mode>>,
+    #[serde_as(as = "Option<StringWithSeparator<CommaSeparator, RatingMode>>")]
+    modes: Option<RatingModes>,
     #[serde_as(as = "Option<DisplayFromStr>")]
     since: Option<LaxMonth>,
     #[serde_as(as = "Option<DisplayFromStr>")]
@@ -128,12 +86,7 @@ impl TryFrom<RawPlayerQuery> for PlayerQuery {
             play: raw.play,
             filter: PlayerFilter {
                 speeds: raw.speeds,
-                modes: raw.modes.map(|modes| {
-                    (
-                        modes.contains(&Mode(RatingMode::Rated)),
-                        modes.contains(&Mode(RatingMode::Unrated)),
-                    )
-                }),
+                modes: raw.modes,
                 since: raw.since.map(LaxMonth::earliest_month),
                 until: raw.until.map(LaxMonth::latest_month),
             },
@@ -170,7 +123,7 @@ mod tests {
         assert_eq!(q.player.as_str(), "revoof");
         assert_eq!(q.color, Color::Black);
         assert_eq!(q.play.variant, Variant::Atomic);
-        assert_eq!(q.filter.modes, Some((false, true)));
+        assert_eq!(q.filter.modes, Some(RatingModes::CASUAL));
         assert_eq!(q.filter.speeds, Some(Speeds::BLITZ | Speeds::RAPID));
         assert_eq!(q.filter.since.unwrap().to_string(), "2020-03");
         assert_eq!(q.filter.until.unwrap().to_string(), "2021-12");
@@ -182,7 +135,7 @@ mod tests {
             q.filter
                 .contains_month(Month::from_year_and_month(2026, 11).unwrap())
         );
-        assert!(q.filter.contains_mode(RatingMode::Unrated));
+        assert!(q.filter.contains_mode(RatingMode::Casual));
 
         assert!(player("player=a").is_err());
         assert!(player("color=white").is_err());

@@ -1,6 +1,6 @@
 use crate::{
     server::app::Kind,
-    util::{Counter, Histogram},
+    util::{Counter, Histogram, push_counters},
 };
 
 /// Request counters for `/monitor`.
@@ -57,10 +57,8 @@ impl Metrics {
         if kind == Kind::Masters {
             counters.push(("pgn_requests", &self.pgn_requests));
         }
-        let mut out: Vec<String> = counters
-            .into_iter()
-            .map(|(name, counter)| format!("{name}={}u", counter.get()))
-            .collect();
+        let mut out = Vec::new();
+        push_counters(&mut out, counters);
         self.compute.fields("compute", &mut out);
         self.request.fields("request", &mut out);
         out

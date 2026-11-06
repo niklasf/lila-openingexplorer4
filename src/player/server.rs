@@ -1,6 +1,3 @@
-//! The `explorer player` server: `/player` (and `/personal`), and on the
-//! administration address `/monitor` and `DELETE /player/{id}`.
-
 use std::{
     convert::Infallible,
     net::SocketAddr,
@@ -28,10 +25,7 @@ use crate::{
     player::{
         InvalidUserName, PlayerDb, UserId,
         db::WARM_CF,
-        explore::{
-            PlayerGameResponse, PlayerGameWithUci, PlayerMove, PlayerResponse, average_rating,
-            performance, prepare,
-        },
+        explore::{PlayerGameResponse, PlayerGameWithUci, PlayerMove, PlayerResponse, prepare},
         indexer::Indexer,
         keys::PlayerGameIndex,
         query::PlayerQuery,
@@ -39,17 +33,16 @@ use crate::{
     },
     server::{
         listen,
-        openings::{Opening, Openings},
+        openings::{self, Opening, Openings},
         query::PlayError,
         response::Stats,
     },
-    util::{Counter, Histogram},
+    util::{Counter, Histogram, push_counters, push_field},
 };
 
 #[derive(Debug, Clone)]
 pub struct PlayerServerConfig {
     pub bind: SocketAddr,
-    /// Address for /monitor and DELETE /player/{id} (`None`: neither).
     pub admin_bind: Option<SocketAddr>,
     pub cors: bool,
     /// Concurrent database reads.
@@ -135,6 +128,40 @@ pub struct ServerMetrics {
     pub players_deleted: Counter,
 }
 
+impl ServerMetrics {
+    /// The fields for `/monitor`. Takes the maximum of the read histogram.
+    fn fields(&self, out: &mut Vec<String>) {
+        push_counters(
+            out,
+            [
+                ("requests", &self.requests),
+                ("bad_requests", &self.bad_requests),
+                ("queue_full", &self.queue_full),
+                ("streams_complete", &self.streams_complete),
+                ("streams_gone", &self.streams_gone),
+                ("stream_us", &self.stream_micros),
+                ("snapshots", &self.snapshots),
+                ("snapshots_repeated", &self.snapshots_repeated),
+                ("keep_alives", &self.keep_alives),
+                ("warm_hits", &self.warm_hits),
+                ("cold_candidates", &self.cold_candidates),
+                ("cold_validated", &self.cold_validated),
+                ("players_deleted", &self.players_deleted),
+            ],
+        );
+        for (i, (partial, complete)) in self.ply.iter().enumerate() {
+            let bucket = if i + 1 == PLY_BUCKETS {
+                format!("ply_ge{}", i * 10)
+            } else {
+                format!("ply_lt{}", (i + 1) * 10)
+            };
+            push_field(out, &format!("{bucket}_partial"), partial.get());
+            push_field(out, &format!("{bucket}_final"), complete.get());
+        }
+        self.read.fields("read", out);
+    }
+}
+
 pub struct PlayerState {
     config: PlayerServerConfig,
     indexer: Arc<Indexer>,
@@ -150,7 +177,6 @@ fn ply(pos: &VariantPosition) -> usize {
     (pos.fullmoves().get() as usize - 1) * 2 + usize::from(pos.turn() == Color::Black)
 }
 
-/// A request in progress.
 struct Request {
     query: PlayerQuery,
     pos: VariantPosition,
@@ -158,7 +184,6 @@ struct Request {
 }
 
 impl PlayerState {
-    /// Reads a snapshot of the position for the request.
     fn read(&self, request: &Request) -> Result<PlayerResponse, Error> {
         let started = Instant::now();
         let query = &request.query;
@@ -219,8 +244,8 @@ impl PlayerState {
                 Some(PlayerMove {
                     uci,
                     san,
-                    average_opponent_rating: average_rating(&pm.stats),
-                    performance: performance(&pm.stats, query.color),
+                    average_opponent_rating: pm.stats.average_rating().map(i32::from),
+                    performance: pm.stats.performance(query.color),
                     stats: Stats::from(&pm.stats),
                     game: pm.game.and_then(game),
                     opening: openings.classify_exact(&after).cloned(),
@@ -298,7 +323,7 @@ impl Drop for StreamGuard {
     }
 }
 
-/// Streams the snapshots of a request (see the plan: first immediately,
+/// Streams the snapshots of a request (first immediately,
 /// then at most one per `debounce` while indexing, each re-reading only
 /// after committed batches, and the final one immediately).
 async fn snapshots(
@@ -439,81 +464,22 @@ async fn player(
 
 async fn monitor(State(state): State<Shared>) -> String {
     let mut fields = Vec::new();
-    let mut add = |name: &str, value: u64| fields.push(format!("{name}={value}u"));
-    let m = &state.metrics;
-    for (name, counter) in [
-        ("requests", &m.requests),
-        ("bad_requests", &m.bad_requests),
-        ("queue_full", &m.queue_full),
-        ("streams_complete", &m.streams_complete),
-        ("streams_gone", &m.streams_gone),
-        ("stream_us", &m.stream_micros),
-        ("snapshots", &m.snapshots),
-        ("snapshots_repeated", &m.snapshots_repeated),
-        ("keep_alives", &m.keep_alives),
-        ("warm_hits", &m.warm_hits),
-        ("cold_candidates", &m.cold_candidates),
-        ("cold_validated", &m.cold_validated),
-        ("players_deleted", &m.players_deleted),
-    ] {
-        add(name, counter.get());
-    }
-    add("open_streams", state.open_streams.load(Ordering::Relaxed));
-    for (i, (partial, complete)) in m.ply.iter().enumerate() {
-        let bucket = if i + 1 == PLY_BUCKETS {
-            format!("ply_ge{}", i * 10)
-        } else {
-            format!("ply_lt{}", (i + 1) * 10)
-        };
-        add(&format!("{bucket}_partial"), partial.get());
-        add(&format!("{bucket}_final"), complete.get());
-    }
+    state.metrics.fields(&mut fields);
+    push_field(
+        &mut fields,
+        "open_streams",
+        state.open_streams.load(Ordering::Relaxed),
+    );
     let indexer = &state.indexer;
     let queue = indexer.queue().stats();
-    add("queue_waiting", queue.waiting as u64);
-    add("queue_running", queue.running as u64);
-    add("queue_busy", queue.busy as u64);
-    add("lila_streams", indexer.lila().busy() as u64);
-    let im = &indexer.metrics;
-    for (name, counter) in [
-        ("runs", &im.runs),
-        ("runs_complete", &im.runs_complete),
-        ("runs_not_found", &im.runs_not_found),
-        ("runs_failed", &im.runs_failed),
-        ("runs_abandoned", &im.runs_abandoned),
-        ("runs_requeued", &im.runs_requeued),
-        ("games_received", &im.games_received),
-        ("skipped_ongoing", &im.skipped_ongoing),
-        ("skipped_unfinished", &im.skipped_unfinished),
-        ("skipped_anonymous", &im.skipped_anonymous),
-        ("skipped_invalid", &im.skipped_invalid),
-        ("malformed_lines", &im.malformed_lines),
-        ("lila_errors", &im.lila_errors),
-        ("lila_timeouts", &im.lila_timeouts),
-        ("stream_retries", &im.stream_retries),
-        ("writer_wait_us", &im.writer_wait_micros),
-        ("lila_stream_us", &im.stream_micros),
-        ("rebuild_errors", &im.rebuild_errors),
-    ] {
-        add(name, counter.get());
-    }
+    push_field(&mut fields, "queue_waiting", queue.waiting as u64);
+    push_field(&mut fields, "queue_running", queue.running as u64);
+    push_field(&mut fields, "queue_busy", queue.busy as u64);
+    push_field(&mut fields, "lila_streams", indexer.lila().busy() as u64);
+    indexer.metrics.fields(&mut fields);
     let db = indexer.db();
-    let dm = &db.counters;
-    for (name, counter) in [
-        ("chunks", &dm.chunks),
-        ("games_indexed", &dm.games_written),
-        ("games_known", &dm.games_known),
-        ("warm_operands", &dm.warm_operands),
-        ("cold_operands", &dm.cold_operands),
-        ("cold_false", &dm.cold_false),
-        ("rebuilds", &dm.rebuilds),
-        ("rebuilds_ingested", &dm.rebuilds_ingested),
-        ("rebuild_us", &dm.rebuild_micros),
-        ("rebuild_bytes", &dm.rebuild_bytes),
-    ] {
-        add(name, counter.get());
-    }
-    add("block_cache_usage", db.cache_usage() as u64);
+    db.counters.fields(&mut fields);
+    push_field(&mut fields, "block_cache_usage", db.cache_usage() as u64);
     for cf in PlayerDb::column_families() {
         for (prop, name) in [
             ("rocksdb.estimate-num-keys", "keys"),
@@ -524,7 +490,7 @@ async fn monitor(State(state): State<Shared>) -> String {
             ),
         ] {
             if let Ok(Some(value)) = db.cf_int_property(cf, prop) {
-                add(&format!("{cf}_{name}"), value);
+                push_field(&mut fields, &format!("{cf}_{name}"), value);
             }
         }
     }
@@ -535,7 +501,7 @@ async fn monitor(State(state): State<Shared>) -> String {
         ("rocksdb.num-running-flushes", "running_flushes"),
     ] {
         if let Ok(Some(value)) = db.cf_int_property(WARM_CF, prop) {
-            add(name, value);
+            push_field(&mut fields, name, value);
         }
     }
     for (name, ticker) in [
@@ -562,21 +528,17 @@ async fn monitor(State(state): State<Shared>) -> String {
         ),
     ] {
         if let Some(value) = db.ticker(ticker) {
-            add(name, value);
+            push_field(&mut fields, name, value);
         }
     }
-    add(
+    push_field(
+        &mut fields,
         "openings",
         state.openings.read().expect("read openings").len() as u64,
     );
-    m.read.fields("read", &mut fields);
     format!("opening_explorer_player {}\n", fields.join(","))
 }
 
-/// `DELETE /player/{id}`: drops everything of a player (204, or 404 if
-/// the player was not indexed). Waits for a running index run (at most
-/// `--max-run`) or rebuild of the player to end. The next request indexes
-/// the player anew.
 async fn delete_player(
     State(state): State<Shared>,
     Path(user): Path<String>,
@@ -620,24 +582,6 @@ async fn cf_prop(
     .await
 }
 
-async fn periodic_openings_refresh(state: Shared) {
-    loop {
-        match Openings::download().await {
-            Ok(openings) => {
-                log::info!("refreshed {} opening names", openings.len());
-                *state.openings.write().expect("write openings") = openings;
-                tokio::time::sleep(Duration::from_secs(60 * 167)).await;
-            }
-            Err(err) => {
-                log::error!("failed to refresh opening names: {err}");
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        }
-    }
-}
-
-/// The public and the administration routers and the state of the server
-/// (without listening), for tests.
 pub fn router(
     config: PlayerServerConfig,
     indexer: Arc<Indexer>,
@@ -672,28 +616,17 @@ pub fn router(
     (app, admin, state)
 }
 
-/// Runs the server until it is interrupted.
 pub async fn serve(
     config: PlayerServerConfig,
     indexer: Arc<Indexer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let openings = match &config.openings_dir {
-        Some(dir) => {
-            let openings = Openings::load_dir(dir)?;
-            log::info!(
-                "loaded {} opening names from {}",
-                openings.len(),
-                dir.display()
-            );
-            openings
-        }
-        None => Openings::default(),
-    };
+    let openings = Openings::initial(config.openings_dir.as_deref())?;
     let download = config.openings_dir.is_none() && !config.no_openings;
     let (bind, admin_bind) = (config.bind, config.admin_bind);
     let (app, admin, state) = router(config, indexer, openings);
     if download {
-        task::spawn(periodic_openings_refresh(Arc::clone(&state)));
+        let state = Arc::clone(&state);
+        task::spawn(async move { openings::periodic_refresh(&state.openings, || ()).await });
     }
     listen::serve_until_signal(bind, app, admin_bind.map(|addr| (addr, admin))).await?;
     Ok(())

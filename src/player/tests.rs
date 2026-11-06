@@ -107,7 +107,7 @@ pub(super) fn arbitrary_game(
             mode: if u.arbitrary()? {
                 RatingMode::Rated
             } else {
-                RatingMode::Unrated
+                RatingMode::Casual
             },
             month: Month::from_months_since_jan_1900(u.int_in_range(1400..=1404)?),
             outcome: u.arbitrary()?,

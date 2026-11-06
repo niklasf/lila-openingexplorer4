@@ -5,11 +5,11 @@ use serde_with::{DisplayFromStr, serde_as};
 use shakmaty::{Color, packed::PackedUciMove, san::SanPlus, uci::UciMove};
 
 use crate::{
-    packed::{EntryView, GameId, Month, PlayerGroupHeader, Rating, Speed, SubStats},
+    packed::{EntryView, GameId, Month, PlayerGroupHeader, RatingMode, Speed, SubStats},
     player::{
         game::PlayerGame,
         keys::PlayerGameIndex,
-        query::{Mode, PlayerFilter, PlayerLimits},
+        query::{PlayerFilter, PlayerLimits},
     },
     server::{openings::Opening, response::Stats},
 };
@@ -92,43 +92,6 @@ pub fn prepare(entry: &[u8], filter: &PlayerFilter, limits: &PlayerLimits) -> Pr
     prepared
 }
 
-/// Performance rating from the point of view of `color`, after
-/// <https://handbook.fide.com/chapter/B022017>, as before.
-pub fn performance(stats: &SubStats, color: Color) -> Option<i32> {
-    const DELTAS: [f64; 101] = [
-        -800.0, -677.0, -589.0, -538.0, -501.0, -470.0, -444.0, -422.0, -401.0, -383.0, -366.0,
-        -351.0, -336.0, -322.0, -309.0, -296.0, -284.0, -273.0, -262.0, -251.0, -240.0, -230.0,
-        -220.0, -211.0, -202.0, -193.0, -184.0, -175.0, -166.0, -158.0, -149.0, -141.0, -133.0,
-        -125.0, -117.0, -110.0, -102.0, -95.0, -87.0, -80.0, -72.0, -65.0, -57.0, -50.0, -43.0,
-        -36.0, -29.0, -21.0, -14.0, -7.0, 0.0, 7.0, 14.0, 21.0, 29.0, 36.0, 43.0, 50.0, 57.0, 65.0,
-        72.0, 80.0, 87.0, 95.0, 102.0, 110.0, 117.0, 125.0, 133.0, 141.0, 149.0, 158.0, 166.0,
-        175.0, 184.0, 193.0, 202.0, 211.0, 220.0, 230.0, 240.0, 251.0, 262.0, 273.0, 284.0, 296.0,
-        309.0, 322.0, 336.0, 351.0, 366.0, 383.0, 401.0, 422.0, 444.0, 470.0, 501.0, 538.0, 589.0,
-        677.0, 800.0,
-    ];
-    let games = stats.games();
-    if games == 0 {
-        return None;
-    }
-    // Exactly as before (sum of absolute ratings over games), so that
-    // rounding at .5 agrees.
-    let rating_sum = stats.rating_offset_sum + 1500 * games as i64;
-    let average = rating_sum as f64 / games as f64;
-    let wins = match color {
-        Color::White => stats.white,
-        Color::Black => stats.black,
-    };
-    let score = 100 * wins + 50 * stats.draws;
-    let p = score as f64 / games as f64;
-    let idx = p.trunc() as usize;
-    Some(
-        (average
-            + DELTAS[idx] * (1.0 - p.fract())
-            + DELTAS.get(idx + 1).copied().unwrap_or(800.0) * p.fract())
-        .round() as i32,
-    )
-}
-
 #[derive(Serialize, Debug, Clone)]
 pub struct PlayerGamePlayer {
     pub name: String,
@@ -147,7 +110,7 @@ pub struct PlayerGameResponse {
     #[serde_as(as = "DisplayFromStr")]
     pub speed: Speed,
     #[serde_as(as = "DisplayFromStr")]
-    pub mode: Mode,
+    pub mode: RatingMode,
     pub white: PlayerGamePlayer,
     pub black: PlayerGamePlayer,
     pub year: u32,
@@ -175,7 +138,7 @@ impl PlayerGameResponse {
             id: game.id,
             winner: game.outcome.winner(),
             speed: game.speed,
-            mode: Mode(game.mode),
+            mode: game.mode,
             white,
             black,
             year: u32::from(game.month.months_since_jan_1900() / 12) + 1900,
@@ -228,17 +191,12 @@ impl PlayerResponse {
     }
 }
 
-/// Average rating of the stats, as JSON number.
-pub fn average_rating(stats: &SubStats) -> Option<i32> {
-    stats.average_rating().map(|r: Rating| i32::from(r))
-}
-
 #[cfg(test)]
 mod tests {
     use shakmaty::KnownOutcome;
 
     use super::*;
-    use crate::packed::{CellKey, GameIndex, PlayerEntry, RatingMode};
+    use crate::packed::{CellKey, GameIndex, PlayerEntry, Rating, RatingModes};
 
     #[test]
     fn test_prepare() {
@@ -251,7 +209,7 @@ mod tests {
         };
         let casual = PlayerGroupHeader {
             speed: Speed::Blitz,
-            mode: RatingMode::Unrated,
+            mode: RatingMode::Casual,
         };
         let month = |m| Month::from_months_since_jan_1900(1400 + m);
         let rating = Rating::try_from(1600).unwrap();
@@ -286,18 +244,18 @@ mod tests {
         assert_eq!(prepared.recent_games.len(), 8);
         assert_eq!(prepared.recent_games[0], (d4, PlayerGameIndex(10)));
         assert_eq!(prepared.recent_games[1], (e4, PlayerGameIndex(9)));
-        assert_eq!(average_rating(&prepared.moves[0].stats), Some(1600));
         assert_eq!(
-            performance(&prepared.moves[0].stats, Color::White),
+            prepared.moves[0].stats.average_rating().map(i32::from),
+            Some(1600)
+        );
+        assert_eq!(
+            prepared.moves[0].stats.performance(Color::White),
             Some(2400)
         );
-        assert_eq!(
-            performance(&prepared.moves[0].stats, Color::Black),
-            Some(800)
-        );
+        assert_eq!(prepared.moves[0].stats.performance(Color::Black), Some(800));
 
         let rated = PlayerFilter {
-            modes: Some((true, false)),
+            modes: Some(RatingModes::RATED),
             since: Some(month(1)),
             ..PlayerFilter::default()
         };

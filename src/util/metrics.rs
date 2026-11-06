@@ -3,6 +3,19 @@ use std::{
     time::Duration,
 };
 
+pub fn push_field(out: &mut Vec<String>, name: &str, value: u64) {
+    out.push(format!("{name}={value}u"));
+}
+
+pub fn push_counters<'a>(
+    out: &mut Vec<String>,
+    counters: impl IntoIterator<Item = (&'a str, &'a Counter)>,
+) {
+    for (name, counter) in counters {
+        push_field(out, name, counter.get());
+    }
+}
+
 #[derive(Default)]
 pub struct Counter(AtomicU64);
 

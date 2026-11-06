@@ -377,7 +377,7 @@ impl ExportGame {
                 mode: if self.rated {
                     RatingMode::Rated
                 } else {
-                    RatingMode::Unrated
+                    RatingMode::Casual
                 },
                 month: self.last_move_at.month(),
                 outcome: match self.winner.as_deref() {
@@ -449,7 +449,7 @@ mod tests {
         };
         assert_eq!(name, "maia1");
         assert_eq!(game.color, Color::Black);
-        assert_eq!(game.mode, RatingMode::Unrated);
+        assert_eq!(game.mode, RatingMode::Casual);
         assert_eq!(game.speed, Speed::Rapid);
         assert_eq!(game.month.to_string(), "2022-04");
         assert_eq!(game.opponent_name, "revoof");
