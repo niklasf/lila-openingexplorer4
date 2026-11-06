@@ -73,7 +73,7 @@ Replay an nginx request log (tab separated `$msec`, `$status`,
 `$request_time`, `$upstream_response_time`, `$request_uri`) against both:
 
 ```sh
-stress_explorer requests.tsv.zst \
+stress_explorer samples/requests/explorer-2026-11-06T1520Z-1h.tsv.zst \
     --lichess-url http://127.0.0.1:9002 \
     --masters-url http://127.0.0.1:9003
 ```
@@ -84,7 +84,7 @@ stress_explorer requests.tsv.zst \
    chronological order by month.
 
    ```sh
-   pgns=$(ls /mnt/lichess_db/*/lichess_db_*_rated_*.pgn.zst | awk -F_ '{print $NF, $0}' | sort -s -k1,1 | cut -d' ' -f2)
+   pgns=$(ls samples/lichess_db/*/lichess_db_*_rated_*.pgn.zst | awk -F_ '{print $NF, $0}' | sort -s -k1,1 | cut -d' ' -f2)
    pgn_to_parquet --out lichess/lichess_db_rated.parquet $pgns
    ```
 
@@ -134,7 +134,7 @@ Critical performance work:
 * [x] Recheck compression on latest SSTs
 * [x] Elias-Fano vs rice on cold entries
 * [x] Optimize SST block sizes
-* [ ] Truncate Lichess game moves
+* [x] Truncate Lichess game moves
 * [ ] Tune warm/cold threshold for player database
 
 Needs HDDs:
