@@ -9,6 +9,7 @@ pub mod queue;
 pub mod status;
 #[cfg(test)]
 mod tests;
+pub mod time;
 mod user;
 
 pub use db::{PlayerDb, PlayerDbConfig, PlayerDbError};

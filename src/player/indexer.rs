@@ -1,6 +1,6 @@
 use std::{
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -16,19 +16,13 @@ use crate::{
         policy::{IndexRun, RunPolicy},
         queue::{ProgressHandle, Queue, QueueFull, QueueItem, Ticket},
         status::PlayerStatus,
+        time::UnixMillis,
     },
     util::Counter,
 };
 
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-/// Milliseconds since the epoch, now.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[derive(Debug, Clone)]
@@ -127,22 +121,22 @@ enum RunEnd {
 #[derive(Default)]
 struct Chunk {
     games: Vec<PlayerGame>,
-    latest_created_at: u64,
+    latest_created_at: UnixMillis,
     /// Earliest `createdAt` of the ongoing games of the chunk.
-    ongoing: Option<u64>,
+    ongoing: Option<UnixMillis>,
     name: Option<String>,
     /// For an interrupted revisit: where the next revisit continues.
-    revisit_from: Option<u64>,
+    revisit_from: Option<UnixMillis>,
     finish: Option<Finish>,
 }
 
 struct Finish {
-    indexed_at: u64,
+    indexed_at: UnixMillis,
     /// For a complete revisit: the new earliest ongoing game.
-    revisit: Option<Option<u64>>,
+    revisit: Option<Option<UnixMillis>>,
 }
 
-fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+fn min_opt<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -214,7 +208,7 @@ impl Indexer {
         if self
             .config
             .policy
-            .next_run(status.as_ref(), now_ms())
+            .next_run(status.as_ref(), UnixMillis::now())
             .is_none()
         {
             return Ok(Ticket::completed());
@@ -261,7 +255,11 @@ impl Indexer {
                 return;
             }
         };
-        let Some(run) = self.config.policy.next_run(status.as_ref(), now_ms()) else {
+        let Some(run) = self
+            .config
+            .policy
+            .next_run(status.as_ref(), UnixMillis::now())
+        else {
             // Indexed meanwhile.
             return;
         };
@@ -366,7 +364,7 @@ impl Indexer {
         let mut chunk = Chunk::default();
         let mut last_flush = Instant::now();
         // Ongoing games of this run, for the revisit pointer.
-        let mut ongoing: Option<u64> = None;
+        let mut ongoing: Option<UnixMillis> = None;
         let m = &self.metrics;
 
         let flush = async |chunk: &mut Chunk, finish: Option<Finish>| {
@@ -482,7 +480,7 @@ impl Indexer {
         // the checkpoint with the next request.
         let finish = match end {
             RunEnd::Complete | RunEnd::NotFound | RunEnd::Failed => Some(Finish {
-                indexed_at: now_ms(),
+                indexed_at: UnixMillis::now(),
                 revisit: (run.revisit && end == RunEnd::Complete).then_some(ongoing),
             }),
             RunEnd::Abandoned | RunEnd::Requeue => None,
@@ -502,7 +500,7 @@ impl Indexer {
 /// Where the next revisit continues after an interrupted one, which
 /// received the games created before `since` (and before, the ongoing
 /// games, the earliest of which is `ongoing`).
-fn revisit_from(ongoing: Option<u64>, since: u64) -> u64 {
+fn revisit_from(ongoing: Option<UnixMillis>, since: UnixMillis) -> UnixMillis {
     ongoing.map_or(since, |ongoing| ongoing.min(since))
 }
 
@@ -537,7 +535,7 @@ fn write_chunks(
         if chunk.games.is_empty()
             && chunk.finish.is_none()
             && chunk.revisit_from.is_none()
-            && chunk.latest_created_at == 0
+            && chunk.latest_created_at == UnixMillis::EPOCH
         {
             continue;
         }
@@ -598,12 +596,12 @@ mod tests {
     }
 
     const RUN: IndexRun = IndexRun {
-        since: 0,
+        since: UnixMillis(0),
         revisit: false,
     };
 
     const REVISIT: IndexRun = IndexRun {
-        since: 10,
+        since: UnixMillis(10),
         revisit: true,
     };
 
@@ -617,18 +615,18 @@ mod tests {
             vec![
                 Chunk {
                     games: games(2),
-                    latest_created_at: 100,
-                    ongoing: Some(60),
+                    latest_created_at: UnixMillis(100),
+                    ongoing: Some(UnixMillis(60)),
                     name: Some("Alice".to_owned()),
                     ..Chunk::default()
                 },
                 // Skipped.
                 Chunk::default(),
                 Chunk {
-                    latest_created_at: 120,
-                    ongoing: Some(50),
+                    latest_created_at: UnixMillis(120),
+                    ongoing: Some(UnixMillis(50)),
                     finish: Some(Finish {
-                        indexed_at: 1000,
+                        indexed_at: UnixMillis(1000),
                         revisit: None,
                     }),
                     ..Chunk::default()
@@ -638,10 +636,10 @@ mod tests {
         let status = status.unwrap();
         assert_eq!(status.games, 2);
         assert_eq!(status.name, "Alice");
-        assert_eq!(status.latest_created_at, 120);
-        assert_eq!(status.revisit_ongoing, Some(50));
-        assert_eq!(status.indexed_at, 1000);
-        assert_eq!(status.revisited_at, 0);
+        assert_eq!(status.latest_created_at, UnixMillis(120));
+        assert_eq!(status.revisit_ongoing, Some(UnixMillis(50)));
+        assert_eq!(status.indexed_at, UnixMillis(1000));
+        assert_eq!(status.revisited_at, UnixMillis(0));
         assert_eq!(ticket.progress().generation, 1);
         assert_eq!(db.status(db.user_hash(&status.user)).unwrap(), Some(status));
     }
@@ -649,26 +647,26 @@ mod tests {
     #[test]
     fn test_revisit() {
         let (_dir, db, mut status) = setup();
-        status.revisit_ongoing = Some(10);
+        status.revisit_ongoing = Some(UnixMillis(10));
         let (status, _) = write(
             &db,
             status,
             REVISIT,
             vec![Chunk {
                 games: games(1),
-                latest_created_at: 100,
+                latest_created_at: UnixMillis(100),
                 // Not the earliest ongoing game, which the run finds.
-                ongoing: Some(5),
+                ongoing: Some(UnixMillis(5)),
                 finish: Some(Finish {
-                    indexed_at: 1000,
-                    revisit: Some(Some(40)),
+                    indexed_at: UnixMillis(1000),
+                    revisit: Some(Some(UnixMillis(40))),
                 }),
                 ..Chunk::default()
             }],
         );
         let status = status.unwrap();
-        assert_eq!(status.revisit_ongoing, Some(40));
-        assert_eq!(status.revisited_at, 1000);
+        assert_eq!(status.revisit_ongoing, Some(UnixMillis(40)));
+        assert_eq!(status.revisited_at, UnixMillis(1000));
 
         // No ongoing games left.
         let (status, _) = write(
@@ -677,7 +675,7 @@ mod tests {
             REVISIT,
             vec![Chunk {
                 finish: Some(Finish {
-                    indexed_at: 2000,
+                    indexed_at: UnixMillis(2000),
                     revisit: Some(None),
                 }),
                 ..Chunk::default()
@@ -685,7 +683,7 @@ mod tests {
         );
         let status = status.unwrap();
         assert_eq!(status.revisit_ongoing, None);
-        assert_eq!(status.revisited_at, 2000);
+        assert_eq!(status.revisited_at, UnixMillis(2000));
     }
 
     /// An interrupted revisit continues from its checkpoint, and remains
@@ -693,28 +691,31 @@ mod tests {
     #[test]
     fn test_interrupted_revisit() {
         let (_dir, db, mut status) = setup();
-        status.revisit_ongoing = Some(10);
-        status.revisited_at = 500;
+        status.revisit_ongoing = Some(UnixMillis(10));
+        status.revisited_at = UnixMillis(500);
         let (status, _) = write(
             &db,
             status,
             REVISIT,
             vec![Chunk {
                 games: games(1),
-                latest_created_at: 100,
-                revisit_from: Some(revisit_from(Some(30), 70)),
+                latest_created_at: UnixMillis(100),
+                revisit_from: Some(revisit_from(Some(UnixMillis(30)), UnixMillis(70))),
                 ..Chunk::default()
             }],
         );
         let status = status.unwrap();
-        assert_eq!(status.revisit_ongoing, Some(30));
-        assert_eq!(status.revisited_at, 500);
-        assert_eq!(status.indexed_at, 0);
+        assert_eq!(status.revisit_ongoing, Some(UnixMillis(30)));
+        assert_eq!(status.revisited_at, UnixMillis(500));
+        assert_eq!(status.indexed_at, UnixMillis(0));
         let policy = RunPolicy::default();
         assert_eq!(
-            policy.next_run(Some(&status), 500 + policy.revisit_interval),
+            policy.next_run(
+                Some(&status),
+                UnixMillis(500 + policy.revisit_interval.as_millis() as u64)
+            ),
             Some(IndexRun {
-                since: 30,
+                since: UnixMillis(30),
                 revisit: true
             })
         );
@@ -722,8 +723,14 @@ mod tests {
 
     #[test]
     fn test_revisit_from() {
-        assert_eq!(revisit_from(None, 100), 100);
-        assert_eq!(revisit_from(Some(50), 100), 50);
-        assert_eq!(revisit_from(Some(150), 100), 100);
+        assert_eq!(revisit_from(None, UnixMillis(100)), UnixMillis(100));
+        assert_eq!(
+            revisit_from(Some(UnixMillis(50)), UnixMillis(100)),
+            UnixMillis(50)
+        );
+        assert_eq!(
+            revisit_from(Some(UnixMillis(150)), UnixMillis(100)),
+            UnixMillis(100)
+        );
     }
 }

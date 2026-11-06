@@ -10,6 +10,7 @@ use crate::{
     player::{
         UserId,
         keys::{Generation, MAX_COLD_BITS, PlayerGameIndex},
+        time::UnixMillis,
     },
 };
 
@@ -36,13 +37,13 @@ pub struct PlayerStatus {
     /// Games at the last rebuild.
     pub games_at_rebuild: u32,
     /// Latest `createdAt` of games received from lila (indexed or not).
-    pub latest_created_at: u64,
+    pub latest_created_at: UnixMillis,
     /// `createdAt` of the earliest game that was ongoing when last seen.
-    pub revisit_ongoing: Option<u64>,
+    pub revisit_ongoing: Option<UnixMillis>,
     /// When the last index run finished.
-    pub indexed_at: u64,
+    pub indexed_at: UnixMillis,
     /// When ongoing games were last revisited.
-    pub revisited_at: u64,
+    pub revisited_at: UnixMillis,
 }
 
 impl PlayerStatus {
@@ -54,10 +55,10 @@ impl PlayerStatus {
             cold_bits: ByColor::new_with(|_| 0),
             games: 0,
             games_at_rebuild: 0,
-            latest_created_at: 0,
+            latest_created_at: UnixMillis::EPOCH,
             revisit_ongoing: None,
-            indexed_at: 0,
-            revisited_at: 0,
+            indexed_at: UnixMillis::EPOCH,
+            revisited_at: UnixMillis::EPOCH,
         }
     }
 
@@ -71,14 +72,14 @@ impl PlayerStatus {
         buf.put_u8(self.cold_bits.black);
         pack_uint(buf, u64::from(self.games));
         pack_uint(buf, u64::from(self.games_at_rebuild));
-        pack_uint(buf, self.latest_created_at);
+        self.latest_created_at.pack(buf);
         pack_uint(
             buf,
             self.revisit_ongoing
-                .map_or(0, |t| t.checked_add(1).expect("valid revisit time")),
+                .map_or(0, |t| t.0.checked_add(1).expect("valid revisit time")),
         );
-        pack_uint(buf, self.indexed_at);
-        pack_uint(buf, self.revisited_at);
+        self.indexed_at.pack(buf);
+        self.revisited_at.pack(buf);
         pack_string(buf, self.user.as_str());
         pack_string(buf, &self.name);
     }
@@ -97,10 +98,10 @@ impl PlayerStatus {
         };
         let games = unpack_u32(buf);
         let games_at_rebuild = unpack_u32(buf);
-        let latest_created_at = unpack_uint(buf);
-        let revisit_ongoing = unpack_uint(buf).checked_sub(1);
-        let indexed_at = unpack_uint(buf);
-        let revisited_at = unpack_uint(buf);
+        let latest_created_at = UnixMillis::unpack(buf);
+        let revisit_ongoing = unpack_uint(buf).checked_sub(1).map(UnixMillis);
+        let indexed_at = UnixMillis::unpack(buf);
+        let revisited_at = UnixMillis::unpack(buf);
         let user = UserId::from_name(unpack_string(buf)).expect("valid user id");
         let name = unpack_string(buf).to_owned();
         PlayerStatus {
@@ -143,7 +144,7 @@ impl Arbitrary<'_> for PlayerStatus {
             latest_created_at: u.arbitrary()?,
             revisit_ongoing: u
                 .arbitrary::<bool>()?
-                .then(|| u.int_in_range(0..=u64::MAX - 1))
+                .then(|| u.int_in_range(0..=u64::MAX - 1).map(UnixMillis))
                 .transpose()?,
             indexed_at: u.arbitrary()?,
             revisited_at: u.arbitrary()?,

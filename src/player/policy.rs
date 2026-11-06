@@ -1,19 +1,21 @@
-use crate::player::status::PlayerStatus;
+use std::time::Duration;
+
+use crate::player::{status::PlayerStatus, time::UnixMillis};
 
 /// When to index a player.
 #[derive(Debug, Clone, Copy)]
 pub struct RunPolicy {
-    /// No new index run within this time after the last one (ms).
-    pub cooldown: u64,
-    /// Ongoing games are revisited at most this often (ms).
-    pub revisit_interval: u64,
+    /// No new index run within this time after the last one.
+    pub cooldown: Duration,
+    /// Ongoing games are revisited at most this often.
+    pub revisit_interval: Duration,
 }
 
 impl Default for RunPolicy {
     fn default() -> RunPolicy {
         RunPolicy {
-            cooldown: 2 * 60 * 1000,
-            revisit_interval: 24 * 60 * 60 * 1000,
+            cooldown: Duration::from_secs(2 * 60),
+            revisit_interval: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -22,25 +24,25 @@ impl Default for RunPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexRun {
     /// Request games with `createdAt >= since`.
-    pub since: u64,
+    pub since: UnixMillis,
     /// Revisits ongoing games (and also gets all newer games).
     pub revisit: bool,
 }
 
 impl RunPolicy {
     /// The run to do now, if any.
-    pub fn next_run(&self, status: Option<&PlayerStatus>, now: u64) -> Option<IndexRun> {
+    pub fn next_run(&self, status: Option<&PlayerStatus>, now: UnixMillis) -> Option<IndexRun> {
         let Some(status) = status else {
             return Some(IndexRun {
-                since: 0,
+                since: UnixMillis::EPOCH,
                 revisit: false,
             });
         };
-        if now.saturating_sub(status.indexed_at) < self.cooldown {
+        if now.elapsed_since(status.indexed_at) < self.cooldown {
             return None;
         }
         if let Some(ongoing) = status.revisit_ongoing
-            && now.saturating_sub(status.revisited_at) >= self.revisit_interval
+            && now.elapsed_since(status.revisited_at) >= self.revisit_interval
         {
             return Some(IndexRun {
                 since: ongoing,
@@ -66,41 +68,32 @@ mod tests {
     fn test_next_run() {
         let policy = RunPolicy::default();
         let alice = UserId::from_name("alice").unwrap();
-        assert_eq!(
-            policy.next_run(None, 0),
+        let run = |since, revisit| {
             Some(IndexRun {
-                since: 0,
-                revisit: false
+                since: UnixMillis(since),
+                revisit,
             })
-        );
+        };
+        assert_eq!(policy.next_run(None, UnixMillis(0)), run(0, false));
         let mut status = PlayerStatus::new(alice);
         status.games = 10;
-        status.latest_created_at = 1000;
+        status.latest_created_at = UnixMillis(1000);
         let t = 100_000_000_000;
-        status.indexed_at = t;
-        assert_eq!(policy.next_run(Some(&status), t + 60_000), None);
+        status.indexed_at = UnixMillis(t);
+        assert_eq!(policy.next_run(Some(&status), UnixMillis(t + 60_000)), None);
         assert_eq!(
-            policy.next_run(Some(&status), t + 120_000),
-            Some(IndexRun {
-                since: 1000,
-                revisit: false
-            })
+            policy.next_run(Some(&status), UnixMillis(t + 120_000)),
+            run(1000, false)
         );
-        status.revisit_ongoing = Some(500);
+        status.revisit_ongoing = Some(UnixMillis(500));
         assert_eq!(
-            policy.next_run(Some(&status), t + 120_000),
-            Some(IndexRun {
-                since: 500,
-                revisit: true
-            })
+            policy.next_run(Some(&status), UnixMillis(t + 120_000)),
+            run(500, true)
         );
-        status.revisited_at = t;
+        status.revisited_at = UnixMillis(t);
         assert_eq!(
-            policy.next_run(Some(&status), t + 120_000),
-            Some(IndexRun {
-                since: 1000,
-                revisit: false
-            })
+            policy.next_run(Some(&status), UnixMillis(t + 120_000)),
+            run(1000, false)
         );
     }
 }

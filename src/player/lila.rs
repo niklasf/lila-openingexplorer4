@@ -11,8 +11,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     lila_variant::LilaVariant,
-    packed::{GameId, Month, PackedMoves, Rating, RatingMode, Speed},
-    player::{UserId, game::PlayerGame},
+    packed::{GameId, PackedMoves, Rating, RatingMode, Speed},
+    player::{UserId, game::PlayerGame, time::UnixMillis},
 };
 
 #[derive(Debug, Clone)]
@@ -108,12 +108,12 @@ pub struct Slot {
 }
 
 impl Slot {
-    /// Requests the games of a user created since a time (ms), oldest
+    /// Requests the games of a user created since a time, oldest
     /// first, including ongoing games.
     pub async fn user_games(
         &mut self,
         user: &UserId,
-        since: u64,
+        since: UnixMillis,
     ) -> Result<GameStream<'_>, LilaError> {
         let config = &self.client.config;
         let mut request = self
@@ -246,8 +246,8 @@ pub struct ExportGame {
     pub rated: bool,
     pub variant: String,
     pub speed: String,
-    pub created_at: u64,
-    pub last_move_at: u64,
+    pub created_at: UnixMillis,
+    pub last_move_at: UnixMillis,
     pub status: String,
     pub players: ExportPlayers,
     #[serde(default)]
@@ -379,7 +379,7 @@ impl ExportGame {
                 } else {
                     RatingMode::Unrated
                 },
-                month: Month::from_unix_ms(self.last_move_at),
+                month: self.last_move_at.month(),
                 outcome: match self.winner.as_deref() {
                     Some("white") => KnownOutcome::Decisive {
                         winner: Color::White,
