@@ -33,6 +33,23 @@ impl PackedMoves {
     pub fn decode(&self) -> Result<PackedMovesDecoder<'_>, InvalidPackedMoves> {
         PackedMovesDecoder::new(&self.0)
     }
+
+    pub fn truncated(
+        bytes: &[u8],
+        mut pos: VariantPosition,
+        max_ply: usize,
+    ) -> Result<PackedMoves, InvalidPackedMoves> {
+        let mut decoder = PackedMovesDecoder::new(bytes)?;
+        let mut encoder = PackedMoves::encoder_with_capacity(max_ply);
+        for _ in 0..max_ply {
+            let Some(m) = decoder.decode_next(&pos)? else {
+                break;
+            };
+            encoder.encode_next(&pos, m);
+            pos.play_unchecked(m);
+        }
+        Ok(encoder.finish())
+    }
 }
 
 pub struct PackedMovesEncoder {
@@ -260,33 +277,53 @@ mod tests {
 
     use super::*;
 
+    struct Game {
+        pos: VariantPosition,
+        moves: Vec<Move>,
+    }
+
+    impl Arbitrary<'_> for Game {
+        fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+            let len: usize = u.arbitrary_len::<usize>()?;
+            let mut game = Game {
+                pos: u.arbitrary()?,
+                moves: Vec::with_capacity(len),
+            };
+
+            let mut pos = game.pos.clone();
+            for _ in 0..len {
+                let legals = pos.legal_moves();
+                let Ok(&m) = u.choose(&legals) else { break };
+                pos.play_unchecked(m);
+                game.moves.push(m);
+            }
+
+            Ok(game)
+        }
+    }
+
+    /// Truncated moves are the first moves, packed like those alone (so
+    /// unchanged if there are no more).
+    #[test]
+    fn test_truncated() {
+        arbtest(|u| {
+            let game: Game = u.arbitrary()?;
+            let max_ply = u.int_in_range(0..=game.moves.len() + 2)?;
+            let packed = PackedMoves::encode(&mut game.pos.clone(), game.moves.iter().copied());
+            let expected = PackedMoves::encode(
+                &mut game.pos.clone(),
+                game.moves.iter().copied().take(max_ply),
+            );
+            assert_eq!(
+                PackedMoves::truncated(&packed.0, game.pos.clone(), max_ply).unwrap(),
+                expected
+            );
+            Ok(())
+        });
+    }
+
     #[test]
     fn test_moves_roundtrip() {
-        struct Game {
-            pos: VariantPosition,
-            moves: Vec<Move>,
-        }
-
-        impl Arbitrary<'_> for Game {
-            fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-                let len: usize = u.arbitrary_len::<usize>()?;
-                let mut game = Game {
-                    pos: u.arbitrary()?,
-                    moves: Vec::with_capacity(len),
-                };
-
-                let mut pos = game.pos.clone();
-                for _ in 0..len {
-                    let legals = pos.legal_moves();
-                    let Ok(&m) = u.choose(&legals) else { break };
-                    pos.play_unchecked(m);
-                    game.moves.push(m);
-                }
-
-                Ok(game)
-            }
-        }
-
         arbtest(|u| {
             let game: Game = u.arbitrary()?;
 

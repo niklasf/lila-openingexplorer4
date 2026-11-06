@@ -232,7 +232,8 @@ struct ServeArgs {
     cors: bool,
     /// Games were indexed up to this ply by parquet_to_positions (0 for all
     /// plies). Must match, or games reaching a position later would be
-    /// found (or missed) inconsistently.
+    /// found (or missed) inconsistently. The moves stored by parquet_to_games
+    /// (its --max-ply) must reach at least this far.
     #[arg(long, default_value = "50")]
     max_ply: usize,
     /// Do not look up cold positions: positions reached by a single game

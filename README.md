@@ -46,8 +46,9 @@ explorer masters --db /hdd/masters/db --bind 127.0.0.1:9003 --cors \
   left out of top, recent, and single-move games; statistics still count
   them. Without access, updates fail and are retried every minute.
   `--no-blacklist` to disable.
-* `--max-ply` must match the indexing run: 50 (the default) for lichess,
-  0 (all plies) for masters.
+* `--max-ply` must match the indexing runs (of `parquet_to_positions` and
+  `parquet_to_games`): 50 (the default) for lichess, 0 (all plies) for
+  masters.
 
 Replay an nginx request log (tab separated `$msec`, `$status`,
 `$request_time`, `$upstream_response_time`, `$request_uri`) against both:
@@ -78,10 +79,13 @@ stress_explorer requests.tsv.zst \
 3. Walk the parquet files to produce SSTs indexed by game id.
 
    ```sh
-   parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games
+   parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games --max-ply 50
    ```
 
-# #Todo
+   `--max-ply 50` stores the moves only up to the indexed ply. Masters must keep
+   all moves (the default, 0), for `/masters/pgn`.
+
+## Todo
 
 ### Indexing from scratch
 
@@ -122,7 +126,7 @@ Needs HDDs:
 
 Minor things:
 
-* [ ] Performance rating
+* [x] Performance rating
 * [x] Banned player blacklist
 * [ ] Unify masters/lichess API
 * [ ] RocksDB PerfStatsLevel mismatch (patch prepared)
