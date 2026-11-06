@@ -1527,6 +1527,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "env_logger",
+ "futures-util",
  "getrandom 0.3.4",
  "hmac",
  "indicatif",
