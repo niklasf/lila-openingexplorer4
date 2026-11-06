@@ -14,8 +14,8 @@ pub struct RecentGameIds {
 impl RecentGameIds {
     pub fn new() -> Self {
         // Enough to deal with historical timezone inconsistency, causing
-        // March/April 2018 games to overlap (assuming the monthly files are
-        // indexed consecutively).
+        // March/April 2018 games to overlap (assuming the games of each
+        // variant are tracked separately).
         Self::with_generation_len(100_000)
     }
 

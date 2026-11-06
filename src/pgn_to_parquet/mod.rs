@@ -36,7 +36,7 @@ use parquet::{
 pub use pgn::GameVisitor;
 use pgn_reader::Reader as PgnReader;
 
-use crate::{packed::GameId, parquet::GameColumns};
+use crate::{lila_variant::LilaVariant, packed::GameId, parquet::GameColumns};
 
 const TYPICAL_GAME_BYTES: usize = 2500;
 
@@ -192,7 +192,8 @@ struct Encoded {
     seq: usize,
     /// Encoded parquet with a single row group.
     parquet: Bytes,
-    game_ids: Vec<GameId>,
+    /// For deduplication.
+    game_ids: Vec<(LilaVariant, GameId)>,
     /// Games the parser found, and games the splitter found.
     parsed: usize,
     expected: usize,
@@ -290,9 +291,10 @@ fn encode_chunk(
             continue;
         }
 
+        let variant = game.lila_variant();
         match game.into_game() {
             Ok((game_id, game)) => {
-                game_ids.push(game_id);
+                game_ids.push((variant, game_id));
                 columns.push(game_id, game);
                 stats.games += 1;
             }
@@ -548,7 +550,9 @@ pub fn convert(
         let mut pending: BTreeMap<(FileId, usize), Encoded> = BTreeMap::new();
         let mut file_chunks: HashMap<FileId, usize> = HashMap::new();
         let mut next = (FileId::default(), 0);
-        let mut recent_game_ids = RecentGameIds::new();
+        // Per variant, because files are ordered by month across variants,
+        // while duplicates are between consecutive months of a variant.
+        let mut recent_game_ids: HashMap<LilaVariant, RecentGameIds> = HashMap::new();
         let mut file_stats = Stats::default();
         let mut file_started = Instant::now();
         let mut total = Stats::default();
@@ -579,12 +583,9 @@ pub fn convert(
                     }
 
                     keep.clear();
-                    keep.extend(
-                        encoded
-                            .game_ids
-                            .iter()
-                            .map(|&game_id| recent_game_ids.insert(game_id)),
-                    );
+                    keep.extend(encoded.game_ids.iter().map(|&(variant, game_id)| {
+                        recent_game_ids.entry(variant).or_default().insert(game_id)
+                    }));
                     let kept = keep.iter().filter(|&&k| k).count() as u64;
                     file_stats.add(&Stats {
                         duplicates: encoded.stats.games - kept,

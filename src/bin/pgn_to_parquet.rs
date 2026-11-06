@@ -20,9 +20,9 @@ static ALLOC: Jemalloc = Jemalloc;
 /// Unplayed games (fewer than two plies), unfinished games (without a known
 /// outcome), and games that cannot be parsed are skipped.
 ///
-/// Games whose id already appeared among the recent games (at least
-/// the previous 100k, also across consecutive files) are skipped as
-/// duplicates.
+/// Games whose id already appeared among the recent games of the same
+/// variant (by `Variant` tag, at least the previous 100k, also across
+/// files, like consecutive months) are skipped as duplicates.
 #[derive(Parser)]
 struct Args {
     pgns: Vec<PathBuf>,

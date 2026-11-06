@@ -9,8 +9,9 @@ use shakmaty::{
     variant::{Variant, VariantPosition},
 };
 
-use crate::packed::{
-    GameId, GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode, Speed,
+use crate::{
+    lila_variant::LilaVariant,
+    packed::{GameId, GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode, Speed},
 };
 
 pub struct GameVisitor;
@@ -26,7 +27,7 @@ pub struct ParsedGame {
     black_title: Option<String>,
     speed: Option<Speed>,
     date: Option<LaxDate>,
-    variant: Option<Variant>,
+    variant: Option<LilaVariant>,
     fen: Option<Fen>,
     moves: Vec<San>,
     outcome: Option<Outcome>,
@@ -36,9 +37,12 @@ impl ParsedGame {
     fn visit_tag(&mut self, name: &[u8], value: RawTag<'_>) -> io::Result<()> {
         match name {
             b"Site" => {
+                // https://lichess.org/{id}, since 2026-10 also
+                // https://lichess.org/game/{id}.
                 self.game_id = value
                     .as_bytes()
                     .strip_prefix(b"https://lichess.org/")
+                    .map(|path| path.strip_prefix(b"game/").unwrap_or(path))
                     .map(GameId::from_ascii)
                     .transpose()
                     .map_err(|err| {
@@ -147,17 +151,18 @@ impl ParsedGame {
                 )?);
             }
             b"Variant" => {
-                self.variant = Some(Variant::from_ascii(value.as_bytes()).map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid Variant tag {:?}: {} @ {:?}",
-                            value.decode_utf8_lossy(),
-                            err,
-                            self.game_id
-                        ),
-                    )
-                })?);
+                self.variant =
+                    Some(LilaVariant::from_pgn_tag(value.as_bytes()).map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid Variant tag {:?}: {} @ {:?}",
+                                value.decode_utf8_lossy(),
+                                err,
+                                self.game_id
+                            ),
+                        )
+                    })?);
             }
             b"FEN" => {
                 self.fen = Some(Fen::from_ascii(value.as_bytes()).map_err(|err| {
@@ -193,12 +198,16 @@ impl ParsedGame {
         self.moves.len()
     }
 
+    pub fn lila_variant(&self) -> LilaVariant {
+        self.variant.unwrap_or_default()
+    }
+
     pub fn outcome(&self) -> Outcome {
         self.outcome.unwrap_or(Outcome::Unknown)
     }
 
     fn initial_position(&self) -> io::Result<(VariantPosition, Option<PackedSetup>)> {
-        let variant = self.variant.unwrap_or_default();
+        let variant = self.lila_variant().variant();
 
         let (pos, need_setup) = match self.fen.clone() {
             None => (VariantPosition::new(variant), variant != Variant::Chess),
@@ -355,5 +364,32 @@ impl Visitor for GameVisitor {
 
     fn end_game(&mut self, movetext: Self::Movetext) -> Self::Output {
         Ok(movetext)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pgn_reader::Reader;
+
+    use super::*;
+
+    fn game_ids(pgn: &str) -> Vec<String> {
+        Reader::new(pgn.as_bytes())
+            .read_games(&mut GameVisitor)
+            .map(|game| {
+                game.expect("io")
+                    .expect("valid game")
+                    .game_id()
+                    .expect("game id")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_site_formats() {
+        let pgn = "[Site \"https://lichess.org/bcRJNu4b\"]\n\n1. e4 e5 0-1\n\n\
+                   [Site \"https://lichess.org/game/Q8ku5wgM\"]\n\n1. d4 d5 1/2-1/2\n";
+        assert_eq!(game_ids(pgn), ["bcRJNu4b", "Q8ku5wgM"]);
     }
 }

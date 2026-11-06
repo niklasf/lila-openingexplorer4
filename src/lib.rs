@@ -1,4 +1,5 @@
 pub mod intermediate;
+pub mod lila_variant;
 pub mod masters_to_parquet;
 pub mod packed;
 pub mod parquet;
