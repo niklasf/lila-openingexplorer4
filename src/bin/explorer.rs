@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, process, thread, time::Duration};
+use std::{
+    fs,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    process, thread,
+    time::Duration,
+};
 
 use clap::{Args, Parser, Subcommand};
 use lila_openingexplorer4::{
@@ -160,7 +167,7 @@ struct LilaArgs {
     /// Token of https://lichess.org/@/OpeningExplorer, for the blacklist.
     #[arg(long, env = "EXPLORER_BEARER", hide_env_values = true)]
     lila_bearer: Option<String>,
-    /// File with the token, read before each update.
+    /// File with the token, read once at startup.
     #[arg(long, env = "EXPLORER_BEARER_FILE", conflicts_with = "lila_bearer")]
     lila_bearer_file: Option<PathBuf>,
     /// Seconds between blacklist updates.
@@ -231,6 +238,19 @@ fn main() {
     }
 }
 
+/// The token, or the token from the file (exits if it cannot be read).
+fn bearer(bearer: Option<String>, file: Option<&Path>) -> Option<String> {
+    bearer.or_else(|| {
+        file.map(|file| match fs::read_to_string(file) {
+            Ok(bearer) => bearer.trim().to_owned(),
+            Err(err) => {
+                eprintln!("error: reading bearer file {}: {err}", file.display());
+                process::exit(1);
+            }
+        })
+    })
+}
+
 fn run(kind: Kind, args: ServeArgs) {
     raise_fd_limit();
     let blocking_threads = args.blocking_threads.unwrap_or_else(|| {
@@ -252,8 +272,7 @@ fn run(kind: Kind, args: ServeArgs) {
         no_openings: args.no_openings,
         blacklist: (kind == Kind::Lichess && !args.lila.no_blacklist).then(|| LilaConfig {
             url: args.lila.lila.trim_end_matches('/').to_owned(),
-            bearer: args.lila.lila_bearer,
-            bearer_file: args.lila.lila_bearer_file,
+            bearer: bearer(args.lila.lila_bearer, args.lila.lila_bearer_file.as_deref()),
             refresh: Duration::from_secs(args.lila.blacklist_refresh),
         }),
     };

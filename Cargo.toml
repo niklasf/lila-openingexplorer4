@@ -38,6 +38,7 @@ tower-http = { version = "0.6", features = ["set-header"] }
 zstd = "0.13.3"
 hmac = "0.12"
 getrandom = "0.3"
+memchr = "2"
 
 [dev-dependencies]
 arbtest = "0.3.2"

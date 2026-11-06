@@ -1,7 +1,5 @@
 use std::{
     collections::HashSet,
-    fs, io,
-    path::PathBuf,
     sync::RwLock,
     time::{Duration, SystemTime},
 };
@@ -14,9 +12,6 @@ pub struct LilaConfig {
     /// Token of https://lichess.org/@/OpeningExplorer, for the internal
     /// endpoint.
     pub bearer: Option<String>,
-    /// File with the token, read before each request (so that it can be
-    /// rotated).
-    pub bearer_file: Option<PathBuf>,
     /// Time between updates.
     pub refresh: Duration,
 }
@@ -25,8 +20,6 @@ pub struct LilaConfig {
 pub enum BlacklistError {
     #[error("request: {0}")]
     Request(#[from] reqwest::Error),
-    #[error("bearer file: {0}")]
-    BearerFile(#[from] io::Error),
     #[error("invalid user name in response: {0:?}")]
     InvalidName(String),
 }
@@ -106,8 +99,6 @@ pub async fn fetch_marked_since(
         ));
         if let Some(bearer) = &config.bearer {
             request = request.bearer_auth(bearer);
-        } else if let Some(file) = &config.bearer_file {
-            request = request.bearer_auth(fs::read_to_string(file)?.trim());
         }
         let mut response = request.send().await?.error_for_status()?;
         let mut pending = Vec::new();

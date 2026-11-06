@@ -2,6 +2,8 @@ pub mod aggregate;
 pub mod db;
 pub mod game;
 pub mod keys;
+pub mod lila;
+pub mod policy;
 pub mod status;
 #[cfg(test)]
 mod tests;

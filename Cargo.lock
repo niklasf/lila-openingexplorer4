@@ -1532,6 +1532,7 @@ dependencies = [
  "indicatif",
  "libc",
  "log",
+ "memchr",
  "moka",
  "nohash-hasher",
  "parquet",

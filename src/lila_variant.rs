@@ -34,6 +34,29 @@ impl LilaVariant {
         LilaVariant::ThreeCheck,
     ];
 
+    /// Parses a key of lila's API, like `kingOfTheHill`.
+    pub fn from_key(key: &str) -> Result<LilaVariant, UnknownLilaVariant> {
+        LilaVariant::ALL
+            .into_iter()
+            .find(|variant| variant.key() == key)
+            .ok_or(UnknownLilaVariant)
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            LilaVariant::Standard => "standard",
+            LilaVariant::Chess960 => "chess960",
+            LilaVariant::FromPosition => "fromPosition",
+            LilaVariant::Antichess => "antichess",
+            LilaVariant::Atomic => "atomic",
+            LilaVariant::Crazyhouse => "crazyhouse",
+            LilaVariant::Horde => "horde",
+            LilaVariant::KingOfTheHill => "kingOfTheHill",
+            LilaVariant::RacingKings => "racingKings",
+            LilaVariant::ThreeCheck => "threeCheck",
+        }
+    }
+
     pub fn from_pgn_tag(value: &[u8]) -> Result<LilaVariant, UnknownLilaVariant> {
         Ok(match value {
             b"Standard" => LilaVariant::Standard,
@@ -84,6 +107,14 @@ impl LilaVariant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_key_roundtrip() {
+        for variant in LilaVariant::ALL {
+            assert_eq!(LilaVariant::from_key(variant.key()).unwrap(), variant);
+        }
+        assert!(LilaVariant::from_key("Chess960").is_err());
+    }
 
     #[test]
     fn test_pgn_tag_roundtrip() {
