@@ -1,6 +1,7 @@
 pub mod aggregate;
 pub mod db;
 pub mod game;
+pub mod indexer;
 pub mod keys;
 pub mod lila;
 pub mod policy;

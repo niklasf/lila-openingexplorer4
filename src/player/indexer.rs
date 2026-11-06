@@ -1,0 +1,729 @@
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
+
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task,
+};
+
+use crate::{
+    player::{
+        PlayerDb, PlayerDbError, UserId,
+        game::PlayerGame,
+        lila::{Classified, ExportGame, LilaClient, LilaError, Skip},
+        policy::{IndexRun, RunPolicy},
+        queue::{ProgressHandle, Queue, QueueFull, QueueItem, Ticket},
+        status::PlayerStatus,
+    },
+    util::Counter,
+};
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Milliseconds since the epoch, now.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexerConfig {
+    /// Parallel index runs (each with one stream from lila).
+    pub indexers: usize,
+    /// Players waiting at most.
+    pub queue_capacity: usize,
+    /// Queue players that have an index (incremental runs) before first
+    /// runs.
+    pub known_first: bool,
+    pub policy: RunPolicy,
+    /// Games per chunk at most.
+    pub chunk_games: usize,
+    /// A chunk is written at the latest after this time, so that waiting
+    /// requests see progress.
+    pub chunk_interval: Duration,
+    /// Index runs give up their stream after this time and continue at the
+    /// end of the queue (`None` to run until all games are indexed).
+    pub max_run: Option<Duration>,
+    /// Rebuild a player after `max(rebuild_min_games, rebuild_factor *
+    /// games at the last rebuild)` new games.
+    pub rebuild_min_games: u32,
+    pub rebuild_factor: f64,
+    /// Parallel rebuilds at most.
+    pub rebuilds: usize,
+    /// Retries of a failed request or stream in a row (without games
+    /// received between), in the same slot.
+    pub retries: u32,
+    /// Delay before the first retry, growing linearly with each failure in
+    /// a row.
+    pub retry_delay: Duration,
+}
+
+impl Default for IndexerConfig {
+    fn default() -> IndexerConfig {
+        IndexerConfig {
+            indexers: 8,
+            queue_capacity: 2000,
+            known_first: true,
+            policy: RunPolicy::default(),
+            chunk_games: 2000,
+            chunk_interval: Duration::from_secs(1),
+            max_run: Some(Duration::from_secs(30)),
+            rebuild_min_games: 1000,
+            rebuild_factor: 0.5,
+            rebuilds: 1,
+            retries: 3,
+            retry_delay: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Counters of the indexers, for `/monitor`.
+#[derive(Default)]
+pub struct IndexerMetrics {
+    pub runs: Counter,
+    pub runs_complete: Counter,
+    pub runs_not_found: Counter,
+    pub runs_failed: Counter,
+    pub runs_abandoned: Counter,
+    pub runs_requeued: Counter,
+    pub games_received: Counter,
+    pub skipped_ongoing: Counter,
+    pub skipped_unfinished: Counter,
+    pub skipped_anonymous: Counter,
+    pub skipped_invalid: Counter,
+    pub malformed_lines: Counter,
+    pub lila_errors: Counter,
+    pub lila_timeouts: Counter,
+    pub stream_retries: Counter,
+    /// Time that streams waited for chunk writes.
+    pub writer_wait_micros: Counter,
+    /// Time that streams were open.
+    pub stream_micros: Counter,
+    pub rebuild_errors: Counter,
+    pub queue_full: Counter,
+}
+
+/// How an index run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunEnd {
+    /// All games received.
+    Complete,
+    /// Unknown or closed account.
+    NotFound,
+    /// Too many errors.
+    Failed,
+    /// No request waits for the player any more.
+    Abandoned,
+    /// Out of time, to continue later.
+    Requeue,
+}
+
+/// A chunk of an index run, for the writer.
+#[derive(Default)]
+struct Chunk {
+    games: Vec<PlayerGame>,
+    latest_created_at: u64,
+    /// Earliest `createdAt` of the ongoing games of the chunk.
+    ongoing: Option<u64>,
+    name: Option<String>,
+    /// For an interrupted revisit: where the next revisit continues.
+    revisit_from: Option<u64>,
+    finish: Option<Finish>,
+}
+
+struct Finish {
+    indexed_at: u64,
+    /// For a complete revisit: the new earliest ongoing game.
+    revisit: Option<Option<u64>>,
+}
+
+fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+pub struct Indexer {
+    queue: Arc<Queue>,
+    db: Arc<PlayerDb>,
+    lila: Arc<LilaClient>,
+    config: IndexerConfig,
+    rebuilds: Arc<Semaphore>,
+    pub metrics: IndexerMetrics,
+}
+
+impl Indexer {
+    /// Starts the indexer tasks.
+    pub fn start(db: Arc<PlayerDb>, lila: Arc<LilaClient>, config: IndexerConfig) -> Arc<Indexer> {
+        let indexer = Arc::new(Indexer {
+            queue: Arc::new(Queue::new(config.queue_capacity, config.known_first)),
+            rebuilds: Arc::new(Semaphore::new(config.rebuilds.max(1))),
+            db,
+            lila,
+            config,
+            metrics: IndexerMetrics::default(),
+        });
+        for idx in 0..indexer.config.indexers {
+            let indexer = Arc::clone(&indexer);
+            task::spawn(async move {
+                loop {
+                    let item = indexer.queue.acquire().await;
+                    indexer.index(idx, item).await;
+                }
+            });
+        }
+        indexer
+    }
+
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    pub fn lila(&self) -> &LilaClient {
+        &self.lila
+    }
+
+    pub fn db(&self) -> &Arc<PlayerDb> {
+        &self.db
+    }
+
+    /// The ticket for a request of the player: queues the player if an index
+    /// run is due.
+    pub async fn request(&self, user: &UserId) -> Result<Ticket, QueueFull> {
+        if let Some(ticket) = self.queue.watch(user) {
+            return Ok(ticket);
+        }
+        let db = Arc::clone(&self.db);
+        let uh = db.user_hash(user);
+        let status = task::spawn_blocking(move || db.status(uh))
+            .await
+            .expect("status task");
+        let status = match status {
+            Ok(status) => status,
+            Err(err) => {
+                log::error!("reading status of {user}: {err}");
+                return Ok(Ticket::completed());
+            }
+        };
+        if self
+            .config
+            .policy
+            .next_run(status.as_ref(), now_ms())
+            .is_none()
+        {
+            return Ok(Ticket::completed());
+        }
+        let known = status.is_some_and(|status| status.games > 0);
+        self.queue.submit(user.clone(), known).inspect_err(|_| {
+            self.metrics.queue_full.inc();
+        })
+    }
+
+    /// Deletes all data of the player, after waiting for a running index
+    /// run or rebuild of the player to end. Requests waiting for the player
+    /// get a new first run afterwards. Returns whether the player was
+    /// indexed.
+    pub async fn delete(&self, user: &UserId) -> Result<bool, PlayerDbError> {
+        let _busy = self.queue.reserve(user).await;
+        let db = Arc::clone(&self.db);
+        let uh = db.user_hash(user);
+        let existed = task::spawn_blocking(move || -> Result<bool, PlayerDbError> {
+            let existed = db.status(uh)?.is_some();
+            db.delete_player(uh)?;
+            Ok(existed)
+        })
+        .await
+        .expect("delete task")?;
+        log::info!(
+            "deleted {user}{}",
+            if existed { "" } else { " (was not indexed)" }
+        );
+        Ok(existed)
+    }
+
+    async fn index(self: &Arc<Self>, idx: usize, item: QueueItem) {
+        let user = item.user().clone();
+        let uh = self.db.user_hash(&user);
+        let db = Arc::clone(&self.db);
+        let status = match task::spawn_blocking(move || db.status(uh))
+            .await
+            .expect("status task")
+        {
+            Ok(status) => status,
+            Err(err) => {
+                log::error!("indexer {idx:02}: reading status of {user}: {err}");
+                return;
+            }
+        };
+        let Some(run) = self.config.policy.next_run(status.as_ref(), now_ms()) else {
+            // Indexed meanwhile.
+            return;
+        };
+        let status = status.unwrap_or_else(|| PlayerStatus::new(user.clone()));
+        let games_before = status.games;
+        self.metrics.runs.inc();
+        let started = Instant::now();
+        log::debug!(
+            "indexer {idx:02}: starting {user} since {}{}",
+            run.since,
+            if run.revisit { " (revisit)" } else { "" }
+        );
+
+        let (tx, rx) = mpsc::channel::<Chunk>(2);
+        let writer = {
+            let db = Arc::clone(&self.db);
+            let progress = item.progress();
+            task::spawn_blocking(move || write_chunks(&db, status, run, rx, progress))
+        };
+        let end = self.stream(idx, &item, &user, run, &tx).await;
+        drop(tx);
+        let status = writer.await.expect("writer task");
+
+        let counter = match end {
+            RunEnd::Complete => &self.metrics.runs_complete,
+            RunEnd::NotFound => &self.metrics.runs_not_found,
+            RunEnd::Failed => &self.metrics.runs_failed,
+            RunEnd::Abandoned => &self.metrics.runs_abandoned,
+            RunEnd::Requeue => &self.metrics.runs_requeued,
+        };
+        counter.inc();
+        let Some(status) = status else {
+            return;
+        };
+        let new_games = status.games - games_before;
+        let elapsed = started.elapsed();
+        if new_games > 0 || end != RunEnd::Complete {
+            log::info!(
+                "indexer {idx:02}: {user}: {new_games} new games in {elapsed:.3?} ({:.0} games/s), {end:?}",
+                f64::from(new_games) / elapsed.as_secs_f64()
+            );
+        }
+
+        if end == RunEnd::Requeue && !item.abandoned() {
+            item.requeue();
+            return;
+        }
+        if end != RunEnd::Requeue
+            && self.db.rebuild_due(
+                &status,
+                self.config.rebuild_min_games,
+                self.config.rebuild_factor,
+            )
+        {
+            let busy = item.finish_busy();
+            let indexer = Arc::clone(self);
+            task::spawn(async move {
+                let _permit = Arc::clone(&indexer.rebuilds)
+                    .acquire_owned()
+                    .await
+                    .expect("rebuild semaphore");
+                let db = Arc::clone(&indexer.db);
+                let started = Instant::now();
+                match task::spawn_blocking(move || db.rebuild(uh))
+                    .await
+                    .expect("rebuild task")
+                {
+                    Ok(Some(stats)) => log::info!(
+                        "rebuilt {user} in {:.3?}: {} games, {} warm, {} cold groups, {} bytes{}",
+                        started.elapsed(),
+                        stats.games,
+                        stats.warm_entries,
+                        stats.cold_groups,
+                        stats.bytes,
+                        if stats.ingested { ", ingested" } else { "" }
+                    ),
+                    Ok(None) => (),
+                    Err(err) => {
+                        indexer.metrics.rebuild_errors.inc();
+                        log::error!("rebuilding {user}: {err}");
+                    }
+                }
+                drop(busy);
+            });
+        }
+    }
+
+    /// Streams the games of the run from lila into chunks for the writer.
+    async fn stream(
+        &self,
+        idx: usize,
+        item: &QueueItem,
+        user: &UserId,
+        run: IndexRun,
+        tx: &mpsc::Sender<Chunk>,
+    ) -> RunEnd {
+        let max_ply = self.db.config().max_ply;
+        let mut slot = self.lila.slot().await;
+        let started = Instant::now();
+        let mut since = run.since;
+        let mut failures = 0;
+        let mut chunk = Chunk::default();
+        let mut last_flush = Instant::now();
+        // Ongoing games of this run, for the revisit pointer.
+        let mut ongoing: Option<u64> = None;
+        let m = &self.metrics;
+
+        let flush = async |chunk: &mut Chunk, finish: Option<Finish>| {
+            let chunk = Chunk {
+                finish,
+                ..std::mem::take(chunk)
+            };
+            let waited = Instant::now();
+            let ok = tx.send(chunk).await.is_ok();
+            m.writer_wait_micros.add(micros(waited.elapsed()));
+            ok
+        };
+
+        let end = 'run: loop {
+            let mut stream = match slot.user_games(user, since).await {
+                Ok(stream) => stream,
+                Err(LilaError::NotFound) => {
+                    log::warn!("indexer {idx:02}: did not find player {user}");
+                    break 'run RunEnd::NotFound;
+                }
+                Err(err) => {
+                    if matches!(err, LilaError::Timeout) {
+                        m.lila_timeouts.inc();
+                    } else {
+                        m.lila_errors.inc();
+                    }
+                    log::error!("indexer {idx:02}: request for {user}: {err}");
+                    failures += 1;
+                    if failures > self.config.retries {
+                        break 'run RunEnd::Failed;
+                    }
+                    m.stream_retries.inc();
+                    tokio::time::sleep(self.config.retry_delay * failures).await;
+                    continue;
+                }
+            };
+            let mut received = false;
+            loop {
+                let line = match stream.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break 'run RunEnd::Complete,
+                    Err(err) => {
+                        if matches!(err, LilaError::Timeout) {
+                            m.lila_timeouts.inc();
+                        } else {
+                            m.lila_errors.inc();
+                        }
+                        log::error!("indexer {idx:02}: stream for {user}: {err}");
+                        break;
+                    }
+                };
+                let game = match ExportGame::parse(&line) {
+                    Ok(game) => game,
+                    Err(err) => {
+                        m.malformed_lines.inc();
+                        log::warn!("indexer {idx:02}: malformed line for {user}: {err}");
+                        continue;
+                    }
+                };
+                m.games_received.inc();
+                received = true;
+                // Retries include the latest millisecond (see `RunPolicy`).
+                since = since.max(game.created_at);
+                chunk.latest_created_at = chunk.latest_created_at.max(game.created_at);
+                match game.classify(user, max_ply) {
+                    Classified::Game { game, name } => {
+                        chunk.games.push(*game);
+                        chunk.name = Some(name);
+                    }
+                    Classified::Skip(Skip::Ongoing) => {
+                        m.skipped_ongoing.inc();
+                        chunk.ongoing = min_opt(chunk.ongoing, Some(game.created_at));
+                        ongoing = min_opt(ongoing, Some(game.created_at));
+                    }
+                    Classified::Skip(Skip::Unfinished) => m.skipped_unfinished.inc(),
+                    Classified::Skip(Skip::Anonymous) => m.skipped_anonymous.inc(),
+                    Classified::Skip(Skip::NotPlayer | Skip::Invalid) => m.skipped_invalid.inc(),
+                }
+                if chunk.games.len() >= self.config.chunk_games
+                    || last_flush.elapsed() >= self.config.chunk_interval
+                {
+                    last_flush = Instant::now();
+                    if !flush(&mut chunk, None).await {
+                        break 'run RunEnd::Failed;
+                    }
+                    if item.abandoned() {
+                        break 'run RunEnd::Abandoned;
+                    }
+                    if self
+                        .config
+                        .max_run
+                        .is_some_and(|max_run| started.elapsed() >= max_run)
+                    {
+                        break 'run RunEnd::Requeue;
+                    }
+                }
+            }
+            // The stream broke: retry from the checkpoint, in the same slot.
+            // Failures count only in a row, without games received between.
+            drop(stream);
+            failures = if received { 1 } else { failures + 1 };
+            if failures > self.config.retries {
+                break 'run RunEnd::Failed;
+            }
+            m.stream_retries.inc();
+            tokio::time::sleep(self.config.retry_delay * failures).await;
+        };
+        drop(slot);
+        m.stream_micros.add(micros(started.elapsed()));
+
+        // Finished runs start the cooldown, also after errors (to not
+        // retry a failing player at once). Interrupted runs continue from
+        // the checkpoint with the next request.
+        let finish = match end {
+            RunEnd::Complete | RunEnd::NotFound | RunEnd::Failed => Some(Finish {
+                indexed_at: now_ms(),
+                revisit: (run.revisit && end == RunEnd::Complete).then_some(ongoing),
+            }),
+            RunEnd::Abandoned | RunEnd::Requeue => None,
+        };
+        // An interrupted revisit has checked the games created before
+        // `since` (the ongoing ones are in `ongoing`), so that the next one
+        // continues from there, instead of starting over (and maybe never
+        // completing within `max_run`).
+        if run.revisit && end != RunEnd::Complete {
+            chunk.revisit_from = Some(revisit_from(ongoing, since));
+        }
+        flush(&mut chunk, finish).await;
+        end
+    }
+}
+
+/// Where the next revisit continues after an interrupted one, which
+/// received the games created before `since` (and before, the ongoing
+/// games, the earliest of which is `ongoing`).
+fn revisit_from(ongoing: Option<u64>, since: u64) -> u64 {
+    ongoing.map_or(since, |ongoing| ongoing.min(since))
+}
+
+/// Writes the chunks of a run, returning the final status (`None` after a
+/// database error, which also ends the stream: its next chunk cannot be
+/// sent).
+fn write_chunks(
+    db: &PlayerDb,
+    mut status: PlayerStatus,
+    run: IndexRun,
+    mut rx: mpsc::Receiver<Chunk>,
+    progress: ProgressHandle,
+) -> Option<PlayerStatus> {
+    while let Some(chunk) = rx.blocking_recv() {
+        status.latest_created_at = status.latest_created_at.max(chunk.latest_created_at);
+        if !run.revisit {
+            status.revisit_ongoing = min_opt(status.revisit_ongoing, chunk.ongoing);
+        }
+        if let Some(name) = chunk.name {
+            status.name = name;
+        }
+        if let Some(from) = chunk.revisit_from {
+            status.revisit_ongoing = Some(from);
+        }
+        if let Some(finish) = &chunk.finish {
+            status.indexed_at = finish.indexed_at;
+            if let Some(revisit) = finish.revisit {
+                status.revisit_ongoing = revisit;
+                status.revisited_at = finish.indexed_at;
+            }
+        }
+        if chunk.games.is_empty()
+            && chunk.finish.is_none()
+            && chunk.revisit_from.is_none()
+            && chunk.latest_created_at == 0
+        {
+            continue;
+        }
+        match db.write_chunk(&mut status, &chunk.games) {
+            Ok(stats) => {
+                if stats.games > 0 {
+                    progress.committed();
+                }
+            }
+            Err(err) => {
+                log::error!("writing games of {}: {err}", status.user);
+                return None;
+            }
+        }
+    }
+    Some(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use arbitrary::Unstructured;
+
+    use super::*;
+    use crate::player::{
+        PlayerDbConfig,
+        tests::{TempDir, arbitrary_game},
+    };
+
+    fn games(n: u64) -> Vec<PlayerGame> {
+        let data = [7; 4096];
+        let mut u = Unstructured::new(&data);
+        (0..n)
+            .map(|i| arbitrary_game(&mut u, i).unwrap().0)
+            .collect()
+    }
+
+    /// Runs the writer on the chunks.
+    fn write(
+        db: &PlayerDb,
+        status: PlayerStatus,
+        run: IndexRun,
+        chunks: Vec<Chunk>,
+    ) -> (Option<PlayerStatus>, Ticket) {
+        let (tx, rx) = mpsc::channel(chunks.len().max(1));
+        for chunk in chunks {
+            tx.try_send(chunk).expect("channel capacity");
+        }
+        drop(tx);
+        let (progress, ticket) = ProgressHandle::detached();
+        (write_chunks(db, status, run, rx, progress), ticket)
+    }
+
+    fn setup() -> (TempDir, PlayerDb, PlayerStatus) {
+        let dir = TempDir::new("writer");
+        let db = PlayerDb::open(&dir.0, PlayerDbConfig::default()).unwrap();
+        let status = PlayerStatus::new(UserId::from_name("alice").unwrap());
+        (dir, db, status)
+    }
+
+    const RUN: IndexRun = IndexRun {
+        since: 0,
+        revisit: false,
+    };
+
+    const REVISIT: IndexRun = IndexRun {
+        since: 10,
+        revisit: true,
+    };
+
+    #[test]
+    fn test_run() {
+        let (_dir, db, status) = setup();
+        let (status, ticket) = write(
+            &db,
+            status,
+            RUN,
+            vec![
+                Chunk {
+                    games: games(2),
+                    latest_created_at: 100,
+                    ongoing: Some(60),
+                    name: Some("Alice".to_owned()),
+                    ..Chunk::default()
+                },
+                // Skipped.
+                Chunk::default(),
+                Chunk {
+                    latest_created_at: 120,
+                    ongoing: Some(50),
+                    finish: Some(Finish {
+                        indexed_at: 1000,
+                        revisit: None,
+                    }),
+                    ..Chunk::default()
+                },
+            ],
+        );
+        let status = status.unwrap();
+        assert_eq!(status.games, 2);
+        assert_eq!(status.name, "Alice");
+        assert_eq!(status.latest_created_at, 120);
+        assert_eq!(status.revisit_ongoing, Some(50));
+        assert_eq!(status.indexed_at, 1000);
+        assert_eq!(status.revisited_at, 0);
+        assert_eq!(ticket.progress().generation, 1);
+        assert_eq!(db.status(db.user_hash(&status.user)).unwrap(), Some(status));
+    }
+
+    #[test]
+    fn test_revisit() {
+        let (_dir, db, mut status) = setup();
+        status.revisit_ongoing = Some(10);
+        let (status, _) = write(
+            &db,
+            status,
+            REVISIT,
+            vec![Chunk {
+                games: games(1),
+                latest_created_at: 100,
+                // Not the earliest ongoing game, which the run finds.
+                ongoing: Some(5),
+                finish: Some(Finish {
+                    indexed_at: 1000,
+                    revisit: Some(Some(40)),
+                }),
+                ..Chunk::default()
+            }],
+        );
+        let status = status.unwrap();
+        assert_eq!(status.revisit_ongoing, Some(40));
+        assert_eq!(status.revisited_at, 1000);
+
+        // No ongoing games left.
+        let (status, _) = write(
+            &db,
+            status,
+            REVISIT,
+            vec![Chunk {
+                finish: Some(Finish {
+                    indexed_at: 2000,
+                    revisit: Some(None),
+                }),
+                ..Chunk::default()
+            }],
+        );
+        let status = status.unwrap();
+        assert_eq!(status.revisit_ongoing, None);
+        assert_eq!(status.revisited_at, 2000);
+    }
+
+    /// An interrupted revisit continues from its checkpoint, and remains
+    /// due.
+    #[test]
+    fn test_interrupted_revisit() {
+        let (_dir, db, mut status) = setup();
+        status.revisit_ongoing = Some(10);
+        status.revisited_at = 500;
+        let (status, _) = write(
+            &db,
+            status,
+            REVISIT,
+            vec![Chunk {
+                games: games(1),
+                latest_created_at: 100,
+                revisit_from: Some(revisit_from(Some(30), 70)),
+                ..Chunk::default()
+            }],
+        );
+        let status = status.unwrap();
+        assert_eq!(status.revisit_ongoing, Some(30));
+        assert_eq!(status.revisited_at, 500);
+        assert_eq!(status.indexed_at, 0);
+        let policy = RunPolicy::default();
+        assert_eq!(
+            policy.next_run(Some(&status), 500 + policy.revisit_interval),
+            Some(IndexRun {
+                since: 30,
+                revisit: true
+            })
+        );
+    }
+
+    #[test]
+    fn test_revisit_from() {
+        assert_eq!(revisit_from(None, 100), 100);
+        assert_eq!(revisit_from(Some(50), 100), 50);
+        assert_eq!(revisit_from(Some(150), 100), 100);
+    }
+}

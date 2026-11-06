@@ -407,6 +407,13 @@ impl ProgressHandle {
     pub fn committed(&self) {
         self.tx.send_modify(|p| p.generation += 1);
     }
+
+    /// A handle that is not part of a queue, and its ticket.
+    #[cfg(test)]
+    pub fn detached() -> (ProgressHandle, Ticket) {
+        let (tx, rx) = watch::channel(Progress::default());
+        (ProgressHandle { tx: Arc::new(tx) }, Ticket { rx })
+    }
 }
 
 #[cfg(test)]

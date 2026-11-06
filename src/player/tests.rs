@@ -54,7 +54,7 @@ impl Drop for TempDir {
 
 /// A random game with a few likely openings, so that positions repeat
 /// across games.
-fn arbitrary_game(
+pub(super) fn arbitrary_game(
     u: &mut Unstructured<'_>,
     n: u64,
 ) -> arbitrary::Result<(PlayerGame, Vec<VariantPosition>)> {
