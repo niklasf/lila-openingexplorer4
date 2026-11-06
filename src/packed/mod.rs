@@ -1,6 +1,7 @@
 mod bits;
 mod bytes;
 mod cold;
+mod color;
 mod entry;
 mod game;
 mod game_id;
@@ -14,6 +15,7 @@ mod rating;
 
 pub use bytes::{pack_bytes, pack_string, unpack_bytes, unpack_string};
 pub use cold::{ColdGroup, ColdGroupView, ColdKey};
+pub use color::{color_bits, color_from_bits};
 pub use entry::{
     CellGames, CellGroupHeader, CellHeader, CellKey, CellView, CellViews, Entry, EntryCell,
     EntryView, GAMES_PER_CELL, GroupCells, GroupHeader, GroupView, GroupViews, LichessEntry,

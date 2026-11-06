@@ -111,7 +111,7 @@ Critical performance work:
 * [x] Recheck compression on latest SSTs
 * [x] Elias-Fano vs rice on cold entries
 * [x] Optimize SST block sizes
-* [ ] moka admission policy
+* [ ] Truncate Lichess game moves
 
 Needs HDDs:
 

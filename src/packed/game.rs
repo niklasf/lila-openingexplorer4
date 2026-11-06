@@ -399,11 +399,8 @@ impl Arbitrary<'_> for LichessGame {
             speed: u.arbitrary()?,
             rating_mode: u.arbitrary()?,
             setup: setup.map(|s| {
-                PackedSetup::pack_variant_normalized(
-                    &s.to_setup(EnPassantMode::Always),
-                    s.variant(),
-                )
-                .expect("packed setup")
+                PackedSetup::pack_variant_normalized(&s.to_setup(EnPassantMode::Legal), s.variant())
+                    .expect("packed setup")
             }),
             event: u.arbitrary()?,
             moves: packed_moves.finish(),

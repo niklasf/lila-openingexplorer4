@@ -99,7 +99,7 @@ impl From<RawPlay> for Play {
             variant,
             setup: match raw.fen {
                 Some(fen) => fen.into_setup(),
-                None => VariantPosition::new(variant).to_setup(EnPassantMode::Always),
+                None => VariantPosition::new(variant).to_setup(EnPassantMode::Legal),
             },
             play: raw.play,
         }

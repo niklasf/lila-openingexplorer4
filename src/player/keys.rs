@@ -16,7 +16,7 @@ use std::fmt;
 use shakmaty::Color;
 
 use crate::{
-    packed::{GameId, GameIndex, PositionKey},
+    packed::{GameId, GameIndex, PositionKey, color_bits},
     player::UserHash,
 };
 
@@ -73,13 +73,6 @@ impl Generation {
 
     pub fn to_bytes(self) -> [u8; Generation::SIZE] {
         self.0.to_be_bytes()
-    }
-}
-
-pub fn color_byte(color: Color) -> u8 {
-    match color {
-        Color::White => 0,
-        Color::Black => 1,
     }
 }
 
@@ -154,7 +147,7 @@ fn index_prefix(uh: UserHash, generation: Generation, color: Color) -> [u8; INDE
     let mut key = [0; INDEX_PREFIX_SIZE];
     key[..UserHash::SIZE].copy_from_slice(uh.as_bytes());
     key[UserHash::SIZE..UserHash::SIZE + Generation::SIZE].copy_from_slice(&generation.to_bytes());
-    key[INDEX_PREFIX_SIZE - 1] = color_byte(color);
+    key[INDEX_PREFIX_SIZE - 1] = color_bits(color);
     key
 }
 
