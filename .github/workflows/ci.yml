@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test
+      - name: Build
+        run: cargo build --bins
+      - name: Indexing pipeline and servers on the sample data
+        run: samples/test-pipeline.sh
+        env:
+          BIN: target/debug
+      - name: Logs of the servers
+        if: failure()
+        run: tail -n 100 target/pipeline-test/*.log || true

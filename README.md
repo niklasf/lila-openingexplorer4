@@ -6,6 +6,13 @@ and growing).
 
 ## Usage
 
+Build the binaries:
+
+```sh
+cargo build --release
+B=target/release
+```
+
 Production: 128 GB RAM, 12 hardware threads, SST files on hard disks,
 two instances running intermittently.
 
@@ -13,20 +20,20 @@ Create the database directories from the SST files. The SST files are
 hard-linked, so they must be on the same file system as the database:
 
 ```sh
-explorer ingest --db /hdd/lichess/db --games /hdd/lichess/sst/games --positions /hdd/lichess/sst
-explorer ingest --db /hdd/masters/db --games /hdd/masters/sst/games --positions /hdd/masters/sst --game-ids /hdd/masters/sst/game_ids
+$B/explorer ingest --db /hdd/lichess/db --games /hdd/lichess/sst/games --positions /hdd/lichess/sst
+$B/explorer ingest --db /hdd/masters/db --games /hdd/masters/sst/games --positions /hdd/masters/sst --game-ids /hdd/masters/sst/game_ids
 ```
 
 Serve them:
 
 ```sh
-explorer lichess --db /hdd/lichess/db --bind 127.0.0.1:9002 --cors \
+$B/explorer lichess --db /hdd/lichess/db --bind 127.0.0.1:9002 --cors \
     --cache 32g \
     --blocking-threads 16 \
     --response-cache 300000 \
     --lila-bearer-file /etc/explorer-bearer
 
-explorer masters --db /hdd/masters/db --bind 127.0.0.1:9003 --cors \
+$B/explorer masters --db /hdd/masters/db --bind 127.0.0.1:9003 --cors \
     --max-ply 0 \
     --cache 4g \
     --blocking-threads 12
@@ -53,7 +60,7 @@ The personal opening explorer (`/player`) has its own writable database,
 created on first start, and indexes games from lila on demand:
 
 ```sh
-explorer player --db /nvme/player/db --bind 127.0.0.1:9004 --cors \
+$B/explorer player --db /nvme/player/db --bind 127.0.0.1:9004 --cors \
     --db-path /nvme/player/sst:64g --db-path /hdd/player/sst:6t \
     --cache 8g \
     --lila-bearer-file /etc/explorer-bearer
@@ -73,7 +80,7 @@ Replay an nginx request log (tab separated `$msec`, `$status`,
 `$request_time`, `$upstream_response_time`, `$request_uri`) against both:
 
 ```sh
-stress_explorer samples/requests/explorer-2026-11-06T1520Z-1h.tsv.zst \
+$B/stress_explorer samples/requests/explorer-2026-11-06T1520Z-1h.tsv.zst \
     --lichess-url http://127.0.0.1:9002 \
     --masters-url http://127.0.0.1:9003
 ```
@@ -85,20 +92,20 @@ stress_explorer samples/requests/explorer-2026-11-06T1520Z-1h.tsv.zst \
 
    ```sh
    pgns=$(ls samples/lichess_db/*/lichess_db_*_rated_*.pgn.zst | awk -F_ '{print $NF, $0}' | sort -s -k1,1 | cut -d' ' -f2)
-   pgn_to_parquet --out lichess/lichess_db_rated.parquet $pgns
+   $B/pgn_to_parquet --out lichess/lichess_db_rated.parquet $pgns
    ```
 
 2. Walk the parquet files to produce SSTs indexed by position. Benefits from
    large memory and disk scratch space.
 
    ```sh
-   parquet_to_positions lichess/lichess_db_rated.parquet --out lichess/sst --scratch scratch --scratch-budget 3400g --memory-budget 100g
+   $B/parquet_to_positions lichess/lichess_db_rated.parquet --out lichess/sst --scratch scratch --scratch-budget 3400g --memory-budget 100g
    ```
 
 3. Walk the parquet files to produce SSTs indexed by game id.
 
    ```sh
-   parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games --max-ply 50
+   $B/parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games --max-ply 50
    ```
 
    `--max-ply 50` stores the moves only up to the indexed ply. Masters must keep

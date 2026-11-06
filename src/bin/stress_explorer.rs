@@ -24,6 +24,10 @@ use tokio::task::JoinSet;
 /// which they started (`$msec - $request_time`), and `--speed` replays them
 /// with their original timing. Requests rejected by nginx (429) and
 /// requests that do not match a route of the given servers are skipped.
+///
+/// Exits with status 1 if any response was invalid, a server error (5xx) or
+/// another unexpected status, or if any request failed without a response.
+/// Client errors (4xx) are expected, since logs have bad requests.
 #[derive(Parser)]
 #[command(group(ArgGroup::new("servers").required(true).multiple(true)))]
 struct Args {
@@ -204,6 +208,11 @@ struct Outcome {
 }
 
 impl Outcome {
+    /// Whether anything went wrong that should not, whatever the requests.
+    fn has_errors(&self) -> bool {
+        self.invalid > 0 || self.server_errors > 0 || self.other_statuses > 0 || self.failed > 0
+    }
+
     fn example(&mut self, example: String) {
         if self.examples.len() < MAX_EXAMPLES {
             self.examples.push(example);
@@ -600,5 +609,9 @@ async fn main() {
             total.merge(outcome);
         }
         report("total", &mut total, elapsed);
+    }
+    if outcomes.iter().any(Outcome::has_errors) {
+        eprintln!("error: invalid responses, server errors or failed requests");
+        std::process::exit(1);
     }
 }
