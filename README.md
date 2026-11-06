@@ -163,4 +163,5 @@ Pending documentation changes:
 
 ## License
 
-* [ ] TODO
+Licensed under the GNU Affero General Public License v3. See the `LICENSE` file
+for details.
