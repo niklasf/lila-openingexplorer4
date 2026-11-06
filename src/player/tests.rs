@@ -21,8 +21,8 @@ use crate::{
         PositionKey, Rating, RatingMode, Speed,
     },
     player::{
-        PlayerDb, PlayerDbConfig, UserId, aggregate::Placement, record::PlayerGame,
-        status::PlayerStatus,
+        PlayerDb, PlayerDbConfig, PlayerDbError, UserHasher, UserId, aggregate::Placement,
+        record::PlayerGame, status::PlayerStatus,
     },
 };
 
@@ -224,8 +224,8 @@ fn test_storage_matches_naive() {
             let stats = db.write_chunk(&mut statuses[player], &chunk).unwrap();
             assert_eq!(stats.games + stats.known, chunk.len() as u64);
             if u.ratio(1, 3)? {
-                db.rebuild(users[player].hash()).unwrap();
-                statuses[player] = db.status(users[player].hash()).unwrap().unwrap();
+                db.rebuild(db.user_hash(&users[player])).unwrap();
+                statuses[player] = db.status(db.user_hash(&users[player])).unwrap().unwrap();
             }
             if u.ratio(1, 4)? {
                 db.flush().unwrap();
@@ -238,7 +238,7 @@ fn test_storage_matches_naive() {
         let reader = db.reader();
         for (player, user) in users.iter().enumerate() {
             let expected = naive(&games[player], max_ply);
-            let Some(status) = reader.status(user.hash()).unwrap() else {
+            let Some(status) = reader.status(db.user_hash(user)).unwrap() else {
                 assert!(games[player].is_empty());
                 continue;
             };
@@ -275,9 +275,45 @@ fn test_delete_player() {
     let mut u = Unstructured::new(&[7; 4096]);
     let (game, _) = arbitrary_game(&mut u, 1).unwrap();
     db.write_chunk(&mut status, &[game]).unwrap();
-    assert!(db.status(alice.hash()).unwrap().is_some());
-    db.delete_player(alice.hash()).unwrap();
-    assert!(db.status(alice.hash()).unwrap().is_none());
+    assert!(db.status(db.user_hash(&alice)).unwrap().is_some());
+    db.delete_player(db.user_hash(&alice)).unwrap();
+    assert!(db.status(db.user_hash(&alice)).unwrap().is_none());
+}
+
+/// The user hash key is generated (or given) for a new database, kept when
+/// reopening, and checked against a given key.
+#[test]
+fn test_user_hash_key() {
+    let dir = TempDir::new("user_hash_key");
+    let alice = UserId::from_name("alice").unwrap();
+    let given = UserHasher::from_key([5; UserHasher::KEY_SIZE]);
+    let config = |user_hasher| PlayerDbConfig {
+        user_hasher,
+        ..PlayerDbConfig::default()
+    };
+    let generated = {
+        let db = PlayerDb::open(&dir.0.join("generated"), config(None)).unwrap();
+        let mut status = PlayerStatus::new(alice.clone(), 50);
+        let mut u = Unstructured::new(&[7; 4096]);
+        let (game, _) = arbitrary_game(&mut u, 1).unwrap();
+        db.write_chunk(&mut status, &[game]).unwrap();
+        db.user_hash(&alice)
+    };
+    assert_ne!(generated, given.hash(&alice));
+    let db = PlayerDb::open(&dir.0.join("generated"), config(None)).unwrap();
+    assert_eq!(db.user_hash(&alice), generated);
+    assert!(db.status(generated).unwrap().is_some());
+    drop(db);
+    assert!(matches!(
+        PlayerDb::open(&dir.0.join("generated"), config(Some(given.clone()))),
+        Err(PlayerDbError::UserHashKeyMismatch)
+    ));
+
+    let db = PlayerDb::open(&dir.0.join("given"), config(Some(given.clone()))).unwrap();
+    assert_eq!(db.user_hash(&alice), given.hash(&alice));
+    drop(db);
+    let db = PlayerDb::open(&dir.0.join("given"), config(None)).unwrap();
+    assert_eq!(db.user_hash(&alice), given.hash(&alice));
 }
 
 #[test]

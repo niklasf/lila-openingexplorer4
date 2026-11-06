@@ -402,7 +402,7 @@ async fn export(
         return (StatusCode::SERVICE_UNAVAILABLE, "injected fault").into_response();
     }
     let games = UserId::from_name(&user).ok().and_then(|id| {
-        let closed = unit(state.config.seed, id.hash().to_u64(), 12) < state.config.noise.not_found;
+        let closed = unit(state.config.seed, id.fingerprint(), 12) < state.config.noise.not_found;
         state
             .fixture
             .player(&id)

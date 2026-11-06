@@ -25,6 +25,10 @@ pub mod check;
 pub mod population;
 pub mod scatter;
 
+/// File with the key of the user hashes (`UserHasher`) that `scatter`
+/// generates, which `build` copies to its output for `ingest`.
+pub const USER_HASH_KEY_FILE: &str = "user_hash_key";
+
 use std::{
     io,
     sync::{

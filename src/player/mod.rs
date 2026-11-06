@@ -20,4 +20,4 @@ mod tests;
 mod user;
 
 pub use db::{PlayerDb, PlayerDbConfig, PlayerDbError};
-pub use user::{InvalidUserName, UserHash, UserId};
+pub use user::{InvalidUserName, UserHash, UserHasher, UserId};

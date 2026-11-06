@@ -44,9 +44,9 @@ use crate::{
     },
     parquet::Input,
     player::{
-        UserHash, UserId,
+        UserHash, UserHasher, UserId,
         bulk::{
-            for_each_row_group,
+            USER_HASH_KEY_FILE, for_each_row_group,
             population::{Member, Origin},
         },
         lila::{Classified, ExportGame},
@@ -282,6 +282,8 @@ const FLUSH_BYTES: usize = 256 << 10;
 /// Scatters the games of the members. Returns the statistics.
 pub fn scatter(config: &ScatterConfig<'_>) -> io::Result<ScatterStats> {
     fs::create_dir_all(config.out)?;
+    let hasher = UserHasher::generate();
+    hasher.save(&config.out.join(USER_HASH_KEY_FILE))?;
     let parts = config.partitions;
     let files: Vec<Mutex<File>> = (0..parts.count())
         .map(|p| File::create(Partitions::path(config.out, p)).map(Mutex::new))
@@ -326,7 +328,7 @@ pub fn scatter(config: &ScatterConfig<'_>) -> io::Result<ScatterStats> {
                     };
                     let (user, _, uh) = state.users.entry(member).or_insert_with(|| {
                         let user = UserId::from_name(name).expect("valid user name");
-                        let uh = user.hash();
+                        let uh = hasher.hash(&user);
                         (user, name.to_owned(), uh)
                     });
                     let uh = *uh;

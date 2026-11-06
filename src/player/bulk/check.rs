@@ -147,7 +147,7 @@ pub fn check(
         .fixture
         .players()
         .filter(|(_, games)| games.count > 0)
-        .map(|(id, _)| (id, mix(config.seed ^ id.hash().to_u64())))
+        .map(|(id, _)| (id, mix(config.seed ^ id.fingerprint())))
         .collect();
     players.sort_by_key(|(_, key)| *key);
     players.truncate(config.players);
@@ -156,7 +156,7 @@ pub fn check(
     let reader = db.reader();
     for (user, _) in players {
         stats.players += 1;
-        let Some(status) = reader.status(user.hash())? else {
+        let Some(status) = reader.status(db.user_hash(user))? else {
             stats.unindexed += 1;
             continue;
         };
@@ -169,7 +169,7 @@ pub fn check(
         )?;
         let seqs: Vec<GameSeq> = (0..status.games).map(GameSeq).collect();
         let actual: Vec<PlayerGame> = reader
-            .games(user.hash(), &seqs)?
+            .games(db.user_hash(user), &seqs)?
             .into_iter()
             .map(|g| g.expect("game of status"))
             .collect();

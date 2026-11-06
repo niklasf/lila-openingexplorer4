@@ -51,6 +51,7 @@ use crate::{
         PlayerDb, UserHash,
         aggregate::{Aggregation, Placed, Placement, cold_bits_for},
         bulk::{
+            USER_HASH_KEY_FILE,
             population::{Member, Origin},
             scatter::{self, Partitions},
         },
@@ -328,6 +329,10 @@ pub fn build(config: &BuildConfig<'_>) -> io::Result<BuildStats> {
         fs::create_dir_all(config.out.join(cf))?;
     }
     fs::create_dir_all(config.out.join("tail"))?;
+    fs::copy(
+        config.scatter_dir.join(USER_HASH_KEY_FILE),
+        config.out.join(USER_HASH_KEY_FILE),
+    )?;
     let created_at = CreatedAt::new(scatter::read_days(config.scatter_dir)?);
     let names = scatter::read_names(config.scatter_dir)?;
     let origins: HashMap<u64, Origin> = config

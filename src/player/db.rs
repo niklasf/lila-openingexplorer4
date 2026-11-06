@@ -11,7 +11,7 @@ use std::{
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
     Direction, EnvOptions, IngestExternalFileOptions, IteratorMode, MergeOperands, Options,
-    ReadOptions, SnapshotWithThreadMode, SstFileWriter, WriteBatch,
+    ReadOptions, SnapshotWithThreadMode, SstFileWriter, WriteBatch, WriteOptions,
     statistics::{StatsLevel, Ticker},
 };
 use shakmaty::{Color, variant::VariantPosition};
@@ -20,12 +20,11 @@ use thiserror::Error;
 use crate::{
     packed::{CellKey, GameId, GameIndex, PlayerEntry, PlayerGroupHeader, PositionKey},
     player::{
-        UserHash,
+        UserHash, UserHasher, UserId,
         aggregate::{Aggregation, Placed, Placement, cold_bits_for, find_visit},
         cold::PlayerColdGroup,
         keys::{
-            ColdBucket, ColdGroupKey, GameIdKey, GameKey, GameSeq, Generation, PlayerRange,
-            StatusKey, WarmKey,
+            ColdBucket, ColdGroupKey, GameIdKey, GameKey, GameSeq, Generation, StatusKey, WarmKey,
         },
         record::{BorrowedPlayerGame, PlayerGame},
         status::{FORMAT_VERSION, PlayerStatus},
@@ -38,8 +37,13 @@ pub const GAMES_CF: &str = "player_games";
 pub const GAME_IDS_CF: &str = "player_game_ids";
 pub const WARM_CF: &str = "player_warm";
 pub const COLD_CF: &str = "player_cold";
+/// Properties of the database, like the key of the user hashes.
+pub const META_CF: &str = "player_meta";
 
-const ALL_CFS: [&str; 5] = [STATUS_CF, GAMES_CF, GAME_IDS_CF, WARM_CF, COLD_CF];
+const ALL_CFS: [&str; 6] = [STATUS_CF, GAMES_CF, GAME_IDS_CF, WARM_CF, COLD_CF, META_CF];
+
+/// Key of the `UserHasher` key in the meta column family.
+const USER_HASH_KEY: &[u8] = b"user_hash_key";
 
 /// Subdirectory of the database for SST files of rebuilds, before they are
 /// ingested.
@@ -51,6 +55,12 @@ pub enum PlayerDbError {
     RocksDb(#[from] rocksdb::Error),
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    #[error("invalid user hash key")]
+    InvalidUserHashKey,
+    #[error("user hash key differs from the key of the database")]
+    UserHashKeyMismatch,
+    #[error("database has players, but no user hash key")]
+    MissingUserHashKey,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +90,10 @@ pub struct PlayerDbConfig {
     /// With several `db_paths`: the last level holds this many times its
     /// upper level (see `tune_levels`).
     pub level_ratio: f64,
+    /// Key of the user hashes for a new database (like the one that SST
+    /// files to ingest were built with), or to check against the key of an
+    /// existing database. `None` generates one for a new database.
+    pub user_hasher: Option<UserHasher>,
 }
 
 impl Default for PlayerDbConfig {
@@ -96,6 +110,7 @@ impl Default for PlayerDbConfig {
             batch_bytes: 4 << 20,
             background_jobs: 4,
             level_ratio: 10.0,
+            user_hasher: None,
         }
     }
 }
@@ -186,6 +201,29 @@ pub struct RebuildStats {
     pub ingested: bool,
 }
 
+/// The user hasher stored in the database, or for a database without
+/// players a new one (`given`, or generated), which is stored.
+fn open_user_hasher(db: &DB, given: Option<&UserHasher>) -> Result<UserHasher, PlayerDbError> {
+    let meta = db.cf_handle(META_CF).expect("meta column family");
+    if let Some(stored) = db.get_pinned_cf(meta, USER_HASH_KEY)? {
+        let stored =
+            UserHasher::from_key_bytes(&stored).ok_or(PlayerDbError::InvalidUserHashKey)?;
+        if given.is_some_and(|given| *given != stored) {
+            return Err(PlayerDbError::UserHashKeyMismatch);
+        }
+        return Ok(stored);
+    }
+    let status = db.cf_handle(STATUS_CF).expect("status column family");
+    if db.iterator_cf(status, IteratorMode::Start).next().is_some() {
+        return Err(PlayerDbError::MissingUserHashKey);
+    }
+    let hasher = given.cloned().unwrap_or_else(UserHasher::generate);
+    let mut write_opts = WriteOptions::default();
+    write_opts.set_sync(true);
+    db.put_cf_opt(meta, USER_HASH_KEY, hasher.key(), &write_opts)?;
+    Ok(hasher)
+}
+
 pub struct PlayerDb {
     db: DB,
     path: PathBuf,
@@ -194,6 +232,7 @@ pub struct PlayerDb {
     warm_opts: Options,
     cold_opts: Options,
     config: PlayerDbConfig,
+    hasher: UserHasher,
     pub counters: DbCounters,
 }
 
@@ -235,6 +274,7 @@ impl PlayerDb {
             path,
             ALL_CFS.map(|name| ColumnFamilyDescriptor::new(name, cf_options(name, &cache))),
         )?;
+        let hasher = open_user_hasher(&db, config.user_hasher.as_ref())?;
         let rebuild_dir = path.join(REBUILD_DIR);
         if rebuild_dir.exists() {
             fs::remove_dir_all(&rebuild_dir)?;
@@ -248,6 +288,7 @@ impl PlayerDb {
             cache,
             opts,
             config,
+            hasher,
             counters: DbCounters::default(),
         };
         db.tune_levels()?;
@@ -256,6 +297,14 @@ impl PlayerDb {
 
     pub fn config(&self) -> &PlayerDbConfig {
         &self.config
+    }
+
+    pub fn user_hasher(&self) -> &UserHasher {
+        &self.hasher
+    }
+
+    pub fn user_hash(&self, user: &UserId) -> UserHash {
+        self.hasher.hash(user)
     }
 
     fn cf(&self, name: &str) -> &ColumnFamily {
@@ -272,8 +321,11 @@ impl PlayerDb {
     pub fn put_status(&self, status: &PlayerStatus) -> Result<(), PlayerDbError> {
         let mut buf = Vec::new();
         status.pack(&mut buf);
-        self.db
-            .put_cf(self.cf(STATUS_CF), StatusKey::new(status.user.hash()), buf)?;
+        self.db.put_cf(
+            self.cf(STATUS_CF),
+            StatusKey::new(self.user_hash(&status.user)),
+            buf,
+        )?;
         Ok(())
     }
 
@@ -286,7 +338,7 @@ impl PlayerDb {
         status: &mut PlayerStatus,
         games: &[PlayerGame],
     ) -> Result<ChunkStats, PlayerDbError> {
-        let uh = status.user.hash();
+        let uh = self.user_hash(&status.user);
         let id_keys: Vec<GameIdKey> = games
             .iter()
             .map(|game| GameIdKey::new(uh, game.id))
@@ -394,14 +446,14 @@ impl PlayerDb {
         let new = status.generation.next();
 
         // Leftovers of an interrupted rebuild.
-        let (start, end) = PlayerRange::generations(uh, new, None);
+        let (start, end) = uh.generations_range(new, None);
         for cf in [WARM_CF, COLD_CF] {
             self.db.delete_range_cf(self.cf(cf), &start, &end)?;
         }
 
         let mut aggregation = Aggregation::new();
         let mut stats = RebuildStats::default();
-        let (start, end) = PlayerRange::all(uh);
+        let (start, end) = uh.range();
         let mut read_opts = ReadOptions::default();
         read_opts.set_iterate_lower_bound(start.clone());
         read_opts.set_iterate_upper_bound(end);
@@ -512,7 +564,7 @@ impl PlayerDb {
         let mut buf = Vec::new();
         status.pack(&mut buf);
         batch.put_cf(self.cf(STATUS_CF), StatusKey::new(uh), &buf);
-        let (start, end) = PlayerRange::generations(uh, Generation(0), Some(new));
+        let (start, end) = uh.generations_range(Generation(0), Some(new));
         batch.delete_range_cf(self.cf(WARM_CF), &start, &end);
         batch.delete_range_cf(self.cf(COLD_CF), &start, &end);
         self.db.write(batch)?;
@@ -609,7 +661,7 @@ impl PlayerDb {
 
     /// Deletes all data of a player.
     pub fn delete_player(&self, uh: UserHash) -> Result<(), PlayerDbError> {
-        let (start, end) = PlayerRange::all(uh);
+        let (start, end) = uh.range();
         let mut batch = WriteBatch::default();
         for cf in ALL_CFS {
             batch.delete_range_cf(self.cf(cf), &start, &end);
@@ -654,7 +706,7 @@ impl PlayerDb {
         }
     }
 
-    pub fn column_families() -> [&'static str; 5] {
+    pub fn column_families() -> [&'static str; 6] {
         ALL_CFS
     }
 
@@ -727,7 +779,7 @@ impl PlayerReader<'_> {
         color: Color,
         pos: &VariantPosition,
     ) -> Result<(PlayerEntry, PositionStats), PlayerDbError> {
-        let uh = status.user.hash();
+        let uh = self.db.user_hash(&status.user);
         let key = PositionKey::new(pos);
         let mut stats = PositionStats::default();
         let mut entry = PlayerEntry::new();

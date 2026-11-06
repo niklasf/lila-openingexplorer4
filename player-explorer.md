@@ -212,15 +212,17 @@ entries only (273 vs 862 B per indexed game, see
 
 ### Data
 
-All keys start with the user hash `uh` (8 B of a stable hash of the
-lowercase user id), so each player is one contiguous key range: an index
+All keys start with the user hash `uh` (8 B of HMAC-SHA-256 of the
+lowercase user id, with a random secret key generated with the database and
+stored in it), so each player is one contiguous key range: an index
 run writes one range, a browsing session hits the same blocks (soon all in
 the cache), a player is deleted or reset with one `DeleteRange`. (The old
 key XORed the user hash into the Zobrist hash, which scatters a player over
 the whole key space.) SST prefix compression makes the repeated prefix
 cheap. A collision of two players' 64-bit hashes is ~10^-5 likely with
-~10^7 players; the status stores the user id, so it would at least be
-detected.
+~10^7 players, which is acceptable, but the secret key makes sure nobody
+can pick a user name that collides with another player's on purpose (to
+see or overwrite their data).
 
 * `status`: `uh -> {user id, gen, cold bucket bits per color, games, games
   at last rebuild, latest createdAt, earliest ongoing game to revisit,

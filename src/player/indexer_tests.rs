@@ -118,7 +118,7 @@ impl Setup {
         let db = self.indexer.db();
         let reader = db.reader();
         for (user, games) in self.players.iter().zip(&self.games) {
-            let status = reader.status(user.hash()).unwrap().expect("status");
+            let status = reader.status(db.user_hash(user)).unwrap().expect("status");
             assert_eq!(status.games as usize, games.len(), "{user}");
             assert!(status.name.eq_ignore_ascii_case(user.as_str()));
             for color in Color::ALL {
@@ -224,7 +224,7 @@ async fn test_index_with_faults() {
     for _ in 0..10 {
         let db = setup.indexer.db();
         let missing = setup.players.iter().zip(&setup.games).any(|(user, games)| {
-            db.status(user.hash())
+            db.status(db.user_hash(user))
                 .unwrap()
                 .is_none_or(|s| (s.games as usize) < games.len())
         });
@@ -235,11 +235,11 @@ async fn test_index_with_faults() {
         // the players to get them again.
         for (user, games) in setup.players.iter().zip(&setup.games) {
             if db
-                .status(user.hash())
+                .status(db.user_hash(user))
                 .unwrap()
                 .is_none_or(|s| (s.games as usize) < games.len())
             {
-                let mut status = db.status(user.hash()).unwrap().unwrap();
+                let mut status = db.status(db.user_hash(user)).unwrap().unwrap();
                 status.latest_created_at = 0;
                 db.put_status(&status).unwrap();
             }

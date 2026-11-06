@@ -5,9 +5,10 @@ use lila_openingexplorer4::{
     mock_lila::{Fixture, Noise, prepare::name_hash, synth::Synth},
     parquet::Input,
     player::{
-        PlayerDb, PlayerDbConfig,
+        PlayerDb, PlayerDbConfig, UserHasher,
         aggregate::Placement,
         bulk::{
+            USER_HASH_KEY_FILE,
             age::{AgeConfig, age},
             build::{AgingPlan, BuildConfig, CFS, build, sst_files},
             check::{CheckConfig, check},
@@ -250,12 +251,18 @@ struct DbArgs {
 
 impl DbArgs {
     fn open(&self) -> PlayerDb {
+        self.open_with(None)
+    }
+
+    /// Opens the database, created with the given user hasher if new.
+    fn open_with(&self, user_hasher: Option<UserHasher>) -> PlayerDb {
         PlayerDb::open(
             &self.db,
             PlayerDbConfig {
                 cache_bytes: self.cache.into(),
                 max_ply: self.max_ply,
                 background_jobs: self.background_jobs,
+                user_hasher,
                 ..PlayerDbConfig::default()
             },
         )
@@ -467,7 +474,9 @@ fn main() {
             if args.db.db.exists() {
                 fail(format!("{} exists", args.db.db.display()));
             }
-            let db = args.db.open();
+            let hasher = UserHasher::load(&args.build.join(USER_HASH_KEY_FILE))
+                .unwrap_or_else(|err| fail(err));
+            let db = args.db.open_with(Some(hasher));
             for cf in CFS {
                 let files = sst_files(&args.build, cf).unwrap_or_else(|err| fail(err));
                 let t = Instant::now();

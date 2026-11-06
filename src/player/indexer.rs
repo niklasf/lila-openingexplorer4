@@ -193,7 +193,7 @@ impl Indexer {
             return Ok(ticket);
         }
         let db = Arc::clone(&self.db);
-        let uh = user.hash();
+        let uh = db.user_hash(user);
         let status = task::spawn_blocking(move || db.status(uh))
             .await
             .expect("status task");
@@ -225,7 +225,7 @@ impl Indexer {
     pub async fn delete(&self, user: &UserId) -> Result<bool, PlayerDbError> {
         let _busy = self.queue.reserve(user).await;
         let db = Arc::clone(&self.db);
-        let uh = user.hash();
+        let uh = db.user_hash(user);
         let existed = task::spawn_blocking(move || -> Result<bool, PlayerDbError> {
             let existed = db.status(uh)?.is_some();
             db.delete_player(uh)?;
@@ -242,7 +242,7 @@ impl Indexer {
 
     async fn index(self: &Arc<Self>, idx: usize, item: QueueItem) {
         let user = item.user().clone();
-        let uh = user.hash();
+        let uh = self.db.user_hash(&user);
         let db = Arc::clone(&self.db);
         let status = match task::spawn_blocking(move || db.status(uh))
             .await

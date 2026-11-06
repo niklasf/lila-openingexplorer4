@@ -163,8 +163,8 @@ impl PlayerState {
     fn read(&self, request: &Request) -> Result<PlayerResponse, Error> {
         let started = Instant::now();
         let query = &request.query;
-        let uh = query.player.hash();
         let db = self.indexer.db();
+        let uh = db.user_hash(&query.player);
         let reader = db.reader();
         let empty = || PlayerResponse {
             opening: request.opening.clone(),

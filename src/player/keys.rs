@@ -1,6 +1,6 @@
-//! Keys of the column families of the personal explorer. Every key starts
-//! with the `UserHash`, so that all data of a player is one contiguous key
-//! range.
+//! Keys of the column families of the personal explorer. Every key of
+//! player data starts with the `UserHash`, so that all data of a player is
+//! one contiguous key range.
 //!
 //! ```text
 //! status    uh                                  -> PlayerStatus
@@ -8,6 +8,7 @@
 //! game_ids  uh | GameId                         -> seq
 //! warm      uh | gen | color | PositionKey      -> PlayerEntry
 //! cold      uh | gen | color | bucket           -> PlayerColdGroup
+//! meta      name                                -> value (no player)
 //! ```
 //!
 //! Integers are big endian, so that keys sort numerically.
@@ -84,11 +85,13 @@ macro_rules! key_bytes {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StatusKey([u8; UserHash::SIZE]);
+pub struct StatusKey([u8; StatusKey::SIZE]);
 
 key_bytes!(StatusKey);
 
 impl StatusKey {
+    pub const SIZE: usize = UserHash::SIZE;
+
     pub fn new(uh: UserHash) -> StatusKey {
         StatusKey(*uh.as_bytes())
     }
@@ -130,20 +133,16 @@ impl GameIdKey {
     }
 }
 
+/// Size of the prefix of the warm and cold keys of a generation and color.
+const INDEX_PREFIX_SIZE: usize = UserHash::SIZE + Generation::SIZE + 1;
+
 /// Prefix of the warm and cold keys of a generation and color.
-struct IndexPrefix;
-
-impl IndexPrefix {
-    const SIZE: usize = UserHash::SIZE + Generation::SIZE + 1;
-
-    fn bytes(uh: UserHash, generation: Generation, color: Color) -> [u8; IndexPrefix::SIZE] {
-        let mut key = [0; IndexPrefix::SIZE];
-        key[..UserHash::SIZE].copy_from_slice(uh.as_bytes());
-        key[UserHash::SIZE..UserHash::SIZE + Generation::SIZE]
-            .copy_from_slice(&generation.to_bytes());
-        key[IndexPrefix::SIZE - 1] = color_byte(color);
-        key
-    }
+fn index_prefix(uh: UserHash, generation: Generation, color: Color) -> [u8; INDEX_PREFIX_SIZE] {
+    let mut key = [0; INDEX_PREFIX_SIZE];
+    key[..UserHash::SIZE].copy_from_slice(uh.as_bytes());
+    key[UserHash::SIZE..UserHash::SIZE + Generation::SIZE].copy_from_slice(&generation.to_bytes());
+    key[INDEX_PREFIX_SIZE - 1] = color_byte(color);
+    key
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -152,12 +151,12 @@ pub struct WarmKey([u8; WarmKey::SIZE]);
 key_bytes!(WarmKey);
 
 impl WarmKey {
-    pub const SIZE: usize = IndexPrefix::SIZE + PositionKey::SIZE;
+    pub const SIZE: usize = INDEX_PREFIX_SIZE + PositionKey::SIZE;
 
     pub fn new(uh: UserHash, generation: Generation, color: Color, pos: &PositionKey) -> WarmKey {
         let mut key = [0; WarmKey::SIZE];
-        key[..IndexPrefix::SIZE].copy_from_slice(&IndexPrefix::bytes(uh, generation, color));
-        key[IndexPrefix::SIZE..].copy_from_slice(pos.as_bytes());
+        key[..INDEX_PREFIX_SIZE].copy_from_slice(&index_prefix(uh, generation, color));
+        key[INDEX_PREFIX_SIZE..].copy_from_slice(pos.as_bytes());
         WarmKey(key)
     }
 }
@@ -191,7 +190,7 @@ pub struct ColdGroupKey([u8; ColdGroupKey::SIZE]);
 key_bytes!(ColdGroupKey);
 
 impl ColdGroupKey {
-    pub const SIZE: usize = IndexPrefix::SIZE + 4;
+    pub const SIZE: usize = INDEX_PREFIX_SIZE + 4;
 
     pub fn new(
         uh: UserHash,
@@ -200,46 +199,51 @@ impl ColdGroupKey {
         bucket: ColdBucket,
     ) -> ColdGroupKey {
         let mut key = [0; ColdGroupKey::SIZE];
-        key[..IndexPrefix::SIZE].copy_from_slice(&IndexPrefix::bytes(uh, generation, color));
-        key[IndexPrefix::SIZE..].copy_from_slice(&bucket.0.to_be_bytes());
+        key[..INDEX_PREFIX_SIZE].copy_from_slice(&index_prefix(uh, generation, color));
+        key[INDEX_PREFIX_SIZE..].copy_from_slice(&bucket.0.to_be_bytes());
         ColdGroupKey(key)
     }
 }
 
-/// Key ranges of a player, for `DeleteRange`.
-pub struct PlayerRange;
+/// Longest key of any column family.
+pub const MAX_KEY_SIZE: usize = WarmKey::SIZE;
 
-impl PlayerRange {
-    /// All keys of the player in any column family: `[uh, uh + 1)`, or up
-    /// to a key past every key of the player for the largest hash.
-    pub fn all(uh: UserHash) -> (Vec<u8>, Vec<u8>) {
-        let start = uh.as_bytes().to_vec();
-        let end = match uh.to_u64().checked_add(1) {
+const _: () = assert!(
+    StatusKey::SIZE <= MAX_KEY_SIZE
+        && GameKey::SIZE <= MAX_KEY_SIZE
+        && GameIdKey::SIZE <= MAX_KEY_SIZE
+        && ColdGroupKey::SIZE <= MAX_KEY_SIZE
+);
+
+/// Key ranges of a player, for `DeleteRange`.
+impl UserHash {
+    /// All keys of the player in any column family: `[uh, uh + 1)`, or for
+    /// the largest hash up to `uh` and more `0xff` than any key has after
+    /// it.
+    pub fn range(self) -> (Vec<u8>, Vec<u8>) {
+        let start = self.as_bytes().to_vec();
+        let end = match self.to_u64().checked_add(1) {
             Some(next) => next.to_be_bytes().to_vec(),
             None => {
                 let mut end = start.clone();
-                end.extend_from_slice(&[0xff; 32]);
+                end.resize(MAX_KEY_SIZE + 1, 0xff);
                 end
             }
         };
         (start, end)
     }
 
-    /// The warm or cold keys of generations `from..to`.
-    pub fn generations(
-        uh: UserHash,
-        from: Generation,
-        to: Option<Generation>,
-    ) -> (Vec<u8>, Vec<u8>) {
-        let mut start = uh.as_bytes().to_vec();
+    /// The warm or cold keys of generations `from..to` (or all from `from`).
+    pub fn generations_range(self, from: Generation, to: Option<Generation>) -> (Vec<u8>, Vec<u8>) {
+        let mut start = self.as_bytes().to_vec();
         start.extend_from_slice(&from.to_bytes());
         let end = match to {
             Some(to) => {
-                let mut end = uh.as_bytes().to_vec();
+                let mut end = self.as_bytes().to_vec();
                 end.extend_from_slice(&to.to_bytes());
                 end
             }
-            None => PlayerRange::all(uh).1,
+            None => self.range().1,
         };
         (start, end)
     }
@@ -248,7 +252,6 @@ impl PlayerRange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::UserId;
 
     #[test]
     fn test_cold_bucket() {
@@ -263,8 +266,8 @@ mod tests {
 
     #[test]
     fn test_ranges() {
-        let uh = UserId::from_name("alice").unwrap().hash();
-        let (start, end) = PlayerRange::all(uh);
+        let uh = UserHash::from_bytes(*b"\x12\x34\x56\x78\x9a\xbc\xde\xf0");
+        let (start, end) = uh.range();
         let key = WarmKey::new(
             uh,
             Generation(7),
@@ -272,13 +275,20 @@ mod tests {
             &PositionKey::from_bytes([0xff; 12]),
         );
         assert!(start.as_slice() <= key.as_ref() && key.as_ref() < end.as_slice());
-        let (start, end) = PlayerRange::generations(uh, Generation(7), Some(Generation(8)));
+        let (start, end) = uh.generations_range(Generation(7), Some(Generation(8)));
         assert!(start.as_slice() <= key.as_ref() && key.as_ref() < end.as_slice());
-        let (start, _) = PlayerRange::generations(uh, Generation(8), None);
+        let (start, _) = uh.generations_range(Generation(8), None);
         assert!(key.as_ref() < start.as_slice());
         let max = UserHash::from_bytes([0xff; 8]);
-        let (start, end) = PlayerRange::all(max);
+        let (start, end) = max.range();
         let key = GameKey::new(max, GameSeq(u32::MAX));
+        assert!(start.as_slice() <= key.as_ref() && key.as_ref() < end.as_slice());
+        let key = WarmKey::new(
+            max,
+            Generation(u32::MAX),
+            Color::Black,
+            &PositionKey::from_bytes([0xff; 12]),
+        );
         assert!(start.as_slice() <= key.as_ref() && key.as_ref() < end.as_slice());
     }
 }
