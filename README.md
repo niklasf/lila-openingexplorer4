@@ -1,7 +1,8 @@
 # lila-openingexplorer v4
 
 Next generation opening explorer for lichess.org, indexing billions of
-chess games (currently ~10 B rated games across all variants, growing fast).
+chess games (currently ~10 billion rated games across all variants,
+and growing).
 
 ## Usage
 
@@ -41,14 +42,32 @@ explorer masters --db /hdd/masters/db --bind 127.0.0.1:9003 --cors \
 * `--response-cache 100000`: 28% hit rate in 2026-11. More gains little.
 * `--lila-bearer-file`: Token of https://lichess.org/@/OpeningExplorer
   (or `EXPLORER_BEARER_FILE`), for the blacklist of players marked by
-  moderators (`/api/stream/mod-marked-since`, all of it on startup, then
-  every `--blacklist-refresh` seconds, default 173 min). Their games are
-  left out of top, recent, and single-move games; statistics still count
-  them. Without access, updates fail and are retried every minute.
+  moderators every `--blacklist-refresh` seconds, default 173 min.
   `--no-blacklist` to disable.
 * `--max-ply` must match the indexing runs (of `parquet_to_positions` and
   `parquet_to_games`): 50 (the default) for lichess, 0 (all plies) for
   masters.
+* `--admin-bind`: Provide `/monitor`.
+
+The personal opening explorer (`/player`) has its own writable database,
+created on first start, and indexes games from lila on demand:
+
+```sh
+explorer player --db /nvme/player/db --bind 127.0.0.1:9004 --cors \
+    --db-path /nvme/player/sst:64g --db-path /hdd/player/sst:6t \
+    --cache 8g \
+    --lila-bearer-file /etc/explorer-bearer
+```
+
+* `--db-path`: The write ahead log (in `--db`), then multiple paths and
+  their capacities (to put the upper levels on fast storage, if possible).
+* `--rate-limit 16m` (default): Bounds write throughput per second of
+  compactions.
+* `--admin-bind`: Provide `/monitor` and `DELETE /player/{id}`.
+* `--indexers 8` (default): Parallel index runs, which is also the most
+  parallel streams from lila's games export. Uses `--lila-bearer-file`
+  if specified.
+* `--max-ply 50` (default). Must not change on an existing database.
 
 Replay an nginx request log (tab separated `$msec`, `$status`,
 `$request_time`, `$upstream_response_time`, `$request_uri`) against both:
