@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod bulk;
 pub mod db;
 pub mod explore;
 pub mod game;

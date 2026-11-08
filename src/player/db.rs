@@ -754,6 +754,30 @@ impl PlayerDb {
         Ok(generations)
     }
 
+    /// Calls `f` with the keys and (merged) values of a column family in
+    /// `[start, end)`, without filling the block cache (for measurements).
+    pub fn scan(
+        &self,
+        cf: &str,
+        start: &[u8],
+        end: &[u8],
+        mut f: impl FnMut(&[u8], &[u8]),
+    ) -> Result<(), PlayerDbError> {
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_lower_bound(start.to_vec());
+        read_opts.set_iterate_upper_bound(end.to_vec());
+        read_opts.fill_cache(false);
+        for item in self.db.iterator_cf_opt(
+            self.cf(cf),
+            read_opts,
+            IteratorMode::From(start, Direction::Forward),
+        ) {
+            let (key, value) = item?;
+            f(&key, &value);
+        }
+        Ok(())
+    }
+
     /// Compacts everything (for tests and measurements).
     pub fn compact(&self) {
         for cf in ALL_CFS {
