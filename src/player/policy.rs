@@ -15,7 +15,7 @@ impl Default for RunPolicy {
     fn default() -> RunPolicy {
         RunPolicy {
             cooldown: Duration::from_secs(2 * 60),
-            revisit_interval: Duration::from_secs(24 * 60 * 60),
+            revisit_interval: Duration::from_secs(15 * 60),
         }
     }
 }

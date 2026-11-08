@@ -127,7 +127,7 @@ Overall features:
 * [x] Lichess games
 * [x] Master games
 * [ ] Broadcast games
-* [ ] Lichess games indexed by player (aka personal opening explorer)
+* [x] Lichess games indexed by player (aka personal opening explorer)
 
 Critical performance work:
 

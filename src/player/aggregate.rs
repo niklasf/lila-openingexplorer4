@@ -121,10 +121,17 @@ pub fn find_visit(
 /// the union), so this only trades space against validation work.
 const WARM_MIN_GAMES: usize = 2;
 
-/// Bucket bits for at most 64 cold items per group on average (the least
-/// bits with `items <= 64 << bits`), up to `MAX_COLD_BITS`.
+/// Cold items per group on average at most. Larger groups are smaller per
+/// item (fewer keys, better compression) and cost little: one lookup reads
+/// one group either way, and false candidates stay rare (about 0.3% of
+/// lookups at 256).
+const COLD_GROUP_ITEMS: u64 = 256;
+
+/// Bucket bits for at most `COLD_GROUP_ITEMS` cold items per group on
+/// average (the least bits with `items <= COLD_GROUP_ITEMS << bits`), up to
+/// `MAX_COLD_BITS`.
 pub fn cold_bits_for(items: u64) -> u8 {
-    let groups = items.div_ceil(64);
+    let groups = items.div_ceil(COLD_GROUP_ITEMS);
     let bits = u64::BITS - groups.saturating_sub(1).leading_zeros();
     bits.min(u32::from(MAX_COLD_BITS)) as u8
 }
@@ -335,10 +342,10 @@ mod tests {
     #[test]
     fn test_cold_bits_for() {
         assert_eq!(cold_bits_for(0), 0);
-        assert_eq!(cold_bits_for(64), 0);
-        assert_eq!(cold_bits_for(65), 1);
-        assert_eq!(cold_bits_for(64 * 1024), 10);
-        assert_eq!(cold_bits_for(20_000_000), 19);
+        assert_eq!(cold_bits_for(256), 0);
+        assert_eq!(cold_bits_for(257), 1);
+        assert_eq!(cold_bits_for(256 * 1024), 10);
+        assert_eq!(cold_bits_for(20_000_000), 17);
         assert_eq!(cold_bits_for(u64::MAX), MAX_COLD_BITS);
     }
 }

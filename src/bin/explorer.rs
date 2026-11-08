@@ -109,7 +109,7 @@ struct PlayerArgs {
     #[arg(long, default_value = "120", help_heading = "Indexer")]
     cooldown: u64,
     /// Revisit ongoing games at most this often (seconds).
-    #[arg(long, default_value = "86400", help_heading = "Indexer")]
+    #[arg(long, default_value = "900", help_heading = "Indexer")]
     revisit_interval: u64,
     /// Games per chunk (one atomic write) at most.
     #[arg(long, default_value = "2000", help_heading = "Indexer")]
