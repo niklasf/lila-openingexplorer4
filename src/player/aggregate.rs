@@ -118,8 +118,10 @@ pub fn find_visit(
 
 /// Positions with at least this many games of a player (and color) are
 /// warm, the others cold. Any placement gives correct results (reads take
-/// the union), so this only trades space against validation work.
-const WARM_MIN_GAMES: usize = 2;
+/// the union), so this only trades space against validation work: at 3
+/// rather than 2, warm and cold together are 8% smaller, and 1.4% of reads
+/// validate 2 more cold candidates.
+const WARM_MIN_GAMES: usize = 3;
 
 /// Cold items per group on average at most. Larger groups are smaller per
 /// item (fewer keys, better compression) and cost little: one lookup reads
