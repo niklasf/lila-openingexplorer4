@@ -305,6 +305,7 @@ impl Indexer {
         let (tx, rx) = mpsc::channel::<Chunk>(2);
         let writer = {
             let db = Arc::clone(&self.db);
+            let run = run.clone();
             let progress = item.progress();
             task::spawn_blocking(move || write_chunks(&db, status, run, rx, progress))
         };

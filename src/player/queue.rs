@@ -9,7 +9,7 @@ use crate::player::UserId;
 
 /// Progress of the indexing of a player, as seen by the requests waiting
 /// for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Progress {
     /// Position in the queue (1 for the next player), 0 while indexing.
     pub queue_position: u64,
@@ -37,14 +37,14 @@ impl Ticket {
     }
 
     pub fn progress(&self) -> Progress {
-        *self.rx.borrow()
+        self.rx.borrow().clone()
     }
 
     /// Waits for the next change of the progress, returning it. Returns the
     /// last progress (as done) if the queue dropped the ticket.
     pub async fn changed(&mut self) -> Progress {
         match self.rx.changed().await {
-            Ok(()) => *self.rx.borrow_and_update(),
+            Ok(()) => self.rx.borrow_and_update().clone(),
             Err(_) => Progress {
                 done: true,
                 ..*self.rx.borrow()
@@ -53,7 +53,7 @@ impl Ticket {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueFull;
 
 struct Entry {
@@ -126,7 +126,7 @@ pub struct Queue {
 }
 
 /// Counts of the queue, for `/monitor`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct QueueStats {
     pub waiting: usize,
     pub running: usize,

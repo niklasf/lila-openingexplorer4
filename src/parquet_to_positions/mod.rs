@@ -33,7 +33,7 @@ use crate::{
         ChunkWriterConfig, ChunkWriterTimes, Layout, RESIDENT_PARTITIONS_PER_PASS, ScratchFile,
         spawn_chunk_writers,
     },
-    sst::SstConfig,
+    sst::{SstConfig, SstTableConfig},
     util::{Gauge, create_dir, create_empty_dir, log_above, progress_bar, timed, timed_seconds},
 };
 
@@ -133,7 +133,7 @@ impl Estimate {
     }
 
     /// Bytes of one memory partition in memory, including bucket slack.
-    fn partition_memory(&self, layout: Layout) -> u64 {
+    fn partition_memory(&self, layout: &Layout) -> u64 {
         self.record_bytes() * 17 / 16 / layout.memory_partitions() as u64
     }
 
@@ -143,7 +143,7 @@ impl Estimate {
     }
 
     /// Peak memory for the given layout and read threads.
-    fn memory(&self, layout: Layout, read_threads: u64) -> u64 {
+    fn memory(&self, layout: &Layout, read_threads: u64) -> u64 {
         let buffers =
             read_threads * layout.scratch_partitions_per_pass() as u64 * CHUNK_BYTES as u64;
         BASE_MEMORY
@@ -153,7 +153,7 @@ impl Estimate {
     }
 
     /// Scratch space needed by one pass.
-    fn scratch(&self, layout: Layout) -> u64 {
+    fn scratch(&self, layout: &Layout) -> u64 {
         let per_partition =
             self.record_bytes() as f64 * self.scratch_ratio / layout.memory_partitions() as f64;
         (per_partition * layout.scratch_partitions_per_pass() as f64) as u64
@@ -322,8 +322,8 @@ impl fmt::Display for Plan {
             self.estimate.hot.len(),
             self.layout.passes(),
             self.layout.memory_partitions_per_pass(),
-            self.estimate.scratch(self.layout) >> 30,
-            self.estimate.memory(self.layout, self.read_threads as u64) >> 30,
+            self.estimate.scratch(&self.layout) >> 30,
+            self.estimate.memory(&self.layout, self.read_threads as u64) >> 30,
             self.read_threads,
             self.write_threads,
             self.load_threads,
@@ -360,7 +360,7 @@ pub fn convert(
     let Plan {
         ref input,
         ref estimate,
-        layout,
+        ref layout,
         read_threads,
         write_threads,
         load_threads,
@@ -386,8 +386,14 @@ pub fn convert(
             zstd_dict: 0,
             ..config.sst
         }
-        .options(false),
-        positions_opts: &config.sst.options(true),
+        .options(&SstTableConfig {
+            filter: false,
+            separate_key_value_in_data_block: false,
+        }),
+        positions_opts: &config.sst.options(&SstTableConfig {
+            filter: true,
+            separate_key_value_in_data_block: true,
+        }),
         env_opts: &config.sst.env_options(),
         out,
         target_size: config.sst_target_size,
@@ -506,7 +512,7 @@ pub fn convert(
                     zstd_level: config.scratch_zstd_level,
                     // The first pass has nothing to wait for.
                     budget: (pass > 0).then_some(config.scratch_budget),
-                    layout,
+                    layout: layout.clone(),
                     read_threads,
                     write_threads,
                     io_depth: config.io_depth.max(1),
@@ -652,9 +658,8 @@ fn scatter_pass(
     config: &ScatterConfig<'_>,
     progress: &ProgressBar,
 ) -> io::Result<Scattered> {
-    let layout = config.layout;
-    let scratch_partitions = layout.scratch_partitions_per_pass();
-    let first_memory_partition = layout.first_memory_partition(pass);
+    let scratch_partitions = config.layout.scratch_partitions_per_pass();
+    let first_memory_partition = config.layout.first_memory_partition(pass);
     let counters = config.counters;
 
     let files: Vec<Mutex<ScratchFile>> = (0..scratch_partitions)
@@ -723,8 +728,8 @@ fn scatter_pass(
                         games += 1;
 
                         for entry in replayer.entries(&info) {
-                            let Some(j) = layout.pass_memory_partition(
-                                memory_partition(entry.key(), layout.memory_partitions()),
+                            let Some(j) = config.layout.pass_memory_partition(
+                                memory_partition(entry.key(), config.layout.memory_partitions()),
                                 pass,
                             ) else {
                                 continue;

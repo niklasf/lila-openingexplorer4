@@ -54,7 +54,7 @@ const MAX_COMPRESSED_BYTES_PER_KB: i32 = 960;
 /// Bloom-equivalent bits per key of filters, for about 1% false positives.
 const FILTER_BITS_PER_KEY: f64 = 10.0;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct SstConfig {
     pub block_size: usize,
     /// Zstd level of the SST files, or 0 for no compression.
@@ -65,11 +65,22 @@ pub struct SstConfig {
     pub direct_io: bool,
 }
 
+/// Table options that depend on the column family.
+#[derive(Debug, Clone)]
+pub struct SstTableConfig {
+    /// Use a filter if lookups often miss and the keys are sparse.
+    pub filter: bool,
+    /// Store the keys and the values of each data block in separate
+    /// sections. Measured on the full lichess database (2026-11-09):
+    /// games -3.1%, positions -0.9%, with no slower point lookups. Not for
+    /// cold positions (+0.1%).
+    pub separate_key_value_in_data_block: bool,
+}
+
 impl SstConfig {
-    /// Options for SST files that serve point lookups. Use a `filter` if
-    /// lookups often miss and the keys are sparse.
-    pub fn options(&self, filter: bool) -> Options {
-        self.options_with_table(&self.table_options(filter))
+    /// Options for SST files that serve point lookups.
+    pub fn options(&self, config: &SstTableConfig) -> Options {
+        self.options_with_table(&self.table_options(config))
     }
 
     /// Column family options with the given table options, which should be
@@ -90,7 +101,7 @@ impl SstConfig {
 
     /// Table options for SST files that serve point lookups. Readers must
     /// use the same filter policy to make use of the filters.
-    pub fn table_options(&self, filter: bool) -> BlockBasedOptions {
+    pub fn table_options(&self, config: &SstTableConfig) -> BlockBasedOptions {
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_size(self.block_size);
         // Hash lookup within data blocks, instead of binary search.
@@ -103,7 +114,8 @@ impl SstConfig {
         // Delta-encode index keys in runs of 16, instead of storing every
         // key in full.
         table_opts.set_index_block_restart_interval(16);
-        if filter {
+        table_opts.set_separate_key_value_in_data_block(config.separate_key_value_in_data_block);
+        if config.filter {
             set_filter(&mut table_opts);
             table_opts.set_partition_filters(true);
             table_opts.set_optimize_filters_for_memory(true);

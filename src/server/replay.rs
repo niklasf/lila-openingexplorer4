@@ -5,7 +5,7 @@ use shakmaty::{
 
 use crate::packed::{BorrowedLichessGame, PackedMovesDecoder, PositionKey};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Visit {
     pub m: PackedUciMove,
     pub turn: Color,

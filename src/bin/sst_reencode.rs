@@ -11,7 +11,7 @@ use std::{
 use clap::Parser;
 use lila_openingexplorer4::{
     server::db::{COLD_CF, GAME_IDS_CF, GAMES_CF, POSITIONS_CF},
-    sst::{SstConfig, SstFile, read_table_options},
+    sst::{SstConfig, SstFile, SstTableConfig, read_table_options},
 };
 use rocksdb::{DB, DBCompressionType, Options, ReadOptions};
 use tikv_jemallocator::Jemalloc;
@@ -44,7 +44,7 @@ struct Args {
     /// not a complete column family.
     #[arg(long, default_value = "1")]
     sample: usize,
-    /// Block size. Defaults to 16384 for games, 4096 otherwise.
+    /// Block size. Defaults to 16384 for games and game ids, 4096 otherwise.
     #[arg(long)]
     block_size: Option<usize>,
     /// Size of index and filter partitions.
@@ -52,6 +52,10 @@ struct Args {
     metadata_block_size: usize,
     #[arg(long, default_value = "16")]
     index_restart_interval: i32,
+    /// Store the keys and the values of each data block in separate
+    /// sections. Defaults to true for games and positions, false otherwise.
+    #[arg(long)]
+    separate_key_value_in_data_block: Option<bool>,
     /// Bloom-equivalent bits per key of the ribbon filter, 0 for none.
     /// Defaults to 10 for positions, none otherwise.
     #[arg(long)]
@@ -72,7 +76,7 @@ struct Args {
     format_version: Option<i32>,
     /// More block based table options, in RocksDB's options string syntax,
     /// for options without a setter, like
-    /// `separate_key_value_in_data_block=true;uniform_cv_threshold=0.2`.
+    /// `uniform_cv_threshold=0.2`.
     #[arg(long)]
     table_options: Option<String>,
 }
@@ -126,12 +130,21 @@ fn main() {
     let sst = SstConfig {
         block_size: args
             .block_size
-            .unwrap_or(if args.cf == GAMES_CF { 16384 } else { 4096 }),
+            .unwrap_or(if args.cf == GAMES_CF || args.cf == GAME_IDS_CF {
+                16384
+            } else {
+                4096
+            }),
         zstd_level,
         zstd_dict: 0,
         direct_io: true,
     };
-    let mut table_opts = sst.table_options(false);
+    let mut table_opts = sst.table_options(&SstTableConfig {
+        filter: false,
+        separate_key_value_in_data_block: args
+            .separate_key_value_in_data_block
+            .unwrap_or(args.cf == GAMES_CF || args.cf == POSITIONS_CF),
+    });
     table_opts.set_metadata_block_size(args.metadata_block_size);
     table_opts.set_index_block_restart_interval(args.index_restart_interval);
     if filter_bits > 0.0 {

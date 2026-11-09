@@ -448,7 +448,6 @@ fn main() {
                 members: &members,
                 threads: args.threads,
                 max_ply: args.max_ply,
-                synth,
                 plan: AgingPlan {
                     window_start: synth.unshifted(parse_date(&args.window_start)),
                     window_end: synth.unshifted(window_end),
@@ -462,6 +461,7 @@ fn main() {
                     max_interval: (args.max_interval_days * day) as u64,
                     seed: args.synth.seed,
                 },
+                synth,
                 sst_target_bytes: args.sst_target.into(),
                 dry_run: args.dry_run,
             })
@@ -507,7 +507,6 @@ fn main() {
                         bits: args.partition_bits,
                     },
                     workers: args.workers,
-                    synth,
                     chunk_games: args.chunk_games,
                     rebuild_min_games: args.rebuild_min_games,
                     rebuild_factor: args.rebuild_factor,
@@ -515,6 +514,7 @@ fn main() {
                         .until
                         .as_deref()
                         .map(|d| synth.unshifted(parse_date(d))),
+                    synth,
                 },
             )
             .unwrap_or_else(|err| fail(err));

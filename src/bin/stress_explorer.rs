@@ -182,7 +182,7 @@ fn read_requests(args: &Args, targets: &[Target]) -> io::Result<(Vec<Request>, u
 const MAX_EXAMPLES: usize = 5;
 
 /// A request in the latency log.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LogEntry {
     /// Index in the measured requests.
     index: usize,
@@ -482,7 +482,7 @@ fn write_latency_log(path: &PathBuf, targets: &[Target], outcomes: &[Outcome]) -
     let mut entries: Vec<(&str, LogEntry)> = targets
         .iter()
         .zip(outcomes)
-        .flat_map(|(target, outcome)| outcome.log.iter().map(|&entry| (target.name, entry)))
+        .flat_map(|(target, outcome)| outcome.log.iter().map(|entry| (target.name, entry.clone())))
         .collect();
     entries.sort_unstable_by_key(|(_, entry)| entry.index);
     let mut out = io::BufWriter::new(fs::File::create(path)?);

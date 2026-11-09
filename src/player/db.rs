@@ -28,7 +28,7 @@ use crate::{
         },
         status::PlayerStatus,
     },
-    sst::SstConfig,
+    sst::{SstConfig, SstTableConfig},
     util::{Counter, push_counters},
 };
 
@@ -140,14 +140,14 @@ fn cold_merge(_key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) ->
     Some(buf)
 }
 
-fn table_options(cache: &Cache, filter: bool) -> BlockBasedOptions {
+fn table_options(cache: &Cache, config: &SstTableConfig) -> BlockBasedOptions {
     let mut table_opts = SstConfig {
         block_size: 16 * 1024,
         zstd_level: 3,
         zstd_dict: 0,
         direct_io: false,
     }
-    .table_options(filter);
+    .table_options(config);
     table_opts.set_block_cache(cache);
     table_opts.set_cache_index_and_filter_blocks(true);
     table_opts.set_cache_index_and_filter_blocks_with_high_priority(true);
@@ -157,7 +157,13 @@ fn table_options(cache: &Cache, filter: bool) -> BlockBasedOptions {
 
 fn cf_options(name: &str, cache: &Cache) -> Options {
     let mut opts = Options::default();
-    opts.set_block_based_table_factory(&table_options(cache, name != GAMES_CF));
+    opts.set_block_based_table_factory(&table_options(
+        cache,
+        &SstTableConfig {
+            filter: name != GAMES_CF,
+            separate_key_value_in_data_block: false,
+        },
+    ));
     opts.set_level_compaction_dynamic_level_bytes(true);
     opts.set_compression_type(DBCompressionType::Lz4);
     opts.set_bottommost_compression_type(DBCompressionType::Zstd);

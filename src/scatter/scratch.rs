@@ -85,7 +85,7 @@ impl ChunkDecompressor {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct ChunkMeta {
     offset: u64,
     raw_len: u32,

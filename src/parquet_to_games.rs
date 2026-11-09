@@ -14,7 +14,7 @@ use indicatif::{MultiProgress, ProgressBar};
 use crate::{
     packed::{BorrowedLichessGame, GameId, GameIndex, PackedMoves, pack_game_value},
     parquet::Input,
-    sst::{RollingSstWriter, SstConfig, SstError, SstStats},
+    sst::{RollingSstWriter, SstConfig, SstError, SstStats, SstTableConfig},
     util::{create_empty_dir, log_above, progress_bar},
 };
 
@@ -74,7 +74,10 @@ pub fn convert(
         create_empty_dir(dir)?;
     }
 
-    let opts = config.sst.options(false);
+    let opts = config.sst.options(&SstTableConfig {
+        filter: false,
+        separate_key_value_in_data_block: true,
+    });
     let env_opts = config.sst.env_options();
     let ranges = ranges(&input, config);
     let progress = progress.add(progress_bar(input.total_rows()));
@@ -219,7 +222,10 @@ fn write_game_ids(
     if let Some(pair) = ids.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         return Err(io::Error::other(format!("duplicate game id {}", pair[0].0)).into());
     }
-    let opts = config.sst.options(false);
+    let opts = config.sst.options(&SstTableConfig {
+        filter: false,
+        separate_key_value_in_data_block: false,
+    });
     let env_opts = config.sst.env_options();
     let mut writer = RollingSstWriter::new(
         &opts,

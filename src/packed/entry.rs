@@ -247,7 +247,7 @@ impl CellKey {
 /// A cell to be packed: its statistics and games, in ascending order.
 /// At least the most recent `min(GAMES_PER_CELL, games of the cell)` games
 /// must be given.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct EntryCell<'a> {
     pub key: CellKey,
     pub stats: SubStats,
@@ -435,7 +435,7 @@ impl<H: CellGroupHeader> Entry<H> {
         let mut new_move = true;
         while let Some(first) = cells.next() {
             group.clear();
-            group.push(first);
+            group.push(first.clone());
             while let Some(cell) = cells
                 .next_if(|cell| cell.key.m == first.key.m && cell.key.header == first.key.header)
             {
@@ -632,7 +632,7 @@ impl<'a, H: CellGroupHeader> Iterator for GroupViews<'a, H> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CellHeader {
     pub key: CellKey,
     pub stats: SubStats,

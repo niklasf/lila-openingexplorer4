@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::player::{status::PlayerStatus, time::UnixMillis};
 
 /// When to index a player.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RunPolicy {
     /// No new index run within this time after the last one.
     pub cooldown: Duration,
@@ -21,7 +21,7 @@ impl Default for RunPolicy {
 }
 
 /// An index run: request games created since a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRun {
     /// Request games with `createdAt >= since`.
     pub since: UnixMillis,

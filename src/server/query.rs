@@ -133,7 +133,7 @@ impl Play {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LichessFilter {
     pub speeds: Option<Speeds>,
     pub ratings: Option<RatingGroups>,
@@ -173,7 +173,7 @@ impl LichessFilter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Limits {
     pub moves: usize,
     pub top_games: usize,

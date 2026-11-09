@@ -56,7 +56,7 @@ pub fn game_number(id: GameId) -> u64 {
     u64::from_be_bytes(b)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Synth {
     pub seed: u64,
     /// Share of games that are casual.
