@@ -50,7 +50,7 @@ struct Args {
     #[arg(long)]
     block_size: Option<usize>,
     /// Keys between restart points of data blocks, which are delta-encoded
-    /// in between. RocksDB's default is 16.
+    /// in between.
     #[arg(long)]
     block_restart_interval: Option<i32>,
     /// Size of index and filter partitions.

@@ -1,8 +1,7 @@
 use std::{fs, io, path::PathBuf};
 
 use rocksdb::{
-    BlockBasedIndexType, BlockBasedOptions, DBCompressionType, DataBlockIndexType, EnvOptions,
-    Options, SstFileWriter,
+    BlockBasedIndexType, BlockBasedOptions, DBCompressionType, EnvOptions, Options, SstFileWriter,
 };
 use thiserror::Error;
 
@@ -144,9 +143,9 @@ impl SstConfig {
     pub fn table_options(&self) -> BlockBasedOptions {
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_size(self.block_size);
-        // Hash lookup within data blocks, instead of binary search.
-        table_opts.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
-        table_opts.set_data_block_hash_ratio(0.75);
+        // Restart interval 16 (the default) with hash index would save ~5% CPU
+        // on warm lookups, for 1-2% larger files. We pick size.
+        table_opts.set_block_restart_interval(32);
         // Large files: partition the index (and the filter), so that only
         // the top-level index needs to stay in memory.
         table_opts.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
