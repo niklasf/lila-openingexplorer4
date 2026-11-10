@@ -106,7 +106,7 @@ on this development hardware:
 Prepare a parquet file from PGNs for further processing.
 
 **Input:** ~2.4 TiB of monthly game dumps from https://database.lichess.org \
-**Output:** ~600 GiB parquet file \
+**Output:** ~470 GiB parquet file \
 **Typical bottleneck:** sequential reads of the dumps (from HDDs) > CPU
 
 Inputs must be in chronological order by month.
@@ -122,7 +122,7 @@ $B/pgn_to_parquet --out lichess/lichess_db_rated.parquet $pgns
 
 Scan out position SSTs from the parquet file.
 
-**Input:** ~600 GiB parquet file from above \
+**Input:** ~470 GiB parquet file from above \
 **Output:** ~2 TiB of SST files \
 **Additional resources:** ideally ~5.5 TiB fast disk scratch space (for a
 single pass, ~3 TiB for 2 passes, ~1.8 TiB for 3), ~100 GiB RAM \
@@ -143,7 +143,7 @@ $B/parquet_to_positions lichess/lichess_db_rated.parquet --out lichess/sst --scr
 
 Scan out game SSTs
 
-**Input:** ~600 GiB parquet file from above \
+**Input:** ~470 GiB parquet file from above \
 **Output:** ~560 GiB of SST files \
 **Additional resources:** no scratch space, ~2 GiB RAM \
 **Typical bottleneck:** CPU (compression)
