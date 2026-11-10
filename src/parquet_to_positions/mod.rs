@@ -102,7 +102,7 @@ struct Estimate {
 impl Estimate {
     fn new(input: &Input, config: &Config, read_threads: u64) -> Estimate {
         let rows = input.total_rows();
-        let sample = Sample::replay(input, config.threads, config.max_ply);
+        let sample = Sample::replay(input, config.threads);
         let per_row = if sample.sampled_rows == 0 {
             0.0
         } else {
@@ -231,8 +231,6 @@ pub struct Config {
     pub direct_io: bool,
     /// Zstd level for scratch chunks, or 0 for no compression.
     pub scratch_zstd_level: i32,
-    /// Only index the positions of the first plies of each game.
-    pub max_ply: Option<usize>,
     /// Skip the first row groups of the inputs.
     pub skip_row_groups: usize,
     /// Only process the first row groups of the inputs.
@@ -531,7 +529,6 @@ pub fn convert(
                     direct: config.direct_io,
                     counters,
                     hot_set,
-                    max_ply: config.max_ply,
                 },
                 progress,
             )
@@ -630,7 +627,6 @@ struct ScatterConfig<'a> {
     direct: bool,
     counters: &'a Counters,
     hot_set: &'a IntSet<PositionKey>,
-    max_ply: Option<usize>,
 }
 
 /// Accumulated time of each scatter stage, summed over its threads.
@@ -741,7 +737,7 @@ fn scatter_pass(
             let tx = tx.clone();
             let prefetcher = prefetcher.clone();
             s.spawn(move || {
-                let mut replayer = Replayer::new(config.max_ply);
+                let mut replayer = Replayer::new();
                 let mut hot = HotBuffer::new(hot_map);
                 let mut local_resident: Vec<Vec<IntermediateEntry>> = (0
                     ..RESIDENT_PARTITIONS_PER_PASS)

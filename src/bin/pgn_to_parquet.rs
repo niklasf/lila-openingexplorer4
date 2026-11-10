@@ -20,6 +20,8 @@ static ALLOC: Jemalloc = Jemalloc;
 /// Unplayed games (fewer than two plies), unfinished games (without a known
 /// outcome), and games that cannot be parsed are skipped.
 ///
+/// Only the first --max-ply moves of each game are processed.
+///
 /// Games whose id already appeared among the recent games of the same
 /// variant (by `Variant` tag, at least the previous 100k, also across
 /// files, like consecutive months) are skipped as duplicates.
@@ -35,7 +37,7 @@ struct Args {
     threads: Option<usize>,
     /// Files read concurrently. Each takes up to one thread. Consider
     /// matching the number of hard drives, or more for NVMe.
-    #[clap(long, default_value = "4")]
+    #[clap(long, default_value_t = 4)]
     readers: usize,
     /// Maximum bytes of PGN chunks and encoded row groups held in memory
     /// while waiting for earlier chunks. Chunks of the oldest unfinished
@@ -44,7 +46,7 @@ struct Args {
     #[clap(long)]
     memory_budget: Option<ByteSize>,
     /// Games per row group.
-    #[clap(long, default_value = "100000")]
+    #[clap(long, default_value_t = 100000)]
     row_group_len: usize,
     /// Bytes read from a file at once. Large sequential reads are kinder to
     /// spinning disks shared between readers.
@@ -52,13 +54,17 @@ struct Args {
     read_buffer: ByteSize,
     /// Zstd level for meta data columns in the produced parquet file, or 0
     /// for no compression. Gains for levels above 9 are small.
-    #[clap(long, default_value = "9", value_parser = zstd_level())]
+    #[clap(long, default_value_t = 9, value_parser = zstd_level())]
     zstd_level: i32,
     /// Zstd level for the moves column in the produced parquet file, or 0 for
     /// no compression. Stacking compression on the move encoding is not very
     /// effective (~5%).
-    #[clap(long, default_value = "0", value_parser = zstd_level())]
+    #[clap(long, default_value_t = 0, value_parser = zstd_level())]
     moves_zstd_level: i32,
+    /// Keep only the first moves of each game, or 0 for all moves. The
+    /// lichess explorer indexes the first 50 plies.
+    #[clap(long, alias = "max-plies", default_value_t = 50)]
+    max_ply: usize,
 }
 
 fn main() {
@@ -80,6 +86,7 @@ fn main() {
         read_buffer: usize::try_from(args.read_buffer.0).expect("read buffer fits in memory"),
         zstd_level: args.zstd_level,
         moves_zstd_level: args.moves_zstd_level,
+        max_ply: (args.max_ply > 0).then_some(args.max_ply),
     };
 
     let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(4));

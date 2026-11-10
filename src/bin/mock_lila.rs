@@ -57,10 +57,10 @@ struct PrepareArgs {
     /// Fixture directory to write.
     #[arg(long)]
     out: PathBuf,
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value_t = 30)]
     threads: usize,
     /// Skip the first row groups (for slices).
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0)]
     skip_row_groups: usize,
     /// Use only this many row groups (for slices).
     #[arg(long)]
@@ -77,7 +77,7 @@ struct ServeArgs {
     /// The newest month of the fixture is shifted to end at this time, in
     /// ms since the epoch. Default: end of requests.tsv (2026-11-04 20:49
     /// UTC).
-    #[arg(long, default_value = "1793825340000")]
+    #[arg(long, default_value_t = 1793825340000)]
     data_end: u64,
     /// Mock time at startup, in ms since the epoch (default --data-end).
     /// Games created later are not served yet; games running at that time
@@ -88,56 +88,56 @@ struct ServeArgs {
     #[arg(long, conflicts_with = "clock_start")]
     clock_real: bool,
     /// Mock milliseconds per real millisecond.
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value_t = 1.0)]
     clock_rate: f64,
     /// Games per second per stream (0 for unlimited). lila: about 300.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0.0)]
     games_per_second: f64,
     /// Log an error and count a violation whenever more streams are open
     /// at once (0 to disable). Set to the --indexers of the explorer.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0)]
     max_streams: usize,
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0)]
     seed: u64,
     /// Share of games served as casual.
-    #[arg(long, default_value = "0.5")]
+    #[arg(long, default_value_t = 0.5)]
     casual: f64,
     /// Rate of aborted games.
-    #[arg(long, default_value = "0.002", help_heading = "Noise")]
+    #[arg(long, default_value_t = 0.002, help_heading = "Noise")]
     aborted: f64,
     /// Rate of games with status noStart.
-    #[arg(long, default_value = "0.001", help_heading = "Noise")]
+    #[arg(long, default_value_t = 0.001, help_heading = "Noise")]
     no_start: f64,
     /// Rate of opponents without account.
-    #[arg(long, default_value = "0.001", help_heading = "Noise")]
+    #[arg(long, default_value_t = 0.001, help_heading = "Noise")]
     no_account: f64,
     /// Rate of opponents without rating.
-    #[arg(long, default_value = "0.001", help_heading = "Noise")]
+    #[arg(long, default_value_t = 0.001, help_heading = "Noise")]
     no_rating: f64,
     /// Rate of games with an illegal move.
-    #[arg(long, default_value = "0.001", help_heading = "Noise")]
+    #[arg(long, default_value_t = 0.001, help_heading = "Noise")]
     illegal_san: f64,
     /// Rate of players answering 404 (closed accounts).
-    #[arg(long, default_value = "0.002", help_heading = "Noise")]
+    #[arg(long, default_value_t = 0.002, help_heading = "Noise")]
     not_found: f64,
     /// Rate of requests that wait --ttfb-ms before answering.
-    #[arg(long, default_value = "0", help_heading = "Faults")]
+    #[arg(long, default_value_t = 0.0, help_heading = "Faults")]
     slow_start: f64,
-    #[arg(long, default_value = "5000", help_heading = "Faults")]
+    #[arg(long, default_value_t = 5000, help_heading = "Faults")]
     ttfb_ms: u64,
     /// Rate of streams that stall for --stall-ms at a random game.
-    #[arg(long, default_value = "0", help_heading = "Faults")]
+    #[arg(long, default_value_t = 0.0, help_heading = "Faults")]
     stall: f64,
-    #[arg(long, default_value = "90000", help_heading = "Faults")]
+    #[arg(long, default_value_t = 90000, help_heading = "Faults")]
     stall_ms: u64,
     /// Rate of streams cut off at a random game.
-    #[arg(long, default_value = "0", help_heading = "Faults")]
+    #[arg(long, default_value_t = 0.0, help_heading = "Faults")]
     disconnect: f64,
     /// Rate of requests answered with 503.
-    #[arg(long, default_value = "0", help_heading = "Faults")]
+    #[arg(long, default_value_t = 0.0, help_heading = "Faults")]
     server_error: f64,
     /// Rate of malformed lines.
-    #[arg(long, default_value = "0", help_heading = "Faults")]
+    #[arg(long, default_value_t = 0.0, help_heading = "Faults")]
     malformed: f64,
     /// Tab separated log of all requests.
     #[arg(long)]

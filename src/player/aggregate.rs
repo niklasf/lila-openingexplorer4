@@ -14,6 +14,7 @@ use crate::{
         Rating, color_bits,
     },
     player::{
+        MAX_PLY,
         game::BorrowedPlayerGame,
         keys::{ColdBucket, MAX_COLD_BITS, PlayerGameIndex},
     },
@@ -183,14 +184,9 @@ impl Aggregation {
         self.visits.len()
     }
 
-    pub fn add_game(
-        &mut self,
-        index: PlayerGameIndex,
-        game: &BorrowedPlayerGame<'_>,
-        max_ply: usize,
-    ) {
+    pub fn add_game(&mut self, index: PlayerGameIndex, game: &BorrowedPlayerGame<'_>) {
         self.replayed.clear();
-        replay(game, max_ply, &mut self.scratch, &mut self.replayed);
+        replay(game, MAX_PLY, &mut self.scratch, &mut self.replayed);
         let header = PlayerGroupHeader {
             speed: game.speed,
             mode: game.mode,

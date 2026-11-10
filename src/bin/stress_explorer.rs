@@ -41,23 +41,23 @@ struct Args {
     #[arg(long, group = "servers")]
     masters_url: Option<String>,
     /// Concurrent requests, across all targets.
-    #[arg(long, default_value = "32")]
+    #[arg(long, default_value_t = 32)]
     concurrency: usize,
     /// Skip the first requests of the log.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0)]
     skip: usize,
     /// Replay at most this many requests (after warm-up).
     #[arg(long)]
     limit: Option<usize>,
     /// Requests to send before measuring, for example to fill caches.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0)]
     warm_up: usize,
     /// Skip repeated requests, to measure responses that are not in the
     /// response cache.
     #[arg(long)]
     unique: bool,
     /// Timeout of each request in seconds.
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value_t = 60)]
     timeout: u64,
     /// Send the measured requests at this rate (requests per second, across
     /// all targets), instead of as fast as possible. Latencies then count

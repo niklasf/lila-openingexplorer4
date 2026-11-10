@@ -21,7 +21,7 @@ use crate::{
     },
     packed::{CellKey, GameIndex, PlayerEntry, PlayerGroupHeader, PositionKey},
     player::{
-        PlayerDb, UserId,
+        MAX_PLY, PlayerDb, UserId,
         game::PlayerGame,
         keys::PlayerGameIndex,
         lila::{Classified, ExportGame},
@@ -62,7 +62,6 @@ fn expected_games(
     user: &UserId,
     latest: u64,
     config: &CheckConfig<'_>,
-    max_ply: usize,
 ) -> std::io::Result<Vec<PlayerGame>> {
     let Some(games) = fixture.player(user) else {
         return Ok(Vec::new());
@@ -78,9 +77,8 @@ fn expected_games(
         else {
             continue;
         };
-        if let Classified::Game { game, .. } = ExportGame::parse(&line)
-            .expect("mock line")
-            .classify(user, max_ply)
+        if let Classified::Game { game, .. } =
+            ExportGame::parse(&line).expect("mock line").classify(user)
             && seen.insert(game.id)
         {
             out.push(*game);
@@ -90,10 +88,7 @@ fn expected_games(
 }
 
 /// Naive aggregation of the games, with a position for each key.
-fn naive(
-    games: &[PlayerGame],
-    max_ply: usize,
-) -> HashMap<(Color, PositionKey), (VariantPosition, PlayerEntry)> {
+fn naive(games: &[PlayerGame]) -> HashMap<(Color, PositionKey), (VariantPosition, PlayerEntry)> {
     let mut entries: HashMap<(Color, PositionKey), (VariantPosition, PlayerEntry)> = HashMap::new();
     for (seq, game) in games.iter().enumerate() {
         let mut pos = game.as_borrowed().initial_position();
@@ -102,7 +97,7 @@ fn naive(
         };
         let mut last: BTreeMap<PositionKey, (VariantPosition, PackedUciMove)> = BTreeMap::new();
         let mut ply = 0;
-        while ply < max_ply
+        while ply < MAX_PLY
             && let Ok(Some(m)) = decoder.decode_next(&pos)
         {
             last.insert(
@@ -142,7 +137,6 @@ pub fn check(
     db: &PlayerDb,
     config: &CheckConfig<'_>,
 ) -> Result<CheckStats, Box<dyn std::error::Error>> {
-    let max_ply = db.config().max_ply;
     let mut players: Vec<(&UserId, u64)> = config
         .fixture
         .players()
@@ -160,13 +154,7 @@ pub fn check(
             stats.unindexed += 1;
             continue;
         };
-        let expected = expected_games(
-            config.fixture,
-            user,
-            status.latest_created_at.0,
-            config,
-            max_ply,
-        )?;
+        let expected = expected_games(config.fixture, user, status.latest_created_at.0, config)?;
         let seqs: Vec<PlayerGameIndex> = (0..status.games).map(PlayerGameIndex).collect();
         let actual: Vec<PlayerGame> = reader
             .games(db.user_hash(user), &seqs)?
@@ -190,7 +178,7 @@ pub fn check(
             continue;
         }
         let mut wrong = 0;
-        for ((color, _), (pos, entry)) in naive(&actual, max_ply) {
+        for ((color, _), (pos, entry)) in naive(&actual) {
             let (read, _) = reader.position(&status, color, &pos)?;
             stats.positions += 1;
             if pack(read) != pack(entry) {

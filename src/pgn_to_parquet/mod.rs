@@ -50,6 +50,8 @@ pub struct Config {
     pub zstd_level: i32,
     /// Zstd level for the moves column, or 0 for no compression.
     pub moves_zstd_level: i32,
+    /// Keep only the first moves of each game (`None` for all).
+    pub max_ply: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -249,7 +251,7 @@ fn compression(zstd_level: i32) -> Compression {
     }
 }
 
-fn writer_properties(zstd_level: i32, moves_zstd_level: i32) -> Arc<WriterProperties> {
+pub fn writer_properties(zstd_level: i32, moves_zstd_level: i32) -> Arc<WriterProperties> {
     Arc::new(
         GameColumns::properties()
             .set_compression(compression(zstd_level))
@@ -262,6 +264,7 @@ fn encode_chunk(
     work: &Work,
     columns: &mut GameColumns,
     properties: &Arc<WriterProperties>,
+    max_ply: Option<usize>,
 ) -> io::Result<Encoded> {
     let mut stats = Stats::default();
     let mut errors = Vec::new();
@@ -270,7 +273,10 @@ fn encode_chunk(
     columns.clear();
 
     let mut reader = PgnReader::new(&work.chunk.bytes[..]);
-    for game in reader.read_games(&mut GameVisitor) {
+    let mut visitor = GameVisitor {
+        max_ply: max_ply.unwrap_or(usize::MAX),
+    };
+    for game in reader.read_games(&mut visitor) {
         parsed += 1;
         let game = match game? {
             Ok(game) => game,
@@ -324,7 +330,9 @@ fn encode_chunk(
     })
 }
 
-fn append_row_group(
+/// Appends the single row group of `parquet`, without the rows that are not
+/// kept.
+pub fn append_row_group(
     writer: &mut SerializedFileWriter<BufWriter<File>>,
     parquet: &Bytes,
     keep: &[bool],
@@ -520,7 +528,7 @@ pub fn convert(
                     let mut columns = GameColumns::default();
                     for work in work_rx {
                         let raw_len = work.chunk.bytes.len() as u64;
-                        let result = encode_chunk(&work, &mut columns, properties);
+                        let result = encode_chunk(&work, &mut columns, properties, config.max_ply);
                         pool_tx.send(work.chunk.bytes).expect("recycle buffer");
                         let msg = match result {
                             Ok(encoded) => {

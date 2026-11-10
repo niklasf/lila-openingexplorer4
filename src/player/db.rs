@@ -19,7 +19,7 @@ use crate::{
         CellKey, ColdGroup, ColdGroupView, GameId, PlayerEntry, PlayerGroupHeader, PositionKey,
     },
     player::{
-        UserHash, UserHasher, UserId,
+        MAX_PLY, UserHash, UserHasher, UserId,
         aggregate::{Aggregation, Placed, cold_bits_for, find_visit},
         game::{BorrowedPlayerGame, PlayerGame},
         keys::{
@@ -71,8 +71,6 @@ pub enum PlayerDbError {
 pub struct PlayerDbConfig {
     /// Size of the block cache.
     pub cache_bytes: u64,
-    /// Plies of each game that are indexed.
-    pub max_ply: usize,
     /// Bytes per second of flushes and compactions (`None` for unlimited).
     pub rate_limit: Option<u64>,
     /// Directory of the write ahead log, if not the database directory.
@@ -103,7 +101,6 @@ impl Default for PlayerDbConfig {
     fn default() -> PlayerDbConfig {
         PlayerDbConfig {
             cache_bytes: 1 << 30,
-            max_ply: 50,
             rate_limit: None,
             wal_dir: None,
             db_paths: Vec::new(),
@@ -396,7 +393,7 @@ impl PlayerDb {
                 GameIdKey::new(uh, game.id),
                 index.to_bytes(),
             );
-            aggregation.add_game(index, &game.as_borrowed(), self.config.max_ply);
+            aggregation.add_game(index, &game.as_borrowed());
             stats.games += 1;
         }
 
@@ -485,11 +482,7 @@ impl PlayerDb {
             IteratorMode::From(&start, Direction::Forward),
         ) {
             let (key, value) = item?;
-            aggregation.add_game(
-                GameKey::index(&key),
-                &BorrowedPlayerGame::unpack(&value),
-                self.config.max_ply,
-            );
+            aggregation.add_game(GameKey::index(&key), &BorrowedPlayerGame::unpack(&value));
             stats.games += 1;
         }
         let placed = aggregation.place(|_, items| cold_bits_for(items));
@@ -868,7 +861,7 @@ impl PlayerReader<'_> {
                     continue;
                 };
                 let game = BorrowedPlayerGame::unpack(&game);
-                if let Some(m) = find_visit(&game, &key, self.db.config.max_ply) {
+                if let Some(m) = find_visit(&game, &key, MAX_PLY) {
                     entry.add_game(
                         CellKey::new(
                             m,

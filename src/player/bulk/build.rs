@@ -257,7 +257,6 @@ pub struct BuildConfig<'a> {
     pub partitions: Partitions,
     pub members: &'a [Member],
     pub threads: usize,
-    pub max_ply: usize,
     pub synth: Synth,
     pub plan: AgingPlan,
     pub sst_target_bytes: u64,
@@ -429,7 +428,6 @@ fn build_partition(
         .collect();
     let mut tail: Vec<(u64, UserHash, u64, Option<Vec<u8>>)> = Vec::new();
     let synth = &config.synth;
-    let max_ply = config.max_ply;
 
     let mut start = 0;
     let mut buf = Vec::new();
@@ -519,7 +517,7 @@ fn build_partition(
                     .map_err(rocks)?;
                 ids.push((game.id, seq));
                 if !config.dry_run {
-                    aggregation.add_game(seq, game, max_ply);
+                    aggregation.add_game(seq, game);
                 }
             }
             stats

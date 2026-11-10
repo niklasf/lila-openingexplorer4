@@ -386,7 +386,6 @@ impl Indexer {
         run: IndexRun,
         tx: &mpsc::Sender<Chunk>,
     ) -> RunEnd {
-        let max_ply = self.db.config().max_ply;
         let mut slot = self.lila.slot().await;
         let started = Instant::now();
         let mut since = run.since;
@@ -459,7 +458,7 @@ impl Indexer {
                 // Retries include the latest millisecond (see `RunPolicy`).
                 since = since.max(game.created_at);
                 chunk.latest_created_at = chunk.latest_created_at.max(game.created_at);
-                match game.classify(user, max_ply) {
+                match game.classify(user) {
                     Classified::Game { game, name } => {
                         chunk.games.push(*game);
                         chunk.name = Some(name);

@@ -44,7 +44,7 @@ use crate::{
     },
     parquet::Input,
     player::{
-        UserHash, UserHasher, UserId,
+        MAX_PLY, UserHash, UserHasher, UserId,
         bulk::{
             USER_HASH_KEY_FILE, for_each_row_group,
             population::{Member, Origin},
@@ -157,7 +157,6 @@ fn direct(
     id: GameId,
     game: &BorrowedLichessGame<'_>,
     color: Color,
-    max_ply: usize,
     synth: &Synth,
     noise: &Noise,
 ) -> (Option<PlayerGame>, u16) {
@@ -170,11 +169,11 @@ fn direct(
             .and_then(|r| Rating::try_from(i32::from(r)).ok())
     };
     let mut pos = game.initial_position();
-    let mut moves = PackedMoves::encoder_with_capacity(max_ply);
+    let mut moves = PackedMoves::encoder_with_capacity(MAX_PLY);
     let mut plies: u16 = 0;
     if let Ok(mut decoder) = PackedMovesDecoder::new(game.moves) {
         while let Ok(Some(m)) = decoder.decode_next(&pos) {
-            if usize::from(plies) < max_ply {
+            if usize::from(plies) < MAX_PLY {
                 moves.encode_next(&pos, m);
             }
             pos.play_unchecked(m);
@@ -224,7 +223,6 @@ fn via_export(
     id: GameId,
     game: &BorrowedLichessGame<'_>,
     user: &UserId,
-    max_ply: usize,
     synth: &Synth,
     noise: &Noise,
 ) -> (Option<PlayerGame>, u16) {
@@ -235,7 +233,7 @@ fn via_export(
         return (None, plies);
     };
     let export = ExportGame::parse(&line).expect("mock line");
-    match export.classify(user, max_ply) {
+    match export.classify(user) {
         Classified::Game { mut game, .. } => {
             game.month = placeholder_month();
             (Some(*game), plies)
@@ -251,7 +249,6 @@ pub struct ScatterConfig<'a> {
     pub out: &'a Path,
     pub partitions: Partitions,
     pub threads: usize,
-    pub max_ply: usize,
     pub synth: Synth,
     /// Noise of the mock (as it will serve the games).
     pub noise: Noise,
@@ -341,23 +338,9 @@ pub fn scatter(config: &ScatterConfig<'_>) -> io::Result<ScatterStats> {
                         && game.initial_position().variant() == Variant::Chess
                         && !has_illegal_san(&config.synth, &config.noise, id);
                     let (converted, plies) = if standard {
-                        let direct = direct(
-                            id,
-                            &game,
-                            color,
-                            config.max_ply,
-                            &config.synth,
-                            &config.noise,
-                        );
+                        let direct = direct(id, &game, color, &config.synth, &config.noise);
                         if config.verify {
-                            let exact = via_export(
-                                id,
-                                &game,
-                                user,
-                                config.max_ply,
-                                &config.synth,
-                                &config.noise,
-                            );
+                            let exact = via_export(id, &game, user, &config.synth, &config.noise);
                             stats.verified.fetch_add(1, Ordering::Relaxed);
                             if (exact.0 != direct.0 || exact.1 != direct.1)
                                 && stats.mismatches.fetch_add(1, Ordering::Relaxed) < 10
@@ -370,14 +353,7 @@ pub fn scatter(config: &ScatterConfig<'_>) -> io::Result<ScatterStats> {
                         direct
                     } else {
                         stats.via_export.fetch_add(1, Ordering::Relaxed);
-                        via_export(
-                            id,
-                            &game,
-                            user,
-                            config.max_ply,
-                            &config.synth,
-                            &config.noise,
-                        )
+                        via_export(id, &game, user, &config.synth, &config.noise)
                     };
                     record.clear();
                     if let Some(converted) = &converted {

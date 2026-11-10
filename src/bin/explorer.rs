@@ -68,9 +68,6 @@ struct PlayerArgs {
     /// Size of the RocksDB block cache.
     #[arg(long, default_value = "4g")]
     cache: ByteSize,
-    /// Plies indexed per game. Must not change on an existing database.
-    #[arg(long, default_value = "50")]
-    max_ply: usize,
     /// Directory of the write ahead log (default: in the database).
     #[arg(long)]
     wal_dir: Option<PathBuf>,
@@ -89,50 +86,50 @@ struct PlayerArgs {
     /// With several --db-path: the last level holds this many times the
     /// level above (RocksDB's dynamic level sizes are not available with
     /// several paths, so the server sets the level targets itself).
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value_t = 10.0)]
     level_ratio: f64,
     /// Collect RocksDB statistics (tickers in /monitor).
     #[arg(long)]
     db_statistics: bool,
     /// Parallel index runs, which is also the most parallel streams from
     /// lila (every request counts, retries included).
-    #[arg(long, default_value = "8", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 8, help_heading = "Indexer")]
     indexers: usize,
     /// Players waiting for indexing at most (503 when full).
-    #[arg(long, default_value = "2000", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 2000, help_heading = "Indexer")]
     queue_capacity: usize,
     /// Queue players strictly in order of arrival, instead of players that
     /// already have an index (short incremental runs) before first runs.
     #[arg(long, help_heading = "Indexer")]
     fifo: bool,
     /// No new index run of a player within this many seconds.
-    #[arg(long, default_value = "120", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 120, help_heading = "Indexer")]
     cooldown: u64,
     /// Revisit ongoing games at most this often (seconds).
-    #[arg(long, default_value = "900", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 900, help_heading = "Indexer")]
     revisit_interval: u64,
     /// Games per chunk (one atomic write) at most.
-    #[arg(long, default_value = "2000", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 2000, help_heading = "Indexer")]
     chunk_games: usize,
     /// Write a chunk at least this often while indexing (milliseconds).
-    #[arg(long, default_value = "1000", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 1000, help_heading = "Indexer")]
     chunk_interval_ms: u64,
     /// Give up the stream of a run after this many seconds and continue at
     /// the end of the queue (0 to run until done). 30 s with --fifo off was
     /// best in the queue simulation of the launch (empty database).
-    #[arg(long, default_value = "30", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 30, help_heading = "Indexer")]
     max_run: u64,
     /// Rebuild a player after at least this many new games ...
-    #[arg(long, default_value = "1000", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 1000, help_heading = "Indexer")]
     rebuild_min_games: u32,
     /// ... and this share of the games at the last rebuild.
-    #[arg(long, default_value = "0.5", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 0.5, help_heading = "Indexer")]
     rebuild_factor: f64,
     /// Parallel rebuilds at most.
-    #[arg(long, default_value = "1", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 1, help_heading = "Indexer")]
     rebuilds: usize,
     /// Seconds to wait for lila's response and between chunks of it.
-    #[arg(long, default_value = "60", help_heading = "Indexer")]
+    #[arg(long, default_value_t = 60, help_heading = "Indexer")]
     lila_timeout: u64,
     /// Base url of the lila instance to index games from.
     #[arg(
@@ -145,7 +142,7 @@ struct PlayerArgs {
     #[command(flatten, next_help_heading = "Indexer")]
     bearer: LilaBearerArgs,
     /// Concurrent database reads of requests.
-    #[arg(long, default_value = "4", help_heading = "Server")]
+    #[arg(long, default_value_t = 4, help_heading = "Server")]
     blocking_threads: usize,
     /// Directory with a.tsv to e.tsv of lichess-org/chess-openings.
     #[arg(long, help_heading = "Server", conflicts_with = "no_openings")]
@@ -194,7 +191,7 @@ struct DbArgs {
     #[arg(long)]
     db_statistics: bool,
     /// Threads for opening table files at startup.
-    #[arg(long, default_value = "16")]
+    #[arg(long, default_value_t = 16)]
     file_opening_threads: usize,
     /// Load all index and filter blocks when opening (sequentially, file
     /// by file), and pin them in the block cache, instead of reading them
@@ -230,12 +227,6 @@ struct ServeArgs {
     /// Allow access from all origins.
     #[arg(long)]
     cors: bool,
-    /// Games were indexed up to this ply by parquet_to_positions (0 for all
-    /// plies). Must match, or games reaching a position later would be
-    /// found (or missed) inconsistently. The moves stored by parquet_to_games
-    /// (its --max-ply) must reach at least this far.
-    #[arg(long, default_value = "50")]
-    max_ply: usize,
     /// Do not look up cold positions: positions reached by a single game
     /// are answered as if no game reached them. Saves a lookup and loading
     /// the candidate games for every position that is not in the positions
@@ -255,10 +246,10 @@ struct ServeArgs {
     #[arg(long, help_heading = "Server")]
     parallel_fetch: bool,
     /// Entries of the response cache.
-    #[arg(long, default_value = "100000", help_heading = "Server")]
+    #[arg(long, default_value_t = 100000, help_heading = "Server")]
     response_cache: u64,
     /// Seconds after which cached responses expire.
-    #[arg(long, default_value = "7200", help_heading = "Server")]
+    #[arg(long, default_value_t = 7200, help_heading = "Server")]
     response_cache_ttl: u64,
     /// Directory with a.tsv to e.tsv of lichess-org/chess-openings, to be
     /// loaded instead of downloading the current names from GitHub.
@@ -308,7 +299,7 @@ struct LilaArgs {
     #[command(flatten)]
     bearer: LilaBearerArgs,
     /// Seconds between blacklist updates.
-    #[arg(long, default_value = "10380")]
+    #[arg(long, default_value_t = 10380)]
     blacklist_refresh: u64,
     /// Do not hide games of blacklisted players.
     #[arg(long)]
@@ -395,7 +386,6 @@ fn run_player(args: PlayerArgs) {
         &args.db,
         PlayerDbConfig {
             cache_bytes: args.cache.into(),
-            max_ply: args.max_ply,
             rate_limit: (args.rate_limit.0 > 0).then_some(args.rate_limit.0),
             wal_dir: args.wal_dir,
             db_paths: args.db_paths.clone(),
@@ -489,7 +479,6 @@ fn run(kind: Kind, args: ServeArgs) {
         cache_ttl: Duration::from_secs(args.response_cache_ttl),
         blocking_threads,
         parallel_fetch: args.parallel_fetch,
-        max_ply: (args.max_ply > 0).then_some(args.max_ply),
         cold: !args.no_cold,
         openings_dir: args.openings_dir,
         no_openings: args.no_openings,

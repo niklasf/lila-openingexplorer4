@@ -32,11 +32,11 @@ struct Args {
     #[clap(long)]
     threads: Option<usize>,
     /// Games per row group.
-    #[clap(long, default_value = "100000")]
+    #[clap(long, default_value_t = 100000)]
     row_group_len: usize,
     /// Zstd level for meta data columns in the produced parquet file, or 0
     /// for no compression.
-    #[clap(long, default_value = "9", value_parser = zstd_level())]
+    #[clap(long, default_value_t = 9, value_parser = zstd_level())]
     zstd_level: i32,
 }
 

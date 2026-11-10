@@ -38,24 +38,19 @@ pub struct Replayer {
     visits: IntMap<Zobrist128, Visit>,
     /// Side to move at ply 0 of the last replayed game.
     initial_turn: Color,
-    /// Games are truncated after this many plies.
-    max_ply: usize,
 }
 
 impl Default for Replayer {
     fn default() -> Replayer {
-        Replayer::new(None)
+        Replayer::new()
     }
 }
 
 impl Replayer {
-    /// Creates a replayer that records only the positions of the first
-    /// `max_ply` plies of each game, if given.
-    pub fn new(max_ply: Option<usize>) -> Replayer {
+    pub fn new() -> Replayer {
         Replayer {
             visits: IntMap::default(),
             initial_turn: Color::White,
-            max_ply: max_ply.unwrap_or(usize::MAX),
         }
     }
 
@@ -69,7 +64,6 @@ impl Replayer {
         let info = GameInfo {
             game_index,
             variant: pos.variant(),
-            // The earliest possible month if only the year is known.
             month: game.date.earliest_month(),
             speed: game.speed,
             ratings: game.players.map(|player| player.rating.unwrap_or_default()),
@@ -90,7 +84,6 @@ impl Replayer {
         struct ReplayGame<'a, 'b> {
             visits: &'a mut IntMap<Zobrist128, Visit>,
             decoder: PackedMovesDecoder<'b>,
-            max_ply: usize,
         }
 
         impl WithPositionMut for ReplayGame<'_, '_> {
@@ -99,9 +92,7 @@ impl Replayer {
             fn call<P: Position>(mut self, pos: &mut P) -> Self::Output {
                 let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
                 let mut ply = 0;
-                while ply < self.max_ply
-                    && let Some(m) = self.decoder.decode_next(pos).expect("valid moves")
-                {
+                while let Some(m) = self.decoder.decode_next(pos).expect("valid moves") {
                     let packed = PackedUciMove::pack(m.to_uci(CastlingMode::Chess960));
                     self.visits
                         .entry(hash)
@@ -119,7 +110,6 @@ impl Replayer {
         pos.with_position_mut(ReplayGame {
             visits: &mut self.visits,
             decoder: PackedMovesDecoder::new(moves).expect("valid moves"),
-            max_ply: self.max_ply,
         });
     }
 

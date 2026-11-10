@@ -1,4 +1,4 @@
-use std::{io, ops::ControlFlow};
+use std::{io, mem, ops::ControlFlow};
 
 use pgn_reader::{RawTag, Skip, Visitor};
 use shakmaty::{
@@ -14,7 +14,13 @@ use crate::{
     packed::{GameId, GamePlayer, LaxDate, LichessGame, PackedMoves, Rating, RatingMode, Speed},
 };
 
-pub struct GameVisitor;
+/// Parses games, keeping only the first `max_ply` moves.
+///
+/// The rest of the movetext of longer games is skipped (not validated), and
+/// their outcome comes from the `Result` tag instead.
+pub struct GameVisitor {
+    pub max_ply: usize,
+}
 
 #[derive(Default)]
 pub struct ParsedGame {
@@ -31,6 +37,9 @@ pub struct ParsedGame {
     fen: Option<Fen>,
     moves: Vec<San>,
     outcome: Option<Outcome>,
+    /// From the `Result` tag, for games that are cut before the result in
+    /// the movetext.
+    result_tag: Option<Outcome>,
 }
 
 impl ParsedGame {
@@ -150,6 +159,9 @@ impl ParsedGame {
                     },
                 )?);
             }
+            b"Result" => {
+                self.result_tag = Outcome::from_ascii(value.as_bytes()).ok();
+            }
             b"Variant" => {
                 self.variant =
                     Some(LilaVariant::from_pgn_tag(value.as_bytes()).map_err(|err| {
@@ -182,8 +194,15 @@ impl ParsedGame {
         Ok(())
     }
 
-    fn visit_san(&mut self, san: San) {
+    /// Returns whether the movetext is complete.
+    fn visit_san(&mut self, san: San, max_ply: usize) -> bool {
         self.moves.push(san);
+        if self.moves.len() >= max_ply {
+            self.outcome = self.result_tag;
+            true
+        } else {
+            false
+        }
     }
 
     fn visit_outcome(&mut self, outcome: Outcome) {
@@ -349,8 +368,11 @@ impl Visitor for GameVisitor {
         movetext: &mut Self::Movetext,
         san_plus: SanPlus,
     ) -> ControlFlow<Self::Output> {
-        movetext.visit_san(san_plus.san);
-        ControlFlow::Continue(())
+        if movetext.visit_san(san_plus.san, self.max_ply) {
+            ControlFlow::Break(Ok(mem::take(movetext)))
+        } else {
+            ControlFlow::Continue(())
+        }
     }
 
     fn outcome(
@@ -375,7 +397,9 @@ mod tests {
 
     fn game_ids(pgn: &str) -> Vec<String> {
         Reader::new(pgn.as_bytes())
-            .read_games(&mut GameVisitor)
+            .read_games(&mut GameVisitor {
+                max_ply: usize::MAX,
+            })
             .map(|game| {
                 game.expect("io")
                     .expect("valid game")

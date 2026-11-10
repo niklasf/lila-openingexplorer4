@@ -87,7 +87,6 @@ pub struct AppConfig {
     pub cache_ttl: Duration,
     pub blocking_threads: usize,
     pub parallel_fetch: bool,
-    pub max_ply: Option<usize>,
     pub cold: bool,
     pub openings_dir: Option<PathBuf>,
     pub no_openings: bool,
@@ -169,7 +168,7 @@ impl AppState {
                 continue;
             };
             let (_, game) = unpack_game_value(&game);
-            if let Some(visit) = find_visit(&game, &hash, self.config.max_ply) {
+            if let Some(visit) = find_visit(&game, &hash) {
                 let rating = game.players[visit.turn].rating.unwrap_or_default();
                 entry.add_game(
                     CellKey::new(

@@ -17,4 +17,9 @@ pub mod time;
 mod user;
 
 pub use db::{PlayerDb, PlayerDbConfig, PlayerDbError};
+
+/// Plies of each game that are indexed. Must not change on an existing
+/// database.
+pub const MAX_PLY: usize = 50;
+
 pub use user::{InvalidUserName, UserHash, UserHasher, UserId};

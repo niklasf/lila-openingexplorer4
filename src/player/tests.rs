@@ -22,7 +22,7 @@ use crate::{
         PlayerGroupHeader, PositionKey, Rating, RatingMode, Speed,
     },
     player::{
-        PlayerDb, PlayerDbConfig, PlayerDbError, UserHasher, UserId,
+        MAX_PLY, PlayerDb, PlayerDbConfig, PlayerDbError, UserHasher, UserId,
         aggregate::{Aggregation, find_visit},
         game::PlayerGame,
         keys::{ColdBucket, PlayerGameIndex},
@@ -129,10 +129,9 @@ pub(super) fn arbitrary_game(
 }
 
 /// Naive aggregation: replay every game, keep the last move from each
-/// position within the first `max_ply` plies.
+/// position within the first `MAX_PLY` plies.
 fn naive(
     games: &[(PlayerGame, Vec<VariantPosition>)],
-    max_ply: usize,
 ) -> HashMap<(Color, PositionKey), PlayerEntry> {
     let mut entries: HashMap<(Color, PositionKey), PlayerEntry> = HashMap::new();
     for (index, (game, positions)) in games.iter().enumerate() {
@@ -140,7 +139,7 @@ fn naive(
         let mut decoder = game.moves.decode().unwrap();
         let mut last: BTreeMap<PositionKey, PackedUciMove> = BTreeMap::new();
         let mut ply = 0;
-        while ply < max_ply
+        while ply < MAX_PLY
             && let Some(m) = decoder.decode_next(&pos).unwrap()
         {
             assert_eq!(pos, positions[ply]);
@@ -180,12 +179,10 @@ fn pack(mut entry: PlayerEntry) -> Vec<u8> {
 fn test_storage_matches_naive() {
     arbtest(|u| {
         let dir = TempDir::new("storage");
-        let max_ply = u.int_in_range(1..=60)?;
         let db = PlayerDb::open(
             &dir.0,
             PlayerDbConfig {
                 cache_bytes: 8 << 20,
-                max_ply,
                 // Sometimes ingest even small rebuilds.
                 ingest_bytes: if u.arbitrary()? { 0 } else { 64 << 20 },
                 batch_bytes: u.int_in_range(100..=10_000)?,
@@ -233,7 +230,7 @@ fn test_storage_matches_naive() {
 
         let reader = db.reader();
         for (player, user) in users.iter().enumerate() {
-            let expected = naive(&games[player], max_ply);
+            let expected = naive(&games[player]);
             let Some(status) = reader.status(db.user_hash(user)).unwrap() else {
                 assert!(games[player].is_empty());
                 continue;
@@ -276,7 +273,6 @@ fn test_storage_matches_naive() {
 #[test]
 fn test_placement_matches_naive() {
     arbtest(|u| {
-        let max_ply = u.int_in_range(1..=60)?;
         let bits = u.int_in_range(0..=2)?;
         // Plenty of data for the games, from a seed.
         let mut x: u64 = u.arbitrary()?;
@@ -296,7 +292,7 @@ fn test_placement_matches_naive() {
 
         let mut aggregation = Aggregation::new();
         for (index, (game, _)) in games.iter().enumerate() {
-            aggregation.add_game(PlayerGameIndex(index as u32), &game.as_borrowed(), max_ply);
+            aggregation.add_game(PlayerGameIndex(index as u32), &game.as_borrowed());
         }
         let placed = aggregation.place(|_, _| bits);
         assert_eq!(placed.cold_bits, shakmaty::ByColor::new_with(|_| bits));
@@ -315,14 +311,14 @@ fn test_placement_matches_naive() {
             })
             .collect();
 
-        for ((color, key), expected) in naive(&games, max_ply) {
+        for ((color, key), expected) in naive(&games) {
             let mut entry = warm.get(&(color, key)).cloned().unwrap_or_default();
             let (bucket, suffix) = ColdBucket::of(&key, bits);
             if let Some(group) = cold.get(&(color, bucket)) {
                 for index in ColdGroupView::unpack_entire(group).candidates(suffix) {
                     let game = games[index as usize].0.as_borrowed();
                     assert_eq!(game.color, color);
-                    if let Some(m) = find_visit(&game, &key, max_ply) {
+                    if let Some(m) = find_visit(&game, &key, MAX_PLY) {
                         entry.add_game(
                             CellKey::new(
                                 m,

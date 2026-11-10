@@ -23,7 +23,7 @@ use tokio::{sync::Semaphore, task};
 use crate::{
     packed::SubStats,
     player::{
-        InvalidUserName, PlayerDb, UserId,
+        InvalidUserName, MAX_PLY, PlayerDb, UserId,
         db::WARM_CF,
         explore::{PlayerGameResponse, PlayerGameWithUci, PlayerMove, PlayerResponse, prepare},
         indexer::Indexer,
@@ -101,8 +101,9 @@ impl IntoResponse for Error {
     }
 }
 
-/// Ply buckets of requests, by tens up to 50 and more.
-const PLY_BUCKETS: usize = 6;
+/// Ply buckets of requests, by tens up to `MAX_PLY` (where indexed
+/// positions end) and more.
+const PLY_BUCKETS: usize = MAX_PLY / 10 + 1;
 
 #[derive(Default)]
 pub struct ServerMetrics {

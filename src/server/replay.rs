@@ -11,20 +11,16 @@ pub struct Visit {
     pub turn: Color,
 }
 
-/// Replays the first `max_ply` plies of a game (all if `None`) and finds
-/// the position with the given hash, as `parquet_to_positions` would have
-/// recorded it. The final position is never a visit.
-pub fn find_visit(
-    game: &BorrowedLichessGame<'_>,
-    target: &PositionKey,
-    max_ply: Option<usize>,
-) -> Option<Visit> {
+/// Replays the stored moves of a game (already truncated by
+/// `pgn_to_parquet`) and finds the position with the given hash, as
+/// `parquet_to_positions` would have recorded it. The final position is
+/// never a visit.
+pub fn find_visit(game: &BorrowedLichessGame<'_>, target: &PositionKey) -> Option<Visit> {
     let mut pos = game.initial_position();
     let variant = pos.variant();
 
     struct Find<'a> {
         decoder: PackedMovesDecoder<'a>,
-        max_ply: usize,
         target: PositionKey,
         variant: shakmaty::variant::Variant,
     }
@@ -35,17 +31,13 @@ pub fn find_visit(
         fn call<P: Position>(mut self, pos: &mut P) -> Option<Visit> {
             let mut hash: Zobrist128 = pos.zobrist_hash(EnPassantMode::Legal);
             let mut found = None;
-            let mut ply = 0;
-            while ply < self.max_ply
-                && let Some(m) = self.decoder.decode_next(pos).expect("valid moves")
-            {
+            while let Some(m) = self.decoder.decode_next(pos).expect("valid moves") {
                 if PositionKey::from_zobrist(hash, self.variant) == self.target {
                     found = Some(Visit {
                         m: PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
                         turn: pos.turn(),
                     });
                 }
-                ply += 1;
                 let updated = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
                 pos.play_unchecked(m);
                 hash = updated.unwrap_or_else(|| pos.zobrist_hash(EnPassantMode::Legal));
@@ -57,7 +49,6 @@ pub fn find_visit(
     let decoder = PackedMovesDecoder::new(game.moves).expect("valid moves");
     pos.with_position_mut(Find {
         decoder,
-        max_ply: max_ply.unwrap_or(usize::MAX),
         target: *target,
         variant,
     })
@@ -94,47 +85,48 @@ mod tests {
 
     #[test]
     fn test_find_visit() {
-        let moves = game("Nf3 Nf6 Ng1 Ng8 e4 e5");
-        let game = BorrowedLichessGame {
-            players: ByColor {
-                white: BorrowedGamePlayer {
-                    title: None,
-                    name: "w",
-                    rating: None,
+        let visit = |sans: &str, pos: &VariantPosition| {
+            let moves = game(sans);
+            let game = BorrowedLichessGame {
+                players: ByColor {
+                    white: BorrowedGamePlayer {
+                        title: None,
+                        name: "w",
+                        rating: None,
+                    },
+                    black: BorrowedGamePlayer {
+                        title: None,
+                        name: "b",
+                        rating: None,
+                    },
                 },
-                black: BorrowedGamePlayer {
-                    title: None,
-                    name: "b",
-                    rating: None,
-                },
-            },
-            date: LaxDate::from_ymd(2020, None, None).unwrap(),
-            outcome: KnownOutcome::Draw,
-            speed: None,
-            rating_mode: RatingMode::Rated,
-            setup: None,
-            event: None,
-            moves: &moves.0,
+                date: LaxDate::from_ymd(2020, None, None).unwrap(),
+                outcome: KnownOutcome::Draw,
+                speed: None,
+                rating_mode: RatingMode::Rated,
+                setup: None,
+                event: None,
+                moves: &moves.0,
+            };
+            find_visit(&game, &PositionKey::new(pos)).map(|visit| (visit.m.unpack(), visit.turn))
         };
-        let visit = |pos: &VariantPosition, max_ply| {
-            find_visit(&game, &PositionKey::new(pos), max_ply)
-                .map(|visit| (visit.m.unpack(), visit.turn))
-        };
+        let full = "Nf3 Nf6 Ng1 Ng8 e4 e5";
         let uci = |s: &str| s.parse::<UciMove>().unwrap();
         // The start position keeps the move eventually played.
-        assert_eq!(visit(&after(""), None), Some((uci("e2e4"), Color::White)));
+        assert_eq!(visit(full, &after("")), Some((uci("e2e4"), Color::White)));
+        // Unless the game was truncated before.
         assert_eq!(
-            visit(&after(""), Some(2)),
+            visit("Nf3 Nf6", &after("")),
             Some((uci("g1f3"), Color::White))
         );
         assert_eq!(
-            visit(&after("Nf3"), None),
+            visit(full, &after("Nf3")),
             Some((uci("g8f6"), Color::Black))
         );
-        assert_eq!(visit(&after("e4"), None), Some((uci("e7e5"), Color::Black)));
+        assert_eq!(visit(full, &after("e4")), Some((uci("e7e5"), Color::Black)));
         // The final position is not a visit.
-        assert_eq!(visit(&after("e4 e5"), None), None);
-        assert_eq!(visit(&after("e4"), Some(5)), None);
-        assert_eq!(visit(&after("d4"), None), None);
+        assert_eq!(visit(full, &after("e4 e5")), None);
+        assert_eq!(visit("Nf3 Nf6 Ng1 Ng8 e4", &after("e4")), None);
+        assert_eq!(visit(full, &after("d4")), None);
     }
 }

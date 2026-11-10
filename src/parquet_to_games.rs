@@ -12,7 +12,7 @@ use std::{
 use indicatif::{MultiProgress, ProgressBar};
 
 use crate::{
-    packed::{BorrowedLichessGame, GameId, GameIndex, PackedMoves, pack_game_value},
+    packed::{GameId, GameIndex, pack_game_value},
     parquet::Input,
     sst::{RollingSstWriter, SstConfig, SstError, SstStats, env_options},
     util::{create_empty_dir, log_above, progress_bar},
@@ -37,10 +37,6 @@ pub struct Config {
     pub row_groups: Option<usize>,
     /// Approximate size of the SST files.
     pub sst_target_size: u64,
-    /// Store the moves of each game only up to this ply (`None` for all),
-    /// for an explorer that indexed the positions up to there and does not
-    /// serve whole games.
-    pub max_ply: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -94,7 +90,6 @@ pub fn convert(
                             &env_opts,
                             &out.join(format!("{:06}", range.start)),
                             config.sst_target_size,
-                            config.max_ply,
                             game_ids.is_some(),
                             &progress,
                         )?;
@@ -166,7 +161,6 @@ fn write_range(
     env_opts: &rocksdb::EnvOptions,
     prefix: &Path,
     target_size: u64,
-    max_ply: Option<usize>,
     collect_ids: bool,
     progress: &ProgressBar,
 ) -> Result<(SstStats, Vec<(GameId, GameIndex)>), SstError> {
@@ -186,17 +180,6 @@ fn write_range(
         let first_row = input.first_row(row_group);
         for (k, (id, game)) in batch.rows().enumerate() {
             let index = GameIndex::new(first_row + k as u64).expect("game index");
-            let truncated = max_ply
-                .map(|max_ply| PackedMoves::truncated(game.moves, game.initial_position(), max_ply))
-                .transpose()
-                .map_err(io::Error::other)?;
-            let game = match &truncated {
-                Some(moves) => BorrowedLichessGame {
-                    moves: &moves.0,
-                    ..game
-                },
-                None => game,
-            };
             value.clear();
             pack_game_value(id, &game, &mut value);
             writer.put(&index.to_bytes(), &value)?;

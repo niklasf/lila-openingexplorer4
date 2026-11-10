@@ -39,16 +39,11 @@ struct Args {
     no_direct_io: bool,
     /// Skip the first row groups of the inputs. Game indexes still count
     /// the skipped rows.
-    #[clap(long, default_value = "0", help_heading = "Benchmarking")]
+    #[clap(long, default_value_t = 0, help_heading = "Benchmarking")]
     skip_row_groups: usize,
     /// Only process the first row groups of the inputs.
     #[clap(long, help_heading = "Benchmarking")]
     row_groups: Option<usize>,
-    /// Store the moves of each game only up to this ply, or 0 for all
-    /// moves. 50 for lichess (where the explorer indexes and replays only
-    /// the first 50 plies), 0 for masters (which serves whole games).
-    #[arg(long, default_value = "0")]
-    max_ply: usize,
     /// Approximate size of the SST files. The target_file_size_base of the
     /// column family should match.
     #[clap(long, default_value = "2g")]
@@ -69,7 +64,6 @@ fn main() {
         skip_row_groups: args.skip_row_groups,
         row_groups: args.row_groups,
         sst_target_size: args.sst_target_size.into(),
-        max_ply: (args.max_ply > 0).then_some(args.max_ply),
     };
 
     let started = Instant::now();

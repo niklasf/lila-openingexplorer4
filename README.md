@@ -34,7 +34,6 @@ $B/explorer lichess --db /hdd/lichess/db --bind 127.0.0.1:9002 --cors \
     --lila-bearer-file /etc/explorer-bearer
 
 $B/explorer masters --db /hdd/masters/db --bind 127.0.0.1:9003 --cors \
-    --max-ply 0 \
     --cache 4g \
     --blocking-threads 12
 ```
@@ -51,9 +50,6 @@ $B/explorer masters --db /hdd/masters/db --bind 127.0.0.1:9003 --cors \
   (or `EXPLORER_BEARER_FILE`), for the blacklist of players marked by
   moderators every `--blacklist-refresh` seconds, default 173 min.
   `--no-blacklist` to disable.
-* `--max-ply` must match the indexing runs (of `parquet_to_positions` and
-  `parquet_to_games`): 50 (the default) for lichess, 0 (all plies) for
-  masters.
 * `--admin-bind`: Provide `/monitor`.
 
 The personal opening explorer (`/player`) has its own writable database,
@@ -74,7 +70,6 @@ $B/explorer player --db /nvme/player/db --bind 127.0.0.1:9004 --cors \
 * `--indexers 8` (default): Parallel index runs, which is also the most
   parallel streams from lila's games export. Uses `--lila-bearer-file`
   if specified.
-* `--max-ply 50` (default). Must not change on an existing database.
 
 Replay an nginx request log (tab separated `$msec`, `$status`,
 `$request_time`, `$upstream_response_time`, `$request_uri`) against both:
@@ -95,7 +90,7 @@ Indexing run of ~2.4 TiB input PGNs
 | --- | --- | --- |
 | `pgn_to_parquet` | 2 h 08 min | 28 GiB |
 | `parquet_to_positions` (3 passes, `--scratch-budget 2863g`) | 2 h 40 min | 80 GiB |
-| `parquet_to_games --max-ply 50` | 15 min | 2 GiB |
+| `parquet_to_games` | 15 min | 2 GiB |
 | `ingest` | 8 s | |
 
 on this development hardware:
@@ -154,11 +149,8 @@ Scan out game SSTs
 **Typical bottleneck:** CPU (compression)
 
 ```sh
-$B/parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games --max-ply 50
+$B/parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games
 ```
-
-`--max-ply 50` stores the moves only up to the indexed ply. Masters must keep
-all moves (the default, 0), for `/masters/pgn`.
 
 ## Todo
 

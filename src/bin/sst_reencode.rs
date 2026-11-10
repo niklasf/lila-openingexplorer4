@@ -40,11 +40,11 @@ struct Args {
     #[arg(long)]
     out: PathBuf,
     /// Files rewritten in parallel.
-    #[arg(long, default_value = "24")]
+    #[arg(long, default_value_t = 24)]
     threads: usize,
     /// Only rewrite every Nth file, for quick size estimates. The result is
     /// not a complete column family.
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value_t = 1)]
     sample: usize,
     /// Block size.
     #[arg(long)]
@@ -54,9 +54,9 @@ struct Args {
     #[arg(long)]
     block_restart_interval: Option<i32>,
     /// Size of index and filter partitions.
-    #[arg(long, default_value = "4096")]
+    #[arg(long, default_value_t = 4096)]
     metadata_block_size: usize,
-    #[arg(long, default_value = "16")]
+    #[arg(long, default_value_t = 16)]
     index_restart_interval: i32,
     /// Store the keys and the values of each data block in separate
     /// sections.
@@ -69,10 +69,10 @@ struct Args {
     zstd_level: Option<i32>,
     /// Maximum size of the zstd dictionary trained for each file, 0 for
     /// none.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0)]
     zstd_dict: i32,
     /// With lz4, the zstd level does not matter.
-    #[arg(long, value_enum, default_value = "zstd")]
+    #[arg(long, value_enum, default_value_t = Compression::Zstd)]
     compression: Compression,
     /// Keep a compressed block only if it is at most this many bytes per
     /// KiB of input (1024 keeps any block that compresses at all). Defaults

@@ -73,10 +73,10 @@ struct InputArgs {
     /// Parquet file(s) of pgn_to_parquet.
     #[arg(long, required = true)]
     parquet: Vec<PathBuf>,
-    #[arg(long, default_value = "28")]
+    #[arg(long, default_value_t = 28)]
     threads: usize,
     /// Skip the first row groups (for slices).
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0)]
     skip_row_groups: usize,
     /// Use only this many row groups (for slices).
     #[arg(long)]
@@ -108,36 +108,36 @@ struct SelectArgs {
     #[arg(long)]
     out: PathBuf,
     /// Players in the population (old production: 1.28 M).
-    #[arg(long, default_value = "1280000")]
+    #[arg(long, default_value_t = 1280000)]
     players: usize,
     /// Mean games of the sampled players.
-    #[arg(long, default_value = "2500")]
+    #[arg(long, default_value_t = 2500.0)]
     mean_games: f64,
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value_t = 1)]
     min_games: u32,
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = 0)]
     seed: u64,
 }
 
 /// The rules of the mock lila (same defaults as `mock_lila serve`).
 #[derive(Args)]
 struct SynthArgs {
-    #[arg(long, default_value = "0", help_heading = "Mock")]
+    #[arg(long, default_value_t = 0, help_heading = "Mock")]
     seed: u64,
-    #[arg(long, default_value = "0.5", help_heading = "Mock")]
+    #[arg(long, default_value_t = 0.5, help_heading = "Mock")]
     casual: f64,
-    #[arg(long, default_value = "0.002", help_heading = "Mock")]
+    #[arg(long, default_value_t = 0.002, help_heading = "Mock")]
     aborted: f64,
-    #[arg(long, default_value = "0.001", help_heading = "Mock")]
+    #[arg(long, default_value_t = 0.001, help_heading = "Mock")]
     no_start: f64,
-    #[arg(long, default_value = "0.001", help_heading = "Mock")]
+    #[arg(long, default_value_t = 0.001, help_heading = "Mock")]
     no_account: f64,
-    #[arg(long, default_value = "0.001", help_heading = "Mock")]
+    #[arg(long, default_value_t = 0.001, help_heading = "Mock")]
     no_rating: f64,
-    #[arg(long, default_value = "0.001", help_heading = "Mock")]
+    #[arg(long, default_value_t = 0.001, help_heading = "Mock")]
     illegal_san: f64,
     /// As for `mock_lila serve`.
-    #[arg(long, default_value = "1793825340000", help_heading = "Mock")]
+    #[arg(long, default_value_t = 1793825340000, help_heading = "Mock")]
     data_end: u64,
     /// Fixture of the mock, for the time shift.
     #[arg(long, help_heading = "Mock")]
@@ -174,10 +174,8 @@ struct ScatterArgs {
     population: PathBuf,
     #[arg(long)]
     out: PathBuf,
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value_t = 10)]
     partition_bits: u32,
-    #[arg(long, default_value = "50")]
-    max_ply: usize,
     /// Also convert all standard games via the mock export and compare.
     #[arg(long)]
     verify: bool,
@@ -193,12 +191,10 @@ struct BuildArgs {
     population: PathBuf,
     #[arg(long)]
     out: PathBuf,
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value_t = 10)]
     partition_bits: u32,
-    #[arg(long, default_value = "28")]
+    #[arg(long, default_value_t = 28)]
     threads: usize,
-    #[arg(long, default_value = "50")]
-    max_ply: usize,
     /// Start of the aging window, as YYYY-MM-DD in database time (after the
     /// shift of the mock).
     #[arg(long)]
@@ -207,24 +203,24 @@ struct BuildArgs {
     /// requests.tsv starts).
     #[arg(long)]
     window_end: Option<String>,
-    #[arg(long, default_value = "0.2")]
+    #[arg(long, default_value_t = 0.2)]
     requests_unindexed: f64,
-    #[arg(long, default_value = "0.2")]
+    #[arg(long, default_value_t = 0.2)]
     requests_dormant: f64,
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = 0.1)]
     requests_new: f64,
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = 0.1)]
     sample_new: f64,
-    #[arg(long, default_value = "0.3")]
+    #[arg(long, default_value_t = 0.3)]
     sample_active: f64,
     /// Mean days from the last index run of dormant players to the start of
     /// the window.
-    #[arg(long, default_value = "180")]
+    #[arg(long, default_value_t = 180.0)]
     dormant_delay_days: f64,
     /// Bounds of the visit interval of active players, in days.
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value_t = 1.0)]
     min_interval_days: f64,
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value_t = 60.0)]
     max_interval_days: f64,
     #[arg(long, default_value = "256m")]
     sst_target: ByteSize,
@@ -241,9 +237,7 @@ struct DbArgs {
     db: PathBuf,
     #[arg(long, default_value = "4g")]
     cache: ByteSize,
-    #[arg(long, default_value = "50")]
-    max_ply: usize,
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value_t = 4)]
     background_jobs: i32,
 }
 
@@ -258,7 +252,6 @@ impl DbArgs {
             &self.db,
             PlayerDbConfig {
                 cache_bytes: self.cache.into(),
-                max_ply: self.max_ply,
                 background_jobs: self.background_jobs,
                 user_hasher,
                 ..PlayerDbConfig::default()
@@ -287,15 +280,15 @@ struct AgeArgs {
     scatter: PathBuf,
     #[command(flatten)]
     db: DbArgs,
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value_t = 10)]
     partition_bits: u32,
-    #[arg(long, default_value = "16")]
+    #[arg(long, default_value_t = 16)]
     workers: usize,
-    #[arg(long, default_value = "2000")]
+    #[arg(long, default_value_t = 2000)]
     chunk_games: usize,
-    #[arg(long, default_value = "1000")]
+    #[arg(long, default_value_t = 1000)]
     rebuild_min_games: u32,
-    #[arg(long, default_value = "0.5")]
+    #[arg(long, default_value_t = 0.5)]
     rebuild_factor: f64,
     /// Stop after the visits up to this date (YYYY-MM-DD, database time).
     #[arg(long)]
@@ -311,9 +304,9 @@ struct AgeArgs {
 struct CheckArgs {
     #[command(flatten)]
     db: DbArgs,
-    #[arg(long, default_value = "200")]
+    #[arg(long, default_value_t = 200)]
     players: usize,
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value_t = 100000)]
     max_naive_games: u32,
     #[command(flatten)]
     synth: SynthArgs,
@@ -424,7 +417,6 @@ fn main() {
                     bits: args.partition_bits,
                 },
                 threads: args.input.threads,
-                max_ply: args.max_ply,
                 synth: args.synth.synth(),
                 noise: args.synth.noise(),
                 verify: args.verify,
@@ -447,7 +439,6 @@ fn main() {
                 },
                 members: &members,
                 threads: args.threads,
-                max_ply: args.max_ply,
                 plan: AgingPlan {
                     window_start: synth.unshifted(parse_date(&args.window_start)),
                     window_end: synth.unshifted(window_end),

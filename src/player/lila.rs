@@ -12,7 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::{
     lila_variant::LilaVariant,
     packed::{GameId, PackedMoves, Rating, RatingMode, Speed},
-    player::{UserId, game::PlayerGame, time::UnixMillis},
+    player::{MAX_PLY, UserId, game::PlayerGame, time::UnixMillis},
 };
 
 #[derive(Debug, Clone)]
@@ -288,9 +288,9 @@ impl ExportGame {
         serde_json::from_slice(line)
     }
 
-    /// Classifies the game, replaying its first `max_ply` plies for a
+    /// Classifies the game, replaying its first `MAX_PLY` plies for a
     /// `PlayerGame` of the user.
-    pub fn classify(&self, user: &UserId, max_ply: usize) -> Classified {
+    pub fn classify(&self, user: &UserId) -> Classified {
         match self.status.as_str() {
             "created" | "started" => return Classified::Skip(Skip::Ongoing),
             "aborted" | "noStart" | "unknownFinish" => {
@@ -354,8 +354,8 @@ impl ExportGame {
             None => VariantPosition::new(variant),
         };
         let setup = PlayerGame::setup_of(&pos);
-        let mut moves = PackedMoves::encoder_with_capacity(max_ply);
-        for san in self.moves.split_ascii_whitespace().take(max_ply) {
+        let mut moves = PackedMoves::encoder_with_capacity(MAX_PLY);
+        for san in self.moves.split_ascii_whitespace().take(MAX_PLY) {
             // Cut off at the first illegal move, as before.
             let Ok(m) = san
                 .parse::<San>()
@@ -442,8 +442,7 @@ mod tests {
     fn test_classify() {
         let line = br#"{"id":"oV2tflO2","rated":false,"variant":"standard","speed":"rapid","perf":"rapid","createdAt":1651131730149,"lastMoveAt":1651131935030,"status":"mate","players":{"white":{"user":{"name":"revoof","patron":true,"id":"revoof"},"rating":1887,"provisional":true},"black":{"user":{"name":"maia1","title":"BOT","id":"maia1"},"rating":1417}},"winner":"white","moves":"d4 d5 c4 dxc4 Nc3 e6 e4 Nc6 Nf3 Bb4 Bxc4 Bxc3+ bxc3 Nf6 Bd3 O-O O-O b6 Bg5 Bb7 e5 h6 Bh4 g5 Nxg5 hxg5 Bxg5 Qd5 c4 Qxd4 Bxf6 Nxe5 Qh5 Ng6 Bxg6 fxg6 Qxg6#","clock":{"initial":600,"increment":0,"totalTime":600}}"#;
         let game = ExportGame::parse(line).unwrap();
-        let Classified::Game { game, name } =
-            game.classify(&UserId::from_name("Maia1").unwrap(), 50)
+        let Classified::Game { game, name } = game.classify(&UserId::from_name("Maia1").unwrap())
         else {
             panic!("expected game");
         };
@@ -459,20 +458,19 @@ mod tests {
 
         let game = ExportGame::parse(line).unwrap();
         assert!(matches!(
-            game.classify(&UserId::from_name("someone").unwrap(), 50),
+            game.classify(&UserId::from_name("someone").unwrap()),
             Classified::Skip(Skip::NotPlayer)
         ));
         let mut game = ExportGame::parse(line).unwrap();
         game.status = "started".to_owned();
         assert!(matches!(
-            game.classify(&UserId::from_name("revoof").unwrap(), 50),
+            game.classify(&UserId::from_name("revoof").unwrap()),
             Classified::Skip(Skip::Ongoing)
         ));
         // Cut off at an illegal move.
         let mut game = ExportGame::parse(line).unwrap();
         game.moves = "d4 d5 O-O-O c4".to_owned();
-        let Classified::Game { game, .. } =
-            game.classify(&UserId::from_name("revoof").unwrap(), 50)
+        let Classified::Game { game, .. } = game.classify(&UserId::from_name("revoof").unwrap())
         else {
             panic!("expected game");
         };

@@ -43,7 +43,7 @@ struct Args {
     #[clap(long)]
     no_direct_io: bool,
     /// Zstd level for scratch chunks, or 0 for no compression.
-    #[clap(long, default_value = "1", value_parser = zstd_level())]
+    #[clap(long, default_value_t = 1, value_parser = zstd_level())]
     scratch_zstd_level: i32,
     /// Directory for the final SST files, in the subdirectories
     /// cold_positions and positions (which must be empty or missing).
@@ -53,12 +53,8 @@ struct Args {
     /// game), for an explorer that does not look them up.
     #[clap(long)]
     no_cold: bool,
-    /// Only index the positions of the first plies of each game, or 0 for
-    /// all positions.
-    #[clap(long, default_value = "50")]
-    max_ply: usize,
     /// Skip the first row groups of the inputs.
-    #[clap(long, default_value = "0", help_heading = "Benchmarking")]
+    #[clap(long, default_value_t = 0, help_heading = "Benchmarking")]
     skip_row_groups: usize,
     /// Only process the first row groups of the inputs.
     #[clap(long, help_heading = "Benchmarking")]
@@ -83,7 +79,7 @@ struct Args {
     #[clap(long, help_heading = "Advanced")]
     read_threads: Option<usize>,
     /// Concurrent reads of the input, ahead of the decoding threads.
-    #[clap(long, default_value = "8")]
+    #[clap(long, default_value_t = 8)]
     io_depth: usize,
     /// Threads for compressing and writing scratch chunks (default: a third
     /// of the threads with a single pass or --no-overlap, otherwise a
@@ -135,7 +131,6 @@ fn main() {
         io_depth: args.io_depth,
         direct_io: !args.no_direct_io,
         scratch_zstd_level: args.scratch_zstd_level,
-        max_ply: (args.max_ply > 0).then_some(args.max_ply),
         skip_row_groups: args.skip_row_groups,
         row_groups: args.row_groups,
         scatter_only: args.scatter_only,

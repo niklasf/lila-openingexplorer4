@@ -9,20 +9,20 @@ rm -rf "$W"; mkdir -p "$W/lichess/sst" "$W/masters/sst"
 pgns=$(ls samples/lichess_db/*/lichess_db_*_rated_*.pgn.zst | awk -F_ '{print $NF, $0}' | sort -s -k1,1 | cut -d' ' -f2)
 $B/pgn_to_parquet --threads 4 --memory-budget 1g --out $W/lichess.parquet $pgns
 $B/parquet_to_positions --threads 4 --no-direct-io --scratch $W/scratch --scratch-budget 4g --memory-budget 6g --out $W/lichess/sst $W/lichess.parquet
-$B/parquet_to_games --threads 4 --no-direct-io --max-ply 50 --out $W/lichess/sst/games $W/lichess.parquet
+$B/parquet_to_games --threads 4 --no-direct-io --out $W/lichess/sst/games $W/lichess.parquet
 $B/explorer ingest --db $W/lichess/db --games $W/lichess/sst/games --positions $W/lichess/sst
 
 # masters
 echo deterministic,legacy > $W/legacy_ids.csv
 $B/masters_to_parquet samples/masters-db/games --out $W/masters.parquet --legacy-ids $W/legacy_ids.csv
-$B/parquet_to_positions --threads 4 --no-direct-io --max-ply 0 --scratch $W/scratch --scratch-budget 4g --memory-budget 6g --out $W/masters/sst $W/masters.parquet
+$B/parquet_to_positions --threads 4 --no-direct-io --scratch $W/scratch --scratch-budget 4g --memory-budget 6g --out $W/masters/sst $W/masters.parquet
 $B/parquet_to_games --threads 4 --no-direct-io --out $W/masters/sst/games --game-ids $W/masters/sst/game_ids $W/masters.parquet
 $B/explorer ingest --db $W/masters/db --games $W/masters/sst/games --positions $W/masters/sst --game-ids $W/masters/sst/game_ids
 
 # serve and replay the sample requests
 $B/explorer lichess --db $W/lichess/db --bind 127.0.0.1:9002 --cache 256m --no-openings --no-blacklist > $W/lichess.log 2>&1 &
 lichess=$!
-$B/explorer masters --db $W/masters/db --bind 127.0.0.1:9003 --max-ply 0 --cache 64m --no-openings > $W/masters.log 2>&1 &
+$B/explorer masters --db $W/masters/db --bind 127.0.0.1:9003 --cache 64m --no-openings > $W/masters.log 2>&1 &
 masters=$!
 trap 'kill $lichess $masters 2>/dev/null || true' EXIT
 for port in 9002 9003; do
