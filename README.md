@@ -87,29 +87,78 @@ $B/stress_explorer samples/requests/explorer-2026-11-06T1520Z-1h.tsv.zst \
 
 ## Indexing
 
-1. Convert PGN files to a more compact parquet file. Inputs must be in
-   chronological order by month.
+### What to expect
 
-   ```sh
-   pgns=$(ls samples/lichess_db/*/lichess_db_*_rated_*.pgn.zst | awk -F_ '{print $NF, $0}' | sort -s -k1,1 | cut -d' ' -f2)
-   $B/pgn_to_parquet --out lichess/lichess_db_rated.parquet $pgns
-   ```
+Development hardware:
 
-2. Walk the parquet files to produce SSTs indexed by position. Benefits from
-   large memory and disk scratch space.
+* AMD Ryzen 9 9950X (16 cores, 32 threads), 30 threads used
+* 192 GiB RAM, `--memory-budget 100g`
+* Input PGNs on HDD readable at ~350 MB/s sequential
+* Output and scratch space on 8 TB NVMe, sustaining ~2.8 GB/s reads + 2.9 GB/s
+  writes concurrently.
 
-   ```sh
-   $B/parquet_to_positions lichess/lichess_db_rated.parquet --out lichess/sst --scratch scratch --scratch-budget 3400g --memory-budget 100g
-   ```
+Indexing run of ~2.5 TiB input PGNs:
 
-3. Walk the parquet files to produce SSTs indexed by game id.
+| Step | Time | Peak RSS |
+| --- | --- | --- |
+| `pgn_to_parquet` | 2 h 08 min | 29 GB |
+| `parquet_to_positions` (3 passes, `--scratch-budget 2863g`) | 2 h 40 min | 84 GB |
+| `parquet_to_games --max-ply 50` | 15 min | 2 GB |
+| `ingest` | 8 s | |
 
-   ```sh
-   $B/parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games --max-ply 50
-   ```
+### `pgn_to_parquet`
 
-   `--max-ply 50` stores the moves only up to the indexed ply. Masters must keep
-   all moves (the default, 0), for `/masters/pgn`.
+Prepare a parquet file from PGNs for further processing.
+
+**Input:** ~2.5 TiB of monthly game dumps from https://database.lichess.org \
+**Output:** ~600 GiB parquet file \
+**Typical bottleneck:** sequential reads of the dumps (from HDDs) > CPU
+
+Inputs must be in chronological order by month.
+
+Example:
+
+```sh
+pgns=$(ls samples/lichess_db/*/lichess_db_*_rated_*.pgn.zst | awk -F_ '{print $NF, $0}' | sort -s -k1,1 | cut -d' ' -f2)
+$B/pgn_to_parquet --out lichess/lichess_db_rated.parquet $pgns
+```
+
+### `parquet_to_positions`
+
+Scan out position SSTs from the parquet file.
+
+**Input:** ~600 GiB parquet file from above \
+**Output:** ~2 TiB of SST files \
+**Additional resources:** ideally ~5.5 TiB fast disk scratch space (for a
+single pass, ~3 TiB for 2 passes, ~1.8 TiB for 3), ~100 GiB RAM \
+**Typical bottleneck:** CPU, because every pass replays all games (~50 min per
+pass on the development hardware), scratch space determining the number of
+passes > scratch write throughput (a single pass writes ~5 TiB) > memory
+
+Walk the parquet file to produce SSTs indexed by position. Can walk the
+parquet multiple times to make do with insufficient scratch space.
+
+Example:
+
+```sh
+$B/parquet_to_positions lichess/lichess_db_rated.parquet --out lichess/sst --scratch scratch --scratch-budget 6000g --memory-budget 100g
+```
+
+### `parquet_to_games`
+
+Scan out game SSTs
+
+**Input:** ~600 GiB parquet file from above \
+**Output:** ~600 GiB of SST files \
+**Additional resources:** no scratch space, ~2 GiB RAM \
+**Typical bottleneck:** CPU (compression)
+
+```sh
+$B/parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games --max-ply 50
+```
+
+`--max-ply 50` stores the moves only up to the indexed ply. Masters must keep
+all moves (the default, 0), for `/masters/pgn`.
 
 ## Todo
 
