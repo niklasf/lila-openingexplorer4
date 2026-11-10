@@ -118,7 +118,7 @@ $B/stress_explorer samples/requests/explorer-2026-11-06T1520Z-1h.tsv.zst \
 * [ ] Upstream RocksDB PerfStatsLevel mismatch
 * [ ] Document title on GamePlayer
 * [ ] Record provenance in SST file meta data
-* [ ] Delta-encoding for intermediate entries
+* [x] Delta-encoding for intermediate entries
 * [ ] Explore more expensive move compression for cold storage
 
 ## Production hardware

@@ -98,6 +98,13 @@ struct Args {
     /// with a single pass or --no-overlap, otherwise a quarter).
     #[clap(long, help_heading = "Advanced")]
     sst_threads: Option<usize>,
+    /// Passes over the input, instead of choosing by the scratch budget
+    /// (requires --partitions-per-pass).
+    #[clap(long, help_heading = "Benchmarking", requires = "partitions_per_pass")]
+    passes: Option<usize>,
+    /// Memory partitions per pass, instead of choosing by the memory budget.
+    #[clap(long, help_heading = "Benchmarking", requires = "passes")]
+    partitions_per_pass: Option<usize>,
 }
 
 fn main() {
@@ -135,6 +142,7 @@ fn main() {
         overlap: !args.no_overlap,
         sst_target_size: args.sst_target_size.into(),
         cold: !args.no_cold,
+        layout: args.passes.zip(args.partitions_per_pass),
     };
 
     let planned = Instant::now();

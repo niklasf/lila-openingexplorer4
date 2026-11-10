@@ -31,6 +31,22 @@ impl Layout {
     /// Upper bound for the memory partitions of a layout.
     const MAX_MEMORY_PARTITIONS: usize = 1 << 16;
 
+    pub fn new(passes: usize, memory_partitions_per_pass: usize) -> Layout {
+        assert!(
+            passes >= 1 && memory_partitions_per_pass >= 1,
+            "empty layout"
+        );
+        assert!(
+            passes * memory_partitions_per_pass <= Self::MAX_MEMORY_PARTITIONS,
+            "at most {} memory partitions",
+            Self::MAX_MEMORY_PARTITIONS
+        );
+        Layout {
+            passes,
+            memory_partitions_per_pass,
+        }
+    }
+
     pub fn passes(&self) -> usize {
         self.passes
     }
@@ -88,6 +104,7 @@ impl Layout {
 #[derive(Default)]
 pub struct ChunkWriterTimes {
     pub recv: AtomicU64,
+    pub encode: AtomicU64,
     pub compress: AtomicU64,
     pub write: AtomicU64,
     pub throttled: AtomicU64,
@@ -96,29 +113,13 @@ pub struct ChunkWriterTimes {
 impl ChunkWriterTimes {
     pub fn summary(&self) -> String {
         format!(
-            "recv {:.0}s, compress {:.0}s, write {:.0}s, throttled {:.0}s",
+            "recv {:.0}s, encode {:.0}s, compress {:.0}s, write {:.0}s, throttled {:.0}s",
             timed_seconds(&self.recv),
+            timed_seconds(&self.encode),
             timed_seconds(&self.compress),
             timed_seconds(&self.write),
             timed_seconds(&self.throttled),
         )
-    }
-}
-
-/// A chunk of records that can be compressed as raw bytes.
-pub trait Chunk: Send {
-    fn as_bytes(&self) -> &[u8];
-}
-
-impl Chunk for Vec<u8> {
-    fn as_bytes(&self) -> &[u8] {
-        self
-    }
-}
-
-impl<const N: usize> Chunk for Vec<[u8; N]> {
-    fn as_bytes(&self) -> &[u8] {
-        self.as_flattened()
     }
 }
 
@@ -137,23 +138,25 @@ pub struct ChunkWriterConfig<'a> {
     pub reclaimable: &'a AtomicU64,
 }
 
-/// Spawns threads that compress chunks received as `(file, raw)` and append
-/// them to the scratch files, throttled by the scratch budget. They finish
-/// once all senders are dropped.
-pub fn spawn_chunk_writers<'s, C: Chunk + 's>(
+/// Spawns threads that encode chunks received as `(file, chunk)` with
+/// `encode`, compress them and append them to the scratch files, throttled
+/// by the scratch budget. They finish once all senders are dropped.
+pub fn spawn_chunk_writers<'s, C: Send + 's>(
     s: &'s thread::Scope<'s, '_>,
     config: &'s ChunkWriterConfig<'s>,
     files: &'s [Mutex<ScratchFile>],
     rx: channel::Receiver<(usize, C)>,
+    encode: &'s (impl Fn(usize, C, &mut Vec<u8>) + Sync),
     times: &'s ChunkWriterTimes,
 ) {
     for _ in 0..config.threads {
         let rx = rx.clone();
         s.spawn(move || {
             let mut compressor = ChunkCompressor::new(config.zstd_level);
+            let mut raw = Vec::new();
             while let Ok((file, chunk)) = timed(&times.recv, || rx.recv()) {
-                let raw = chunk.as_bytes();
-                let compressed = timed(&times.compress, || compressor.compress(raw));
+                timed(&times.encode, || encode(file, chunk, &mut raw));
+                let compressed = timed(&times.compress, || compressor.compress(&raw));
                 if let Some(budget) = config.budget {
                     let waited = config.usage.wait_until(|usage| {
                         usage + compressed.padded_len() as u64 <= budget

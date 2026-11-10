@@ -1,6 +1,7 @@
 mod hot;
 mod partition;
 mod replay;
+mod scratch_codec;
 mod write;
 
 use std::{
@@ -27,6 +28,7 @@ use crate::{
         hot::{HOT_BATCH, HOT_KEY_MEMORY, HotBuffer, HotEntries, HotMap, Sample},
         partition::{Partition, memory_partition},
         replay::Replayer,
+        scratch_codec::ScratchCodec,
         write::{SstContext, write_partition},
     },
     scatter::{
@@ -55,15 +57,14 @@ fn cold_zstd_level(records: u64) -> i32 {
     }
 }
 
-/// Assumed ratio of zstd compressed scratch chunks to record bytes. The ratio
-/// depends on how many records of a game land in the same chunk, so it grows
-/// with the number of memory partitions per pass: measured with zstd level 1
-/// about 0.61 at 8, 0.66 at 16 and 0.78 at 64 partitions per pass. The
-/// estimate has to stay safe for the first pass, which is not throttled by
-/// the scratch budget.
-const SCRATCH_RATIO: f64 = 0.85;
+/// Assumed ratio of zstd compressed scratch chunks to their raw bytes
+/// (encoded with `ScratchCodec`). Measured with zstd level 1 about 0.88 at
+/// 122 partitions per pass; zstd gains little after the codec removed most
+/// redundancy. The estimate has to stay safe for the first pass, which is
+/// not throttled by the scratch budget.
+const SCRATCH_RATIO: f64 = 0.95;
 
-/// Ratio of scratch chunks to record bytes for the given zstd level.
+/// Ratio of scratch chunks to their raw bytes for the given zstd level.
 fn scratch_ratio(zstd_level: i32) -> f64 {
     if zstd_level == 0 { 1.0 } else { SCRATCH_RATIO }
 }
@@ -94,7 +95,7 @@ struct Estimate {
     /// Hot positions and their estimated records.
     hot: Vec<(PositionKey, u64)>,
     months: u64,
-    /// Ratio of scratch chunks to record bytes.
+    /// Ratio of scratch chunks to their raw bytes.
     scratch_ratio: f64,
 }
 
@@ -152,14 +153,25 @@ impl Estimate {
             + self.hot_memory(read_threads)
     }
 
+    /// Bytes of a record in a scratch chunk, before compression.
+    fn scratch_record_bytes(&self, layout: &Layout) -> f64 {
+        let rate =
+            self.records as f64 / self.rows.max(1) as f64 / layout.memory_partitions() as f64;
+        ScratchCodec::new(0, layout.memory_partitions()).record_bytes(rate)
+    }
+
     /// Scratch space needed by one pass.
     fn scratch(&self, layout: &Layout) -> u64 {
         let per_partition =
-            self.record_bytes() as f64 * self.scratch_ratio / layout.memory_partitions() as f64;
+            self.records as f64 * self.scratch_record_bytes(layout) * self.scratch_ratio
+                / layout.memory_partitions() as f64;
         (per_partition * layout.scratch_partitions_per_pass() as f64) as u64
     }
 
     fn layout(&self, config: &Config, read_threads: u64) -> Layout {
+        if let Some((passes, per_pass)) = config.layout {
+            return Layout::new(passes, per_pass);
+        }
         Layout::choose(|layout| {
             (
                 self.memory(layout, read_threads) <= config.memory_budget,
@@ -234,6 +246,9 @@ pub struct Config {
     pub sst_target_size: u64,
     /// Write the cold positions (reached by a single game).
     pub cold: bool,
+    /// Passes and memory partitions per pass, instead of choosing them by
+    /// the budgets (for experiments).
+    pub layout: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -337,7 +352,8 @@ impl fmt::Display for Plan {
 enum PartitionSource {
     /// Collected in memory by the scan threads.
     Resident(Vec<Vec<IntermediateEntry>>),
-    Scratch(ScratchFile),
+    /// A scratch file and its number of records.
+    Scratch(ScratchFile, u64),
 }
 
 struct PartitionJob {
@@ -421,9 +437,15 @@ pub fn convert(
                     PartitionSource::Resident(parts) => {
                         partition::from_parts(parts, layout.memory_partitions(), load_threads)
                     }
-                    PartitionSource::Scratch(scratch) => {
-                        let partition =
-                            partition::load(&scratch, layout.memory_partitions(), load_threads);
+                    PartitionSource::Scratch(scratch, records) => {
+                        let codec = ScratchCodec::new(memory_partition, layout.memory_partitions());
+                        let partition = partition::load(
+                            &scratch,
+                            records as usize,
+                            codec,
+                            layout.memory_partitions(),
+                            load_threads,
+                        );
                         counters.remove_scratch(scratch).expect("remove scratch");
                         partition
                     }
@@ -519,16 +541,18 @@ pub fn convert(
             }
             let scratch_bytes: u64 = scattered.scratch.iter().map(ScratchFile::len).sum();
             let scratch_raw: u64 = scattered.scratch.iter().map(ScratchFile::raw_len).sum();
+            let scratch_records: u64 = scattered.scratch_records.iter().sum();
             counters
                 .reclaimable_scratch
                 .fetch_add(scratch_bytes, Ordering::Release);
             log_above(
                 progress,
                 format!(
-                    "pass {pass}: scatter {:.1?} ({} MB scratch, ratio {:.3}, {} hot entries)",
+                    "pass {pass}: scatter {:.1?} ({} MB scratch, {:.2} B/record, raw {:.2} B/record, {} hot entries)",
                     timer.elapsed(),
                     scratch_bytes >> 20,
-                    scratch_bytes as f64 / scratch_raw.max(1) as f64,
+                    scratch_bytes as f64 / scratch_records.max(1) as f64,
+                    scratch_raw as f64 / scratch_records.max(1) as f64,
                     scattered.hot.len(),
                 ),
             );
@@ -561,11 +585,16 @@ pub fn convert(
                     })
                     .expect("send job");
             }
-            for (j, file) in scattered.scratch.into_iter().enumerate() {
+            for (j, (file, records)) in scattered
+                .scratch
+                .into_iter()
+                .zip(scattered.scratch_records)
+                .enumerate()
+            {
                 job_tx
                     .send(PartitionJob {
                         memory_partition: first_memory_partition + j,
-                        source: PartitionSource::Scratch(file),
+                        source: PartitionSource::Scratch(file, records),
                         hot: mem::take(&mut hot_by_partition[j]),
                     })
                     .expect("send job");
@@ -634,6 +663,8 @@ struct Scattered {
     /// Parts of the resident partitions collected by each thread.
     resident: Vec<Vec<Vec<IntermediateEntry>>>,
     scratch: Vec<ScratchFile>,
+    /// Records in each scratch file.
+    scratch_records: Vec<u64>,
     /// Packed entries of the hot positions of this pass.
     hot: HotEntries,
 }
@@ -665,6 +696,16 @@ fn scatter_pass(
         })
         .collect::<io::Result<_>>()?;
 
+    let scratch_records: Vec<AtomicU64> =
+        (0..scratch_partitions).map(|_| AtomicU64::new(0)).collect();
+    let codecs: Vec<ScratchCodec> = (0..scratch_partitions)
+        .map(|j| {
+            ScratchCodec::new(
+                first_memory_partition + j,
+                config.layout.memory_partitions(),
+            )
+        })
+        .collect();
     let resident: Mutex<Vec<Vec<Vec<IntermediateEntry>>>> = Mutex::new(Vec::new());
     let hot_map = HotMap::default();
     let times = ScatterTimes::default();
@@ -676,6 +717,11 @@ fn scatter_pass(
         reclaimable: &counters.reclaimable_scratch,
     };
 
+    let encode = &|j: usize, chunk: Chunk, out: &mut Vec<u8>| {
+        scratch_records[j].fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        codecs[j].encode(&chunk, out);
+    };
+
     thread::scope(|s| {
         let files = &files;
         let resident = &resident;
@@ -684,10 +730,10 @@ fn scatter_pass(
         let writer_config = &writer_config;
         let prefetcher = Prefetcher::spawn(input, config.io_depth, &times.prefetch, s);
 
-        // Write threads compress full chunks and append them to scratch
-        // files, throttled by the scratch budget.
+        // Write threads encode and compress full chunks and append them to
+        // scratch files, throttled by the scratch budget.
         let (tx, rx) = channel::bounded::<(usize, Chunk)>(config.write_threads * 2);
-        spawn_chunk_writers(s, writer_config, files, rx, &times.writer);
+        spawn_chunk_writers(s, writer_config, files, rx, encode, &times.writer);
 
         // Read threads replay the games and route the records of this pass
         // to hot positions, resident partitions or scratch chunks.
@@ -795,6 +841,10 @@ fn scatter_pass(
     Ok(Scattered {
         resident: merged,
         scratch: files,
+        scratch_records: scratch_records
+            .iter()
+            .map(|records| records.load(Ordering::Relaxed))
+            .collect(),
         hot: hot_map.pack(),
     })
 }

@@ -1,6 +1,9 @@
 use std::{sync::Mutex, thread};
 
-use crate::{intermediate::IntermediateEntry, packed::ColdKey, scatter::ScratchFile};
+use crate::{
+    intermediate::IntermediateEntry, packed::ColdKey,
+    parquet_to_positions::scratch_codec::ScratchCodec, scatter::ScratchFile,
+};
 
 /// Sub-buckets of a memory partition, by the hash bits below the partition
 /// bits. They are sorted in parallel and later written in parallel.
@@ -41,12 +44,6 @@ pub fn memory_partition(
 #[inline]
 pub fn bucket(key: &[u8; IntermediateEntry::KEY_SIZE], memory_partitions: usize) -> usize {
     (split(key, memory_partitions).1 >> (32 - BUCKET_BITS)) as usize
-}
-
-fn entries(raw: &[u8]) -> impl Iterator<Item = IntermediateEntry> + '_ {
-    let (records, rest) = raw.as_chunks::<{ IntermediateEntry::SIZE }>();
-    assert!(rest.is_empty(), "records truncated");
-    records.iter().map(|record| IntermediateEntry(*record))
 }
 
 /// Records of a memory partition, distributed to buckets in key order.
@@ -132,17 +129,18 @@ fn into_partition(buckets: Vec<Mutex<Vec<IntermediateEntry>>>) -> Partition {
 }
 
 /// Loads a scratch file in parallel, distributing its records to buckets.
-pub fn load(scratch: &ScratchFile, memory_partitions: usize, threads: usize) -> Partition {
-    let records = scratch.raw_len() as usize / IntermediateEntry::SIZE;
+pub fn load(
+    scratch: &ScratchFile,
+    records: usize,
+    codec: ScratchCodec,
+    memory_partitions: usize,
+    threads: usize,
+) -> Partition {
     let buckets = shared_buckets(records);
     let bucketers = scratch.load(
         threads,
         || Bucketer::new(memory_partitions, &buckets),
-        |bucketer, _, raw| {
-            for entry in entries(raw) {
-                bucketer.push(entry);
-            }
-        },
+        |bucketer, _, raw| codec.decode(raw, |entry| bucketer.push(entry)),
     );
     for mut bucketer in bucketers {
         bucketer.flush();
