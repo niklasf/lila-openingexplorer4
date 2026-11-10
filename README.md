@@ -113,53 +113,13 @@ $B/stress_explorer samples/requests/explorer-2026-11-06T1520Z-1h.tsv.zst \
 
 ## Todo
 
-### Indexing from scratch
-
-* [x] `pgn_to_parquet`: Convert `.pgn` or `.pgn.zst` files to a single
-  `.parquet` file optimized for the following stages.
-* [x] `parquet_to_games`: Produce RocksDB SST files for games.
-* [x] `parquet_to_positions`: Produce RocksDB SST files for positions.
-
-### Live server
-
-Overall features:
-
-* [x] Lichess games
-* [x] Master games
 * [ ] Broadcast games
-* [x] Lichess games indexed by player (aka personal opening explorer)
-
-Critical performance work:
-
-* [x] Stress testing tool
-* [x] Determine best disk layout and migration strategy
-* [x] Document recommended options for each workload
-* [x] Investigate why LRU beats CLOCK
-* [x] Investigate cache admission policy
-* [x] Make cold optional
-* [x] Partial sorting
-* [x] Recheck compression on latest SSTs
-* [x] Elias-Fano vs rice on cold entries
-* [x] Optimize SST block sizes
-* [x] Truncate Lichess game moves
-* [ ] Tune warm/cold threshold for player database
-
-Needs HDDs:
-
-* [ ] Optimize blocking thread count
-* [ ] Recheck parallel game loading
-* [ ] Consider loading and pinning meta data on startup
-
-Minor things:
-
-* [x] Performance rating
-* [x] Banned player blacklist
 * [ ] Unify masters/lichess API
-* [ ] RocksDB PerfStatsLevel mismatch (patch prepared)
-
-Pending documentation changes:
-
-* [ ] title on GamePlayer
+* [ ] Upstream RocksDB PerfStatsLevel mismatch
+* [ ] Document title on GamePlayer
+* [ ] Record provenance in SST file meta data
+* [ ] Delta-encoding for intermediate entries
+* [ ] Explore more expensive move compression for cold storage
 
 ## Production hardware
 
