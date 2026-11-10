@@ -4,8 +4,7 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use lila_openingexplorer4::{
     parquet_to_games::{Config, convert},
-    sst::SstConfig,
-    util::{ByteSize, zstd_level},
+    util::ByteSize,
 };
 use tikv_jemallocator::Jemalloc;
 
@@ -54,16 +53,6 @@ struct Args {
     /// column family should match.
     #[clap(long, default_value = "2g")]
     sst_target_size: ByteSize,
-    /// Block size of the SST files.
-    #[clap(long, default_value = "16384")]
-    sst_block_size: usize,
-    /// Zstd level of the SST files, or 0 for no compression.
-    #[clap(long, default_value = "3", value_parser = zstd_level())]
-    sst_zstd_level: i32,
-    /// Maximum size of the zstd dictionary trained for each SST file
-    /// (0 to disable dictionary compression).
-    #[clap(long, default_value = "0")]
-    sst_zstd_dict: i32,
 }
 
 fn main() {
@@ -79,12 +68,6 @@ fn main() {
         direct_io: !args.no_direct_io,
         skip_row_groups: args.skip_row_groups,
         row_groups: args.row_groups,
-        sst: SstConfig {
-            block_size: args.sst_block_size,
-            zstd_level: args.sst_zstd_level,
-            zstd_dict: args.sst_zstd_dict,
-            direct_io: !args.no_direct_io,
-        },
         sst_target_size: args.sst_target_size.into(),
         max_ply: (args.max_ply > 0).then_some(args.max_ply),
     };

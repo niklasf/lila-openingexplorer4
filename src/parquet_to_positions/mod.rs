@@ -33,7 +33,7 @@ use crate::{
         ChunkWriterConfig, ChunkWriterTimes, Layout, RESIDENT_PARTITIONS_PER_PASS, ScratchFile,
         spawn_chunk_writers,
     },
-    sst::{SstConfig, SstTableConfig},
+    sst::{SstConfig, env_options},
     util::{Gauge, create_dir, create_empty_dir, log_above, progress_bar, timed, timed_seconds},
 };
 
@@ -230,7 +230,6 @@ pub struct Config {
     /// Scan the input for the next pass while partitions of the previous
     /// pass are still being written.
     pub overlap: bool,
-    pub sst: SstConfig,
     /// Start a new SST file once the current one reaches this size.
     pub sst_target_size: u64,
     /// Write the cold positions (reached by a single game).
@@ -379,22 +378,13 @@ pub fn convert(
 
     let hot_set: IntSet<PositionKey> = estimate.hot.iter().map(|(hash, _)| *hash).collect();
     let sst = SstContext {
-        // Cold keys are dense prefixes of the hash space: every lookup
-        // hits a group, so a filter would not help.
         cold_opts: &SstConfig {
             zstd_level: cold_zstd_level(estimate.records),
-            zstd_dict: 0,
-            ..config.sst
+            ..SstConfig::COLD_POSITIONS
         }
-        .options(&SstTableConfig {
-            filter: false,
-            separate_key_value_in_data_block: false,
-        }),
-        positions_opts: &config.sst.options(&SstTableConfig {
-            filter: true,
-            separate_key_value_in_data_block: true,
-        }),
-        env_opts: &config.sst.env_options(),
+        .options(),
+        positions_opts: &SstConfig::POSITIONS.options(),
+        env_opts: &env_options(config.direct_io),
         out,
         target_size: config.sst_target_size,
         cold: config.cold,

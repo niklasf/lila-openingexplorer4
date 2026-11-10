@@ -11,7 +11,7 @@ use std::{
 use clap::Parser;
 use lila_openingexplorer4::{
     server::db::{COLD_CF, GAME_IDS_CF, GAMES_CF, POSITIONS_CF},
-    sst::{SstConfig, SstFile, SstTableConfig, read_table_options},
+    sst::{FILTER_BITS_PER_KEY, SstConfig, SstFile, env_options},
 };
 use rocksdb::{DB, DBCompressionType, Options, ReadOptions};
 use tikv_jemallocator::Jemalloc;
@@ -24,8 +24,10 @@ static ALLOC: Jemalloc = Jemalloc;
 /// or to adopt new options without rebuilding from parquet. The output files
 /// are named in key order, so that `explorer ingest` can take them.
 ///
-/// Defaults match the writers of parquet_to_games and parquet_to_positions,
-/// so that only the given options change.
+/// Defaults match the writers of parquet_to_games and parquet_to_positions
+/// (`SstConfig` of the column family), so that only the given options
+/// change. Cold positions of small databases are written with zstd level 3
+/// instead (`--zstd-level 3`).
 #[derive(Parser)]
 struct Args {
     /// Database directory created by `explorer ingest`.
@@ -44,26 +46,31 @@ struct Args {
     /// not a complete column family.
     #[arg(long, default_value = "1")]
     sample: usize,
-    /// Block size. Defaults to 16384 for games and game ids, 4096 otherwise.
+    /// Block size.
     #[arg(long)]
     block_size: Option<usize>,
+    /// Keys between restart points of data blocks, which are delta-encoded
+    /// in between. RocksDB's default is 16.
+    #[arg(long)]
+    block_restart_interval: Option<i32>,
     /// Size of index and filter partitions.
     #[arg(long, default_value = "4096")]
     metadata_block_size: usize,
     #[arg(long, default_value = "16")]
     index_restart_interval: i32,
     /// Store the keys and the values of each data block in separate
-    /// sections. Defaults to true for games and positions, false otherwise.
+    /// sections.
     #[arg(long)]
     separate_key_value_in_data_block: Option<bool>,
     /// Bloom-equivalent bits per key of the ribbon filter, 0 for none.
-    /// Defaults to 10 for positions, none otherwise.
     #[arg(long)]
     filter_bits: Option<f64>,
-    /// Defaults to 1 for positions, 0 for cold positions (which the writer
-    /// compresses only for small databases), 3 otherwise.
     #[arg(long)]
     zstd_level: Option<i32>,
+    /// Maximum size of the zstd dictionary trained for each file, 0 for
+    /// none.
+    #[arg(long, default_value = "0")]
+    zstd_dict: i32,
     /// With lz4, the zstd level does not matter.
     #[arg(long, value_enum, default_value = "zstd")]
     compression: Compression,
@@ -90,18 +97,17 @@ enum Compression {
 
 fn main() {
     let args = Args::parse();
-    let filter_bits = args
-        .filter_bits
-        .unwrap_or(if args.cf == POSITIONS_CF { 10.0 } else { 0.0 });
+    let base = SstConfig::for_cf(&args.cf).expect("column family");
+    let filter_bits = args.filter_bits.unwrap_or(if base.filter {
+        FILTER_BITS_PER_KEY
+    } else {
+        0.0
+    });
     let zstd_level = match args.compression {
         Compression::None => 0,
         // Nonzero, so that compression options (including the bar) are set.
         Compression::Lz4 => 1,
-        Compression::Zstd => args.zstd_level.unwrap_or(match args.cf.as_str() {
-            POSITIONS_CF => 1,
-            COLD_CF => 0,
-            _ => 3,
-        }),
+        Compression::Zstd => args.zstd_level.unwrap_or(base.zstd_level),
     };
 
     let cfs = [GAMES_CF, POSITIONS_CF, COLD_CF, GAME_IDS_CF];
@@ -110,7 +116,11 @@ fn main() {
     db_opts.set_max_open_files(-1);
     let descriptors = cfs.iter().map(|name| {
         let mut opts = Options::default();
-        opts.set_block_based_table_factory(&read_table_options(*name == POSITIONS_CF));
+        opts.set_block_based_table_factory(
+            &SstConfig::for_cf(name)
+                .expect("explorer cf")
+                .read_table_options(),
+        );
         rocksdb::ColumnFamilyDescriptor::new(*name, opts)
     });
     let db =
@@ -128,23 +138,18 @@ fn main() {
     std::fs::create_dir_all(&args.out).expect("create out");
 
     let sst = SstConfig {
-        block_size: args
-            .block_size
-            .unwrap_or(if args.cf == GAMES_CF || args.cf == GAME_IDS_CF {
-                16384
-            } else {
-                4096
-            }),
+        block_size: args.block_size.unwrap_or(base.block_size),
         zstd_level,
-        zstd_dict: 0,
-        direct_io: true,
-    };
-    let mut table_opts = sst.table_options(&SstTableConfig {
+        // Set below, with the given bits per key.
         filter: false,
         separate_key_value_in_data_block: args
             .separate_key_value_in_data_block
-            .unwrap_or(args.cf == GAMES_CF || args.cf == POSITIONS_CF),
-    });
+            .unwrap_or(base.separate_key_value_in_data_block),
+    };
+    let mut table_opts = sst.table_options();
+    if let Some(interval) = args.block_restart_interval {
+        table_opts.set_block_restart_interval(interval);
+    }
     table_opts.set_metadata_block_size(args.metadata_block_size);
     table_opts.set_index_block_restart_interval(args.index_restart_interval);
     if filter_bits > 0.0 {
@@ -164,12 +169,16 @@ fn main() {
     if args.compression == Compression::Lz4 {
         opts.set_compression_type(DBCompressionType::Lz4);
     }
+    if zstd_level != 0 && args.zstd_dict > 0 {
+        opts.set_compression_options(-14, zstd_level, 0, args.zstd_dict);
+        opts.set_zstd_max_train_bytes(args.zstd_dict * 100);
+    }
     if let Some(bar) = args.max_compressed_bytes_per_kb
         && zstd_level != 0
     {
         opts.set_compression_options_max_compressed_bytes_per_kb(bar);
     }
-    let env_opts = sst.env_options();
+    let env_opts = env_options(true);
 
     let started = Instant::now();
     let next = AtomicUsize::new(0);

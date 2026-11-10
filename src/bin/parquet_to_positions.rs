@@ -4,7 +4,6 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use lila_openingexplorer4::{
     parquet_to_positions::{Config, Plan, convert},
-    sst::SstConfig,
     util::{ByteSize, free_space, total_memory, zstd_level},
 };
 use tikv_jemallocator::Jemalloc;
@@ -79,13 +78,6 @@ struct Args {
     /// column families should match.
     #[clap(long, default_value = "2g")]
     sst_target_size: ByteSize,
-    /// Block size of the SST files.
-    #[clap(long, default_value = "4096")]
-    sst_block_size: usize,
-    /// Maximum size of the zstd dictionary trained for each positions SST
-    /// file (0 to disable dictionary compression).
-    #[clap(long, default_value = "0")]
-    sst_zstd_dict: i32,
     /// Threads for replaying the input (default: two thirds of the threads
     /// with a single pass or --no-overlap, otherwise half).
     #[clap(long, help_heading = "Advanced")]
@@ -141,14 +133,6 @@ fn main() {
         row_groups: args.row_groups,
         scatter_only: args.scatter_only,
         overlap: !args.no_overlap,
-        sst: SstConfig {
-            block_size: args.sst_block_size,
-            // Higher levels save little more, but cost write time. Cold
-            // positions use their own level.
-            zstd_level: 1,
-            zstd_dict: args.sst_zstd_dict,
-            direct_io: !args.no_direct_io,
-        },
         sst_target_size: args.sst_target_size.into(),
         cold: !args.no_cold,
     };

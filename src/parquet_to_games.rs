@@ -14,7 +14,7 @@ use indicatif::{MultiProgress, ProgressBar};
 use crate::{
     packed::{BorrowedLichessGame, GameId, GameIndex, PackedMoves, pack_game_value},
     parquet::Input,
-    sst::{RollingSstWriter, SstConfig, SstError, SstStats, SstTableConfig},
+    sst::{RollingSstWriter, SstConfig, SstError, SstStats, env_options},
     util::{create_empty_dir, log_above, progress_bar},
 };
 
@@ -35,7 +35,6 @@ pub struct Config {
     pub skip_row_groups: usize,
     /// Only process the first row groups of the inputs.
     pub row_groups: Option<usize>,
-    pub sst: SstConfig,
     /// Approximate size of the SST files.
     pub sst_target_size: u64,
     /// Store the moves of each game only up to this ply (`None` for all),
@@ -74,11 +73,8 @@ pub fn convert(
         create_empty_dir(dir)?;
     }
 
-    let opts = config.sst.options(&SstTableConfig {
-        filter: false,
-        separate_key_value_in_data_block: true,
-    });
-    let env_opts = config.sst.env_options();
+    let opts = SstConfig::GAMES.options();
+    let env_opts = env_options(config.direct_io);
     let ranges = ranges(&input, config);
     let progress = progress.add(progress_bar(input.total_rows()));
     let next = AtomicUsize::new(0);
@@ -222,11 +218,8 @@ fn write_game_ids(
     if let Some(pair) = ids.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         return Err(io::Error::other(format!("duplicate game id {}", pair[0].0)).into());
     }
-    let opts = config.sst.options(&SstTableConfig {
-        filter: false,
-        separate_key_value_in_data_block: false,
-    });
-    let env_opts = config.sst.env_options();
+    let opts = SstConfig::GAME_IDS.options();
+    let env_opts = env_options(config.direct_io);
     let mut writer = RollingSstWriter::new(
         &opts,
         &env_opts,

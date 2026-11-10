@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     packed::{ColdGroupView, ColdKey, GameId, GameIndex, PositionKey},
-    sst::read_table_options,
+    sst::SstConfig,
 };
 
 pub const GAMES_CF: &str = "games";
@@ -50,30 +50,27 @@ pub enum DbError {
 }
 
 fn descriptors(cache: &Cache, pin_metadata: bool) -> Vec<ColumnFamilyDescriptor> {
-    [
-        (GAMES_CF, false),
-        (POSITIONS_CF, true),
-        (COLD_CF, false),
-        (GAME_IDS_CF, false),
-    ]
-    .into_iter()
-    .map(|(name, filter)| {
-        let mut table_opts = read_table_options(filter);
-        table_opts.set_block_cache(cache);
-        table_opts.set_cache_index_and_filter_blocks(true);
-        table_opts.set_cache_index_and_filter_blocks_with_high_priority(true);
-        table_opts.set_pin_top_level_index_and_filter(true);
-        if pin_metadata {
-            table_opts.set_top_level_index_pinning_tier(BlockBasedTablePinningTier::All);
-            table_opts.set_partition_pinning_tier(BlockBasedTablePinningTier::All);
-            table_opts.set_unpartitioned_pinning_tier(BlockBasedTablePinningTier::All);
-        }
-        let mut opts = Options::default();
-        opts.set_block_based_table_factory(&table_opts);
-        opts.set_disable_auto_compactions(true);
-        ColumnFamilyDescriptor::new(name, opts)
-    })
-    .collect()
+    [GAMES_CF, POSITIONS_CF, COLD_CF, GAME_IDS_CF]
+        .into_iter()
+        .map(|name| {
+            let mut table_opts = SstConfig::for_cf(name)
+                .expect("explorer cf")
+                .read_table_options();
+            table_opts.set_block_cache(cache);
+            table_opts.set_cache_index_and_filter_blocks(true);
+            table_opts.set_cache_index_and_filter_blocks_with_high_priority(true);
+            table_opts.set_pin_top_level_index_and_filter(true);
+            if pin_metadata {
+                table_opts.set_top_level_index_pinning_tier(BlockBasedTablePinningTier::All);
+                table_opts.set_partition_pinning_tier(BlockBasedTablePinningTier::All);
+                table_opts.set_unpartitioned_pinning_tier(BlockBasedTablePinningTier::All);
+            }
+            let mut opts = Options::default();
+            opts.set_block_based_table_factory(&table_opts);
+            opts.set_disable_auto_compactions(true);
+            ColumnFamilyDescriptor::new(name, opts)
+        })
+        .collect()
 }
 
 fn db_options(config: &DbConfig) -> Options {
