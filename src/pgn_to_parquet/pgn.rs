@@ -1,4 +1,4 @@
-use std::{io, mem, ops::ControlFlow};
+use std::{io, ops::ControlFlow};
 
 use pgn_reader::{RawTag, Skip, Visitor};
 use shakmaty::{
@@ -16,8 +16,7 @@ use crate::{
 
 /// Parses games, keeping only the first `max_ply` moves.
 ///
-/// The rest of the movetext of longer games is skipped (not validated), and
-/// their outcome comes from the `Result` tag instead.
+/// Moves after `max_ply` are not validated.
 pub struct GameVisitor {
     pub max_ply: usize,
 }
@@ -37,9 +36,6 @@ pub struct ParsedGame {
     fen: Option<Fen>,
     moves: Vec<San>,
     outcome: Option<Outcome>,
-    /// From the `Result` tag, for games that are cut before the result in
-    /// the movetext.
-    result_tag: Option<Outcome>,
 }
 
 impl ParsedGame {
@@ -159,9 +155,6 @@ impl ParsedGame {
                     },
                 )?);
             }
-            b"Result" => {
-                self.result_tag = Outcome::from_ascii(value.as_bytes()).ok();
-            }
             b"Variant" => {
                 self.variant =
                     Some(LilaVariant::from_pgn_tag(value.as_bytes()).map_err(|err| {
@@ -194,14 +187,9 @@ impl ParsedGame {
         Ok(())
     }
 
-    /// Returns whether the movetext is complete.
-    fn visit_san(&mut self, san: San, max_ply: usize) -> bool {
-        self.moves.push(san);
-        if self.moves.len() >= max_ply {
-            self.outcome = self.result_tag;
-            true
-        } else {
-            false
+    fn visit_san(&mut self, san: San, max_ply: usize) {
+        if self.moves.len() < max_ply {
+            self.moves.push(san);
         }
     }
 
@@ -368,11 +356,8 @@ impl Visitor for GameVisitor {
         movetext: &mut Self::Movetext,
         san_plus: SanPlus,
     ) -> ControlFlow<Self::Output> {
-        if movetext.visit_san(san_plus.san, self.max_ply) {
-            ControlFlow::Break(Ok(mem::take(movetext)))
-        } else {
-            ControlFlow::Continue(())
-        }
+        movetext.visit_san(san_plus.san, self.max_ply);
+        ControlFlow::Continue(())
     }
 
     fn outcome(
