@@ -328,7 +328,7 @@ impl fmt::Display for Plan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} games, about {} records ({} GB) and {} records of {} hot positions; {} passes with {} memory partitions each, about {} GB scratch per pass and {} GB memory; threads: {} read, {} write, {} load ({} after the last scan), {} sst ({} after the last scan)",
+            "{} games, about {} records ({} GiB) and {} records of {} hot positions; {} passes with {} memory partitions each, about {} GiB scratch per pass and {} GiB memory; threads: {} read, {} write, {} load ({} after the last scan), {} sst ({} after the last scan)",
             self.estimate.rows,
             self.estimate.records,
             self.estimate.record_bytes() >> 30,
@@ -548,7 +548,7 @@ pub fn convert(
             log_above(
                 progress,
                 format!(
-                    "pass {pass}: scatter {:.1?} ({} MB scratch, {:.2} B/record, raw {:.2} B/record, {} hot entries)",
+                    "pass {pass}: scatter {:.1?} ({} MiB scratch, {:.2} B/record, raw {:.2} B/record, {} hot entries)",
                     timer.elapsed(),
                     scratch_bytes >> 20,
                     scratch_bytes as f64 / scratch_records.max(1) as f64,

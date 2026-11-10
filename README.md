@@ -13,7 +13,7 @@ cargo build --release
 B=target/release
 ```
 
-Production: 128 GB RAM, 12 hardware threads, SST files on hard disks,
+Production: 128 GiB RAM, 12 hardware threads, SST files on hard disks,
 two instances running intermittently.
 
 Create the database directories from the SST files. The SST files are
@@ -39,7 +39,7 @@ $B/explorer masters --db /hdd/masters/db --bind 127.0.0.1:9003 --cors \
     --blocking-threads 12
 ```
 
-* `--cache`: Should fit index and filter blocks (10.9 GB as of 2026-11,
+* `--cache`: Should fit index and filter blocks (10.2 GiB as of 2026-11,
   growing with the number of games). Adding more is good, but keep a
   significant amount of RAM for the page cache to avoid cold starts.
 * No `--direct-reads`: Avoid when cold starts matter. Otherwise good combined
@@ -87,30 +87,30 @@ $B/stress_explorer samples/requests/explorer-2026-11-06T1520Z-1h.tsv.zst \
 
 ## Indexing
 
-### What to expect
+### What to expect?
 
-Development hardware:
-
-* AMD Ryzen 9 9950X (16 cores, 32 threads), 30 threads used
-* 192 GiB RAM, `--memory-budget 100g`
-* Input PGNs on HDD readable at ~350 MB/s sequential
-* Output and scratch space on 8 TB NVMe, sustaining ~2.8 GB/s reads + 2.9 GB/s
-  writes concurrently.
-
-Indexing run of ~2.5 TiB input PGNs:
+Indexing run of ~2.4 TiB input PGNs
 
 | Step | Time | Peak RSS |
 | --- | --- | --- |
-| `pgn_to_parquet` | 2 h 08 min | 29 GB |
-| `parquet_to_positions` (3 passes, `--scratch-budget 2863g`) | 2 h 40 min | 84 GB |
-| `parquet_to_games --max-ply 50` | 15 min | 2 GB |
+| `pgn_to_parquet` | 2 h 08 min | 28 GiB |
+| `parquet_to_positions` (3 passes, `--scratch-budget 2863g`) | 2 h 40 min | 80 GiB |
+| `parquet_to_games --max-ply 50` | 15 min | 2 GiB |
 | `ingest` | 8 s | |
+
+on this development hardware:
+
+* AMD Ryzen 9 9950X (16 cores, 32 threads), `--threads 30`
+* 192 GiB RAM, `--memory-budget 100g`
+* Input PGNs on HDD readable at ~330 MiB/s sequential
+* Output and scratch space on 7.3 TiB NVMe, sustaining ~2.6 GiB/s reads +
+  2.7 GiB/s writes concurrently.
 
 ### `pgn_to_parquet`
 
 Prepare a parquet file from PGNs for further processing.
 
-**Input:** ~2.5 TiB of monthly game dumps from https://database.lichess.org \
+**Input:** ~2.4 TiB of monthly game dumps from https://database.lichess.org \
 **Output:** ~600 GiB parquet file \
 **Typical bottleneck:** sequential reads of the dumps (from HDDs) > CPU
 
@@ -149,7 +149,7 @@ $B/parquet_to_positions lichess/lichess_db_rated.parquet --out lichess/sst --scr
 Scan out game SSTs
 
 **Input:** ~600 GiB parquet file from above \
-**Output:** ~600 GiB of SST files \
+**Output:** ~560 GiB of SST files \
 **Additional resources:** no scratch space, ~2 GiB RAM \
 **Typical bottleneck:** CPU (compression)
 
@@ -173,9 +173,9 @@ all moves (the default, 0), for `/masters/pgn`.
 ## Production hardware
 
 * AMD Ryzen 5 PRO 3600 (12 threads @ 3.6 GHz)
-* 128 GB RAM
-* 4x HGST HUS726T6TAL (5.46 TB) in RAID 10
-* 2x WDC CL SN720 SDAQNTW-512G-2000 (512 GB) in RAID 1
+* 128 GiB RAM
+* 4x HGST HUS726T6TAL (5.46 TiB) in RAID 10
+* 2x WDC CL SN720 SDAQNTW-512G-2000 (477 GiB) in RAID 1
 
 ## License
 

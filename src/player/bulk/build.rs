@@ -293,10 +293,10 @@ impl BuildStats {
         let sst: Vec<String> = CFS
             .iter()
             .zip(&self.sst_bytes)
-            .map(|(cf, b)| format!("{cf} {:.2} GB", l(b) as f64 / 1e9))
+            .map(|(cf, b)| format!("{cf} {:.2} GiB", l(b) as f64 / (1u64 << 30) as f64))
             .collect();
         format!(
-            "players: {} unindexed, {} dormant, {} active, {} new, {} with a base; games: {} base, {} tail in {} visits, {} of unindexed players, {} after the cutoff not indexed, {} duplicates; {} warm entries, {} cold groups; {}; tails {:.2} GB",
+            "players: {} unindexed, {} dormant, {} active, {} new, {} with a base; games: {} base, {} tail in {} visits, {} of unindexed players, {} after the cutoff not indexed, {} duplicates; {} warm entries, {} cold groups; {}; tails {:.2} GiB",
             l(&self.players_unindexed),
             l(&self.players_dormant),
             l(&self.players_active),
@@ -311,7 +311,7 @@ impl BuildStats {
             l(&self.warm_entries),
             l(&self.cold_groups),
             sst.join(", "),
-            l(&self.tail_bytes) as f64 / 1e9,
+            l(&self.tail_bytes) as f64 / (1u64 << 30) as f64,
         )
     }
 }

@@ -650,11 +650,11 @@ impl PlayerDb {
                 ],
             )?;
             log::info!(
-                "{cf}: last level {:.1} GB, level base {} MB, multiplier {multiplier:.2} (level {} target {:.1} GB)",
-                last as f64 / 1e9,
+                "{cf}: last level {:.1} GiB, level base {} MiB, multiplier {multiplier:.2} (level {} target {:.1} GiB)",
+                last as f64 / (1u64 << 30) as f64,
                 base >> 20,
                 NUM_LEVELS - 2,
-                base as f64 * multiplier.powi(NUM_LEVELS as i32 - 3) / 1e9,
+                base as f64 * multiplier.powi(NUM_LEVELS as i32 - 3) / (1u64 << 30) as f64,
             );
         }
         Ok(())

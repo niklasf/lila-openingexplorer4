@@ -449,9 +449,9 @@ fn report(name: &str, outcome: &mut Outcome, elapsed: Duration) {
     let latencies = &outcome.latencies;
     let n = latencies.len() + outcome.failed;
     println!(
-        "{name}: {n} requests in {elapsed:.1?}: {:.0} req/s, {:.1} MB",
+        "{name}: {n} requests in {elapsed:.1?}: {:.0} req/s, {:.1} MiB",
         n as f64 / elapsed.as_secs_f64(),
-        outcome.bytes as f64 / 1e6,
+        outcome.bytes as f64 / (1u64 << 20) as f64,
     );
     println!(
         "2xx {} (invalid {}), 4xx {}, 5xx {}, other {}, failed {}",

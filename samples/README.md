@@ -10,7 +10,7 @@ with the same paths and file names (recompressed with `zstd -19`):
 * `standard/`: 25,603 games of 2026-10.
 * `antichess/`, `atomic/`, `chess960/`, `crazyhouse/`, `horde/`,
   `kingOfTheHill/`, `racingKings/`, `threeCheck/`: 2,236 to 6,025 games
-  each (7 MB of PGN) of 2026-10.
+  each (6.7 MiB of PGN) of 2026-10.
 * `broadcasts/`: 9,119 games of the 2026-09 broadcast dump
 
 ## `masters-db/games/`
