@@ -13,8 +13,9 @@ pub struct Visit {
 
 /// Replays the stored moves of a game (already truncated by
 /// `pgn_to_parquet`) and finds the position with the given hash, as
-/// `parquet_to_positions` would have recorded it. The final position is
-/// never a visit.
+/// `parquet_to_positions` would have recorded it (its last visit, if it
+/// occurs repeatedly). The final position is never a visit. Stops replaying
+/// at the first irreversible move after a visit.
 pub fn find_visit(game: &BorrowedLichessGame<'_>, target: &PositionKey) -> Option<Visit> {
     let mut pos = game.initial_position();
     let variant = pos.variant();
@@ -37,6 +38,11 @@ pub fn find_visit(game: &BorrowedLichessGame<'_>, target: &PositionKey) -> Optio
                         m: PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)),
                         turn: pos.turn(),
                     });
+                }
+                if found.is_some() && pos.is_irreversible(m) {
+                    // The position cannot occur again, so that was its
+                    // last visit.
+                    break;
                 }
                 let updated = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
                 pos.play_unchecked(m);

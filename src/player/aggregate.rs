@@ -71,7 +71,8 @@ pub fn replay(
 }
 
 /// The move played from the position in the game, if the game reached it
-/// (the last time, like `replay`).
+/// (the last time, like `replay`). Stops replaying at the first irreversible
+/// move after a visit.
 pub fn find_visit(
     game: &BorrowedPlayerGame<'_>,
     target: &PositionKey,
@@ -96,6 +97,11 @@ pub fn find_visit(
             {
                 if PositionKey::from_zobrist(hash, self.variant) == *self.target {
                     found = Some(PackedUciMove::pack(m.to_uci(CastlingMode::Chess960)));
+                }
+                if found.is_some() && pos.is_irreversible(m) {
+                    // The position cannot occur again, so that was its
+                    // last visit.
+                    break;
                 }
                 ply += 1;
                 let updated = pos.update_zobrist_hash(hash, m, EnPassantMode::Legal);
