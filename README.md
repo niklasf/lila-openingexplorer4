@@ -160,6 +160,7 @@ $B/parquet_to_games lichess/lichess_db_rated.parquet --out lichess/sst/games
 * [ ] Document title on GamePlayer
 * [ ] Record provenance in SST file meta data
 * [x] Delta-encoding for intermediate entries
+* [ ] Consider introducing player ids
 * [ ] Explore more expensive move compression for cold storage
 
 ## Production hardware

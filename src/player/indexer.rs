@@ -781,7 +781,6 @@ mod tests {
         indexer: Arc<Indexer>,
         players: Vec<UserId>,
         games: Vec<Vec<FixtureGame>>,
-        indexers: usize,
     }
 
     async fn setup_mock(
@@ -844,7 +843,6 @@ mod tests {
             indexer,
             players: users,
             games: fixture_games,
-            indexers,
         }
     }
 
@@ -901,12 +899,6 @@ mod tests {
                     assert_eq!(total, expected, "{user} {color}");
                 }
             }
-            let stats = self.mock.stats();
-            assert_eq!(stats.violations, 0, "{stats:?}");
-            assert!(
-                stats.max_active_streams <= self.indexers as u64,
-                "{stats:?}"
-            );
         }
     }
 
@@ -933,7 +925,13 @@ mod tests {
         // Within the cooldown, no new runs.
         let ticket = setup.indexer.request(&setup.players[0]).await.unwrap();
         assert!(ticket.progress().done);
-        assert_eq!(setup.mock.stats().max_active_streams, 3);
+        // Only meaningful without aborted streams: from the point of view
+        // of the mock, the next request can briefly overlap.
+        if m.stream_retries.get() == 0 {
+            let stats = setup.mock.stats();
+            assert_eq!(stats.violations, 0, "{stats:?}");
+            assert!(stats.max_active_streams <= 3, "{stats:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
