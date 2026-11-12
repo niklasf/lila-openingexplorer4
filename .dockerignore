@@ -1,0 +1,7 @@
+*
+
+# Allow list
+!Cargo.toml
+!Cargo.lock
+!rustfmt.toml
+!src

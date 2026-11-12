@@ -52,84 +52,144 @@ enum Command {
 struct PlayerArgs {
     /// Database directory (created if missing). Only one process may open
     /// it.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_DB")]
     db: PathBuf,
     /// Binding address of the public endpoints.
-    #[arg(long, default_value = "127.0.0.1:9003")]
+    #[arg(long, env = "EXPLORER_BIND", default_value = "127.0.0.1:9003")]
     bind: SocketAddr,
     /// Binding address of administration and monitoring (/monitor and
     /// DELETE /player/{id}), to be kept private. Without it, these are not
     /// served at all.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_ADMIN_BIND")]
     admin_bind: Option<SocketAddr>,
     /// Allow access from all origins.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_CORS")]
     cors: bool,
     /// Size of the RocksDB block cache.
-    #[arg(long, default_value = "4g")]
+    #[arg(long, env = "EXPLORER_CACHE", default_value = "4g")]
     cache: ByteSize,
     /// Directory of the write ahead log (default: in the database).
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_WAL_DIR")]
     wal_dir: Option<PathBuf>,
     /// Directory for SST files with a target size, like
     /// /nvme/player:200g. Repeat for more: newer data (upper levels) goes
     /// to the first ones, older data to later ones (for example the last
     /// level on HDDs).
-    #[arg(long = "db-path", value_parser = parse_db_path)]
+    #[arg(
+        long = "db-path",
+        env = "EXPLORER_DB_PATH",
+        value_delimiter = ',',
+        value_parser = parse_db_path
+    )]
     db_paths: Vec<(PathBuf, u64)>,
     /// Limit flushes and compactions (on all paths) to this many bytes
     /// per second (0 for no limit). Bounds the HDD writes when compactions
     /// rewrite the last level, which are rare; indexing bursts stay in the
     /// upper levels and wrote far less than this in the benchmarks.
-    #[arg(long, default_value = "16m")]
+    #[arg(long, env = "EXPLORER_RATE_LIMIT", default_value = "16m")]
     rate_limit: ByteSize,
     /// With several --db-path: the last level holds this many times the
     /// level above (RocksDB's dynamic level sizes are not available with
     /// several paths, so the server sets the level targets itself).
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(long, env = "EXPLORER_LEVEL_RATIO", default_value_t = 10.0)]
     level_ratio: f64,
     /// Collect RocksDB statistics (tickers in /monitor).
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_DB_STATISTICS")]
     db_statistics: bool,
     /// Parallel index runs, which is also the most parallel streams from
     /// lila (every request counts, retries included).
-    #[arg(long, default_value_t = 8, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_INDEXERS",
+        default_value_t = 8,
+        help_heading = "Indexer"
+    )]
     indexers: usize,
     /// Players waiting for indexing at most (503 when full).
-    #[arg(long, default_value_t = 2000, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_QUEUE_CAPACITY",
+        default_value_t = 2000,
+        help_heading = "Indexer"
+    )]
     queue_capacity: usize,
     /// Queue players strictly in order of arrival, instead of players that
     /// already have an index (short incremental runs) before first runs.
-    #[arg(long, help_heading = "Indexer")]
+    #[arg(long, env = "EXPLORER_FIFO", help_heading = "Indexer")]
     fifo: bool,
     /// No new index run of a player within this many seconds.
-    #[arg(long, default_value_t = 120, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_COOLDOWN",
+        default_value_t = 120,
+        help_heading = "Indexer"
+    )]
     cooldown: u64,
     /// Revisit ongoing games at most this often (seconds).
-    #[arg(long, default_value_t = 900, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_REVISIT_INTERVAL",
+        default_value_t = 900,
+        help_heading = "Indexer"
+    )]
     revisit_interval: u64,
     /// Games per chunk (one atomic write) at most.
-    #[arg(long, default_value_t = 2000, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_CHUNK_GAMES",
+        default_value_t = 2000,
+        help_heading = "Indexer"
+    )]
     chunk_games: usize,
     /// Write a chunk at least this often while indexing (milliseconds).
-    #[arg(long, default_value_t = 1000, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_CHUNK_INTERVAL_MS",
+        default_value_t = 1000,
+        help_heading = "Indexer"
+    )]
     chunk_interval_ms: u64,
     /// Give up the stream of a run after this many seconds and continue at
     /// the end of the queue (0 to run until done). 30 s with --fifo off was
     /// best in the queue simulation of the launch (empty database).
-    #[arg(long, default_value_t = 30, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_MAX_RUN",
+        default_value_t = 30,
+        help_heading = "Indexer"
+    )]
     max_run: u64,
     /// Rebuild a player after at least this many new games ...
-    #[arg(long, default_value_t = 1000, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_REBUILD_MIN_GAMES",
+        default_value_t = 1000,
+        help_heading = "Indexer"
+    )]
     rebuild_min_games: u32,
     /// ... and this share of the games at the last rebuild.
-    #[arg(long, default_value_t = 0.5, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_REBUILD_FACTOR",
+        default_value_t = 0.5,
+        help_heading = "Indexer"
+    )]
     rebuild_factor: f64,
     /// Parallel rebuilds at most.
-    #[arg(long, default_value_t = 1, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_REBUILDS",
+        default_value_t = 1,
+        help_heading = "Indexer"
+    )]
     rebuilds: usize,
     /// Seconds to wait for lila's response and between chunks of it.
-    #[arg(long, default_value_t = 60, help_heading = "Indexer")]
+    #[arg(
+        long,
+        env = "EXPLORER_LILA_TIMEOUT",
+        default_value_t = 60,
+        help_heading = "Indexer"
+    )]
     lila_timeout: u64,
     /// Base url of the lila instance to index games from.
     #[arg(
@@ -142,13 +202,23 @@ struct PlayerArgs {
     #[command(flatten, next_help_heading = "Indexer")]
     bearer: LilaBearerArgs,
     /// Concurrent database reads of requests.
-    #[arg(long, default_value_t = 4, help_heading = "Server")]
+    #[arg(
+        long,
+        env = "EXPLORER_BLOCKING_THREADS",
+        default_value_t = 4,
+        help_heading = "Server"
+    )]
     blocking_threads: usize,
     /// Directory with a.tsv to e.tsv of lichess-org/chess-openings.
-    #[arg(long, help_heading = "Server", conflicts_with = "no_openings")]
+    #[arg(
+        long,
+        env = "EXPLORER_OPENINGS_DIR",
+        help_heading = "Server",
+        conflicts_with = "no_openings"
+    )]
     openings_dir: Option<PathBuf>,
     /// Do not load opening names at all.
-    #[arg(long, help_heading = "Server")]
+    #[arg(long, env = "EXPLORER_NO_OPENINGS", help_heading = "Server")]
     no_openings: bool,
 }
 
@@ -181,22 +251,22 @@ struct DbArgs {
     /// Size of the RocksDB block cache. Accepts units, like 32g. The page
     /// cache serves as a second level unless --direct-reads is given, so
     /// leave memory for it.
-    #[arg(long, default_value = "4g")]
+    #[arg(long, env = "EXPLORER_CACHE", default_value = "4g")]
     cache: ByteSize,
     /// Read SST files with O_DIRECT, bypassing the page cache.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_DIRECT_READS")]
     direct_reads: bool,
     /// Collect RocksDB statistics (tickers in /monitor). Costs a few
     /// percent of CPU.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_DB_STATISTICS")]
     db_statistics: bool,
     /// Threads for opening table files at startup.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, env = "EXPLORER_FILE_OPENING_THREADS", default_value_t = 16)]
     file_opening_threads: usize,
     /// Load all index and filter blocks when opening (sequentially, file
     /// by file), and pin them in the block cache, instead of reading them
     /// as lookups need them. Budget the block cache accordingly.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_PIN_METADATA")]
     pin_metadata: bool,
 }
 
@@ -215,48 +285,63 @@ impl From<DbArgs> for DbConfig {
 #[derive(Args)]
 struct ServeArgs {
     /// Database directory created by `ingest`.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_DB")]
     db: PathBuf,
     /// Binding address of the public endpoints.
-    #[arg(long, default_value = "127.0.0.1:9002")]
+    #[arg(long, env = "EXPLORER_BIND", default_value = "127.0.0.1:9002")]
     bind: SocketAddr,
     /// Binding address for optional administration and monitoring endpoints.
     /// Should not be exposed publicly.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_ADMIN_BIND")]
     admin_bind: Option<SocketAddr>,
     /// Allow access from all origins.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_CORS")]
     cors: bool,
     /// Do not look up cold positions: positions reached by a single game
     /// are answered as if no game reached them. Saves a lookup and loading
     /// the candidate games for every position that is not in the positions
     /// column family.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_NO_COLD")]
     no_cold: bool,
     #[command(flatten)]
     db_opts: DbArgs,
     /// Concurrent database requests. Defaults to half the available
     /// parallelism (the physical cores on machines with SMT): more threads
     /// do not add throughput but lengthen tail latencies.
-    #[arg(long, help_heading = "Server")]
+    #[arg(long, env = "EXPLORER_BLOCKING_THREADS", help_heading = "Server")]
     blocking_threads: Option<usize>,
     /// Read the games of a response that are not in the block cache in
     /// parallel (one thread each), rather than one after the other. For
     /// disks that serve concurrent reads faster, like hard disk arrays.
-    #[arg(long, help_heading = "Server")]
+    #[arg(long, env = "EXPLORER_PARALLEL_FETCH", help_heading = "Server")]
     parallel_fetch: bool,
     /// Entries of the response cache.
-    #[arg(long, default_value_t = 100000, help_heading = "Server")]
+    #[arg(
+        long,
+        env = "EXPLORER_RESPONSE_CACHE",
+        default_value_t = 100000,
+        help_heading = "Server"
+    )]
     response_cache: u64,
     /// Seconds after which cached responses expire.
-    #[arg(long, default_value_t = 7200, help_heading = "Server")]
+    #[arg(
+        long,
+        env = "EXPLORER_RESPONSE_CACHE_TTL",
+        default_value_t = 7200,
+        help_heading = "Server"
+    )]
     response_cache_ttl: u64,
     /// Directory with a.tsv to e.tsv of lichess-org/chess-openings, to be
     /// loaded instead of downloading the current names from GitHub.
-    #[arg(long, help_heading = "Server", conflicts_with = "no_openings")]
+    #[arg(
+        long,
+        env = "EXPLORER_OPENINGS_DIR",
+        help_heading = "Server",
+        conflicts_with = "no_openings"
+    )]
     openings_dir: Option<PathBuf>,
     /// Do not load opening names at all.
-    #[arg(long, help_heading = "Server")]
+    #[arg(long, env = "EXPLORER_NO_OPENINGS", help_heading = "Server")]
     no_openings: bool,
     #[command(flatten)]
     lila: LilaArgs,
@@ -299,10 +384,10 @@ struct LilaArgs {
     #[command(flatten)]
     bearer: LilaBearerArgs,
     /// Seconds between blacklist updates.
-    #[arg(long, default_value_t = 10380)]
+    #[arg(long, env = "EXPLORER_BLACKLIST_REFRESH", default_value_t = 10380)]
     blacklist_refresh: u64,
     /// Do not hide games of blacklisted players.
-    #[arg(long)]
+    #[arg(long, env = "EXPLORER_NO_BLACKLIST")]
     no_blacklist: bool,
 }
 
