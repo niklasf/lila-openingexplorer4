@@ -9,7 +9,7 @@
 #
 #   docker build --target tools -t lila-openingexplorer-tools .
 
-ARG RUST_VERSION=1.100
+ARG RUST_VERSION=1.99
 ARG DEBIAN_RELEASE=trixie
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS chef
