@@ -9,10 +9,7 @@
 #
 #   docker build --target tools -t lila-openingexplorer-tools .
 
-ARG RUST_VERSION=1.99
-ARG DEBIAN_RELEASE=trixie
-
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS chef
+FROM rust:1.99-trixie AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -40,7 +37,7 @@ RUN cargo build --release --locked --bins \
     && mkdir /out \
     && find target/release -maxdepth 1 -type f -executable -exec cp {} /out/ \;
 
-FROM debian:${DEBIAN_RELEASE}-slim AS runtime
+FROM debian:trixie-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
