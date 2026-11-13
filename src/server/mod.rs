@@ -12,4 +12,4 @@ pub mod response;
 
 pub use app::{AppConfig, Kind, serve};
 pub use blacklist::LilaConfig;
-pub use db::{Database, DbConfig, IngestStats, ingest};
+pub use db::{Database, DbConfig, DbError, IngestStats, ingest, ingest_dir};

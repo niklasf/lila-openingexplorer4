@@ -9,7 +9,7 @@ use lila_openingexplorer4::{
         policy::RunPolicy,
         server::PlayerServerConfig,
     },
-    server::{AppConfig, Database, DbConfig, Kind, LilaConfig, ingest, serve},
+    server::{AppConfig, Database, DbConfig, DbError, Kind, LilaConfig, ingest_dir, serve},
     util::ByteSize,
 };
 use tikv_jemallocator::Jemalloc;
@@ -224,25 +224,22 @@ struct PlayerArgs {
 
 #[derive(Args)]
 struct IngestArgs {
-    /// Database directory to create (must not exist yet).
+    /// Database directory to create. It is built in the same path with the
+    /// extension .tmp and renamed when complete.
     #[arg(long)]
     db: PathBuf,
-    /// Output directory of parquet_to_games.
+    /// SST directory: the output directories of parquet_to_positions
+    /// (positions and cold_positions) and parquet_to_games (games, and
+    /// game_ids if it exists, needed for /masters/pgn/{id}).
     #[arg(long)]
-    games: PathBuf,
-    /// Output directory of parquet_to_positions, with the subdirectories
-    /// positions and cold_positions.
-    #[arg(long)]
-    positions: PathBuf,
+    sst: PathBuf,
     /// Leave out the cold positions (positions reached by a single game),
     /// so that the cold_positions subdirectory is not needed.
     #[arg(long)]
     no_cold: bool,
-    /// Directory with the map from game ids to game indexes, written by
-    /// parquet_to_games --game-ids. Needed for looking up games by id
-    /// (/masters/pgn/{id}).
+    /// Do nothing if the database already exists, instead of failing.
     #[arg(long)]
-    game_ids: Option<PathBuf>,
+    if_missing: bool,
 }
 
 #[derive(Args)]
@@ -427,33 +424,23 @@ fn main() {
     .init();
 
     match Cli::parse().command {
-        Command::Ingest(args) => {
-            if args.db.exists() {
-                eprintln!("error: {} already exists", args.db.display());
+        Command::Ingest(args) => match ingest_dir(&args.db, &args.sst, !args.no_cold) {
+            Ok(stats) => println!(
+                "ingested {} games files, {} positions files, {} cold_positions files, {} game_ids files into {}",
+                stats.games_files,
+                stats.positions_files,
+                stats.cold_files,
+                stats.game_ids_files,
+                args.db.display()
+            ),
+            Err(DbError::Exists(path)) if args.if_missing => {
+                println!("{} already exists", path.display());
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
                 process::exit(1);
             }
-            match ingest(
-                &args.db,
-                &args.games,
-                &args.positions.join("positions"),
-                (!args.no_cold)
-                    .then(|| args.positions.join("cold_positions"))
-                    .as_deref(),
-                args.game_ids.as_deref(),
-            ) {
-                Ok(stats) => println!(
-                    "ingested {} games files, {} positions files, {} cold_positions files into {}",
-                    stats.games_files,
-                    stats.positions_files,
-                    stats.cold_files,
-                    args.db.display()
-                ),
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    process::exit(1);
-                }
-            }
-        }
+        },
         Command::Lichess(args) => run(Kind::Lichess, args),
         Command::Masters(args) => run(Kind::Masters, args),
         Command::Player(args) => run_player(args),

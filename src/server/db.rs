@@ -47,6 +47,10 @@ pub enum DbError {
     RocksDb(#[from] rocksdb::Error),
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    #[error("{0} already exists")]
+    Exists(PathBuf),
+    #[error("missing directory {0}")]
+    MissingDir(PathBuf),
 }
 
 fn descriptors(cache: &Cache, pin_metadata: bool) -> Vec<ColumnFamilyDescriptor> {
@@ -118,11 +122,68 @@ pub struct IngestStats {
     pub game_ids_files: usize,
 }
 
+/// Creates a database at `path` from an SST directory, laid out like the
+/// output of parquet_to_games and parquet_to_positions: the subdirectories
+/// `games`, `positions`, `cold_positions` (unless `cold` is false) and,
+/// if it exists, `game_ids`. See [`ingest`].
+pub fn ingest_dir(path: &Path, sst: &Path, cold: bool) -> Result<IngestStats, DbError> {
+    let required = |name: &str| {
+        let dir = sst.join(name);
+        if dir.is_dir() {
+            Ok(dir)
+        } else {
+            Err(DbError::MissingDir(dir))
+        }
+    };
+    let games = required("games")?;
+    let positions = required("positions")?;
+    let cold = cold.then(|| required("cold_positions")).transpose()?;
+    let game_ids = Some(sst.join("game_ids")).filter(|dir| dir.is_dir());
+    ingest(
+        path,
+        &games,
+        &positions,
+        cold.as_deref(),
+        game_ids.as_deref(),
+    )
+}
+
 /// Creates a database at `path` from the SST files of the directories,
 /// which are hard-linked (the originals are left untouched). The
 /// directories must be on the same file system as the database. Without
 /// `cold` or `game_ids`, their column families stay empty.
+///
+/// The database is built next to `path`, in `path` with the extension
+/// `.tmp` (removed first if left over from an interrupted run), and renamed
+/// to `path` once complete, so `path` exists only as a complete database.
 pub fn ingest(
+    path: &Path,
+    games: &Path,
+    positions: &Path,
+    cold: Option<&Path>,
+    game_ids: Option<&Path>,
+) -> Result<IngestStats, DbError> {
+    if path.exists() {
+        return Err(DbError::Exists(path.to_owned()));
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if tmp.exists() {
+        log::warn!("removing {} of an interrupted ingest", tmp.display());
+        fs::remove_dir_all(&tmp)?;
+    }
+    let stats = ingest_into(&tmp, games, positions, cold, game_ids)?;
+    fs::rename(&tmp, path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::File::open(parent)?.sync_all()?;
+    Ok(stats)
+}
+
+fn ingest_into(
     path: &Path,
     games: &Path,
     positions: &Path,

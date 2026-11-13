@@ -20,8 +20,8 @@ Create the database directories from the SST files. The SST files are
 hard-linked, so they must be on the same file system as the database:
 
 ```sh
-$B/explorer ingest --db /hdd/lichess/db --games /hdd/lichess/sst/games --positions /hdd/lichess/sst
-$B/explorer ingest --db /hdd/masters/db --games /hdd/masters/sst/games --positions /hdd/masters/sst --game-ids /hdd/masters/sst/game_ids
+$B/explorer ingest --db /hdd/lichess/db --sst /hdd/lichess/sst
+$B/explorer ingest --db /hdd/masters/db --sst /hdd/masters/sst
 ```
 
 Serve them:

@@ -10,14 +10,14 @@ pgns=$(ls samples/lichess_db/*/lichess_db_*_rated_*.pgn.zst | awk -F_ '{print $N
 $B/pgn_to_parquet --threads 4 --memory-budget 1g --out $W/lichess.parquet $pgns
 $B/parquet_to_positions --threads 4 --no-direct-io --scratch $W/scratch --scratch-budget 4g --memory-budget 6g --out $W/lichess/sst $W/lichess.parquet
 $B/parquet_to_games --threads 4 --no-direct-io --out $W/lichess/sst/games $W/lichess.parquet
-$B/explorer ingest --db $W/lichess/db --games $W/lichess/sst/games --positions $W/lichess/sst
+$B/explorer ingest --db $W/lichess/db --sst $W/lichess/sst
 
 # masters
 echo deterministic,legacy > $W/legacy_ids.csv
 $B/masters_to_parquet samples/masters-db/games --out $W/masters.parquet --legacy-ids $W/legacy_ids.csv
 $B/parquet_to_positions --threads 4 --no-direct-io --scratch $W/scratch --scratch-budget 4g --memory-budget 6g --out $W/masters/sst $W/masters.parquet
 $B/parquet_to_games --threads 4 --no-direct-io --out $W/masters/sst/games --game-ids $W/masters/sst/game_ids $W/masters.parquet
-$B/explorer ingest --db $W/masters/db --games $W/masters/sst/games --positions $W/masters/sst --game-ids $W/masters/sst/game_ids
+$B/explorer ingest --db $W/masters/db --sst $W/masters/sst
 
 # serve and replay the sample requests
 $B/explorer lichess --db $W/lichess/db --bind 127.0.0.1:9002 --cache 256m --no-openings --no-blacklist > $W/lichess.log 2>&1 &
