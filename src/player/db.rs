@@ -7,8 +7,8 @@ use std::{
 
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
-    Direction, EnvOptions, IngestExternalFileOptions, IteratorMode, MergeOperands, Options,
-    ReadOptions, SnapshotWithThreadMode, SstFileWriter, WriteBatch, WriteOptions,
+    Direction, EnvOptions, IngestExternalFileOptions, IteratorMode, LiveFile, MergeOperands,
+    Options, ReadOptions, SnapshotWithThreadMode, SstFileWriter, WriteBatch, WriteOptions,
     statistics::{StatsLevel, Ticker},
 };
 use shakmaty::{Color, variant::VariantPosition};
@@ -739,6 +739,11 @@ impl PlayerDb {
             Some(cf) => self.db.property_int_value_cf(cf, name),
             None => Ok(None),
         }
+    }
+
+    /// The SST files of all column families, with their levels and sizes.
+    pub fn live_files(&self) -> Result<Vec<LiveFile>, rocksdb::Error> {
+        self.db.live_files()
     }
 
     pub fn column_families() -> [&'static str; 6] {

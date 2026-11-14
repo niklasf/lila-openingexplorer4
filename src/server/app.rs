@@ -641,7 +641,7 @@ async fn metrics(State(state): State<Shared>) -> Response {
     listen::metrics_response(out)
 }
 
-/// RocksDB statistics, if collected (--db-statistics).
+/// RocksDB statistics, if collected (not --no-db-statistics).
 fn write_tickers(db: &Database, out: &mut Exposition) {
     use rocksdb::statistics::Ticker;
     if let Some(hits) = db.ticker(Ticker::BlockCacheHit) {

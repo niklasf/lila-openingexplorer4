@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
@@ -585,6 +586,7 @@ async fn metrics(State(state): State<Shared>) -> Response {
                 .filter_map(|cf| Some((cf, db.cf_int_property(cf, prop).ok().flatten()?))),
         );
     }
+    write_levels(db, &mut out);
     for (prop, name, help) in [
         (
             "rocksdb.actual-delayed-write-rate",
@@ -644,6 +646,72 @@ async fn metrics(State(state): State<Shared>) -> Response {
             out.counter(name, help, value);
         }
     }
+    for (ticker, name, help) in [
+        (
+            Ticker::BytesWritten,
+            "rocksdb_bytes_written_total",
+            "Bytes of user writes (keys, values and merge operands), the base of write amplification.",
+        ),
+        (
+            Ticker::WalFileBytes,
+            "rocksdb_wal_write_bytes_total",
+            "Bytes written to the write ahead log.",
+        ),
+        (
+            Ticker::BloomFilterUseful,
+            "rocksdb_bloom_filter_useful_total",
+            "Point lookups in SST files that a filter ruled out.",
+        ),
+        (
+            Ticker::BloomFilterFullPositive,
+            "rocksdb_bloom_filter_positive_total",
+            "Point lookups in SST files that a filter did not rule out.",
+        ),
+        (
+            Ticker::BloomFilterFullTruePositive,
+            "rocksdb_bloom_filter_true_positive_total",
+            "Point lookups in SST files that a filter did not rule out, and that found the key.",
+        ),
+    ] {
+        if let Some(value) = db.ticker(ticker) {
+            out.counter(name, help, value);
+        }
+    }
+    out.labeled_counter(
+        "rocksdb_get_hits_total",
+        "Point lookups that found the key, by where.",
+        "source",
+        [
+            ("memtable", Ticker::MemtableHit),
+            ("L0", Ticker::GetHitL0),
+            ("L1", Ticker::GetHitL1),
+            ("L2+", Ticker::GetHitL2AndUp),
+        ]
+        .into_iter()
+        .filter_map(|(source, ticker)| Some((source, db.ticker(ticker)?))),
+    );
+    out.labeled_counter(
+        "rocksdb_file_reads_total",
+        "Reads from SST files (by queries and compactions), by whether from the last level (on the last --db-path).",
+        "level",
+        [
+            ("last", Ticker::LastLevelReadCount),
+            ("non_last", Ticker::NonLastLevelReadCount),
+        ]
+        .into_iter()
+        .filter_map(|(level, ticker)| Some((level, db.ticker(ticker)?))),
+    );
+    out.labeled_counter(
+        "rocksdb_file_read_bytes_total",
+        "Bytes read from SST files (by queries and compactions), by whether from the last level (on the last --db-path).",
+        "level",
+        [
+            ("last", Ticker::LastLevelReadBytes),
+            ("non_last", Ticker::NonLastLevelReadBytes),
+        ]
+        .into_iter()
+        .filter_map(|(level, ticker)| Some((level, db.ticker(ticker)?))),
+    );
     out.labeled_counter(
         "rocksdb_block_cache_misses_total",
         "RocksDB block cache misses, by block type.",
@@ -662,6 +730,88 @@ async fn metrics(State(state): State<Shared>) -> Response {
         state.openings.read().expect("read openings").len(),
     );
     listen::metrics_response(out)
+}
+
+/// Sizes of the levels of all column families, and the estimated live
+/// data (for space amplification).
+fn write_levels(db: &PlayerDb, out: &mut Exposition) {
+    out.labeled_gauge(
+        "rocksdb_estimated_live_data_bytes",
+        "Estimated size of the live data of the column family (compare with rocksdb_sst_files_bytes for space amplification).",
+        "cf",
+        PlayerDb::column_families().into_iter().filter_map(|cf| {
+            Some((
+                cf,
+                db.cf_int_property(cf, "rocksdb.estimate-live-data-size")
+                    .ok()
+                    .flatten()?,
+            ))
+        }),
+    );
+    let files = match db.live_files() {
+        Ok(files) => files,
+        Err(err) => {
+            log::error!("live files for /metrics: {err}");
+            return;
+        }
+    };
+    #[derive(Default)]
+    struct Level {
+        files: u64,
+        bytes: u64,
+        entries: u64,
+        deletions: u64,
+    }
+    let mut levels: BTreeMap<(&str, i32), Level> = BTreeMap::new();
+    for file in &files {
+        let level = levels
+            .entry((file.column_family_name.as_str(), file.level))
+            .or_default();
+        level.files += 1;
+        level.bytes += file.size as u64;
+        level.entries += file.num_entries;
+        level.deletions += file.num_deletions;
+    }
+    let labels: Vec<(&str, String)> = levels
+        .keys()
+        .map(|&(cf, level)| (cf, level.to_string()))
+        .collect();
+    let labels: Vec<[(&str, &str); 2]> = labels
+        .iter()
+        .map(|(cf, level)| [("cf", *cf), ("level", level.as_str())])
+        .collect();
+    for (name, help, value) in [
+        (
+            "rocksdb_level_files",
+            "SST files of the level.",
+            (|level: &Level| level.files) as fn(&Level) -> u64,
+        ),
+        (
+            "rocksdb_level_bytes",
+            "Size of the SST files of the level.",
+            |level: &Level| level.bytes,
+        ),
+        (
+            "rocksdb_level_entries",
+            "Entries in the SST files of the level (including deletions and merge operands).",
+            |level: &Level| level.entries,
+        ),
+        (
+            "rocksdb_level_deletions",
+            "Deletion entries in the SST files of the level.",
+            |level: &Level| level.deletions,
+        ),
+    ] {
+        out.family(
+            "gauge",
+            name,
+            help,
+            labels
+                .iter()
+                .map(|labels| labels.as_slice())
+                .zip(levels.values().map(value)),
+        );
+    }
 }
 
 async fn delete_player(

@@ -93,9 +93,10 @@ struct PlayerArgs {
     /// several paths, so the server sets the level targets itself).
     #[arg(long, env = "EXPLORER_LEVEL_RATIO", default_value_t = 10.0)]
     level_ratio: f64,
-    /// Collect RocksDB statistics (tickers in /metrics).
-    #[arg(long, env = "EXPLORER_DB_STATISTICS")]
-    db_statistics: bool,
+    /// Do not collect RocksDB statistics (for /metrics). Collecting them
+    /// cost about 1.5% throughput at saturation in benchmarks.
+    #[arg(long, env = "EXPLORER_NO_DB_STATISTICS")]
+    no_db_statistics: bool,
     /// Parallel index runs, which is also the most parallel streams from
     /// lila (every request counts, retries included).
     #[arg(
@@ -253,10 +254,10 @@ struct DbArgs {
     /// Read SST files with O_DIRECT, bypassing the page cache.
     #[arg(long, env = "EXPLORER_DIRECT_READS")]
     direct_reads: bool,
-    /// Collect RocksDB statistics (tickers in /metrics). Costs a few
-    /// percent of CPU.
-    #[arg(long, env = "EXPLORER_DB_STATISTICS")]
-    db_statistics: bool,
+    /// Do not collect RocksDB statistics (for /metrics). Collecting them
+    /// cost about 1.5% throughput at saturation in benchmarks.
+    #[arg(long, env = "EXPLORER_NO_DB_STATISTICS")]
+    no_db_statistics: bool,
     /// Threads for opening table files at startup.
     #[arg(long, env = "EXPLORER_FILE_OPENING_THREADS", default_value_t = 16)]
     file_opening_threads: usize,
@@ -272,7 +273,7 @@ impl From<DbArgs> for DbConfig {
         DbConfig {
             cache_bytes: args.cache.into(),
             direct_reads: args.direct_reads,
-            statistics: args.db_statistics,
+            statistics: !args.no_db_statistics,
             file_opening_threads: args.file_opening_threads,
             pin_metadata: args.pin_metadata,
         }
@@ -461,7 +462,7 @@ fn run_player(args: PlayerArgs) {
             rate_limit: (args.rate_limit.0 > 0).then_some(args.rate_limit.0),
             wal_dir: args.wal_dir,
             db_paths: args.db_paths.clone(),
-            statistics: args.db_statistics,
+            statistics: !args.no_db_statistics,
             level_ratio: args.level_ratio,
             ..PlayerDbConfig::default()
         },
