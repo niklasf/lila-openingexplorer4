@@ -729,10 +729,7 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
     };
     let app = app.with_state(Arc::clone(&state));
     let app = if state.config.cors {
-        app.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            HeaderValue::from_static("*"),
-        ))
+        app.layer(listen::cors())
     } else {
         app
     };

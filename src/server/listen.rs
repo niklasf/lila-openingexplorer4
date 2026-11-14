@@ -1,11 +1,19 @@
 use std::{io, net::SocketAddr};
 
-use axum::Router;
+use axum::{Router, http::Method};
 use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
 };
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+
+pub fn cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(true)
+        .allow_methods([Method::GET])
+}
 
 async fn shutdown_signal() {
     let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");

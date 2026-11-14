@@ -34,7 +34,7 @@ thiserror = "2"
 tikv-jemallocator = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tower-http = { version = "0.7", features = ["set-header"] }
+tower-http = { version = "0.7", features = ["cors"] }
 zstd = "0.14"
 hmac = "0.13"
 getrandom = "0.4"

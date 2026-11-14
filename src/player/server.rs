@@ -13,7 +13,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{Path, Query, State, rejection::QueryRejection},
-    http::{HeaderValue, StatusCode, header},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get},
 };
@@ -607,10 +607,7 @@ pub fn router(
         .route("/player/{id}", delete(delete_player))
         .with_state(Arc::clone(&state));
     let app = if state.config.cors {
-        app.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            HeaderValue::from_static("*"),
-        ))
+        app.layer(listen::cors())
     } else {
         app
     };

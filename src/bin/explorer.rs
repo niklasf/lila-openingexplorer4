@@ -62,7 +62,7 @@ struct PlayerArgs {
     /// served at all.
     #[arg(long, env = "EXPLORER_ADMIN_BIND")]
     admin_bind: Option<SocketAddr>,
-    /// Allow access from all origins.
+    /// Allow access from all origins, including with credentials.
     #[arg(long, env = "EXPLORER_CORS")]
     cors: bool,
     /// Size of the RocksDB block cache.
@@ -291,7 +291,7 @@ struct ServeArgs {
     /// Should not be exposed publicly.
     #[arg(long, env = "EXPLORER_ADMIN_BIND")]
     admin_bind: Option<SocketAddr>,
-    /// Allow access from all origins.
+    /// Allow access from all origins, including with credentials.
     #[arg(long, env = "EXPLORER_CORS")]
     cors: bool,
     /// Do not look up cold positions: positions reached by a single game
