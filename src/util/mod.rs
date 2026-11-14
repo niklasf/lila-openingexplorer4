@@ -10,5 +10,7 @@ pub use aligned::{AlignedBuf, DIRECT_ALIGN};
 pub use byte_size::{ByteSize, ParseByteSizeError};
 pub use cli::{SignificantRate, log_above, progress_bar, timed, timed_seconds, zstd_level};
 pub use gauge::Gauge;
-pub use metrics::{Counter, Histogram, Max, push_counters, push_field};
+pub use metrics::{
+    CONTENT_TYPE as METRICS_CONTENT_TYPE, Counter, Exposition, Histogram, micros_to_seconds,
+};
 pub use system::{create_dir, create_empty_dir, free_space, total_memory};

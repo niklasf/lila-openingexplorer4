@@ -1,9 +1,9 @@
 use crate::{
     server::app::Kind,
-    util::{Counter, Histogram, push_counters},
+    util::{Counter, Exposition, Histogram},
 };
 
-/// Request counters for `/monitor`.
+/// Request metrics for `/metrics`.
 #[derive(Default)]
 pub struct Metrics {
     /// Valid explorer requests, answered from the response cache or
@@ -37,30 +37,70 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// The fields relevant for the served database. Takes the maxima of the
-    /// histograms, so that they cover the time since the previous call.
-    pub fn fields(&self, kind: Kind) -> Vec<String> {
-        let mut counters = vec![
-            ("requests", &self.requests),
-            ("computed", &self.computed),
-            ("bad_requests", &self.bad_requests),
-            ("positions_hits", &self.positions_hits),
-            ("cold_hits", &self.cold_hits),
-            ("misses", &self.misses),
-            ("cold_games_loaded", &self.cold_games_loaded),
-            ("response_games_loaded", &self.response_games_loaded),
-            ("parallel_fetch_games", &self.parallel_fetch_games),
-        ];
+    /// The metrics relevant for the served database.
+    pub fn write(&self, kind: Kind, out: &mut Exposition) {
+        out.counter(
+            "requests_total",
+            "Valid explorer requests, answered from the response cache or computed.",
+            self.requests.get(),
+        );
+        out.counter(
+            "responses_computed_total",
+            "Explorer requests that computed their response (response cache misses).",
+            self.computed.get(),
+        );
+        out.counter(
+            "bad_requests_total",
+            "Rejected explorer requests.",
+            self.bad_requests.get(),
+        );
+        out.labeled_counter(
+            "position_lookups_total",
+            "Position lookups by result: found in the positions column family, validated from a cold candidate, or not found.",
+            "result",
+            [
+                ("positions", self.positions_hits.get()),
+                ("cold", self.cold_hits.get()),
+                ("miss", self.misses.get()),
+            ],
+        );
+        out.labeled_counter(
+            "games_loaded_total",
+            "Games loaded, by purpose: cold candidates to replay, or moves, top and recent games of responses.",
+            "purpose",
+            [
+                ("cold_candidate", self.cold_games_loaded.get()),
+                ("response", self.response_games_loaded.get()),
+            ],
+        );
+        out.counter(
+            "parallel_fetch_games_total",
+            "Loaded games that were not in the block cache, fetched in parallel (--parallel-fetch).",
+            self.parallel_fetch_games.get(),
+        );
         if kind == Kind::Lichess {
-            counters.push(("blacklisted_games", &self.blacklisted_games));
+            out.counter(
+                "blacklisted_games_total",
+                "Loaded games hidden because a player is blacklisted.",
+                self.blacklisted_games.get(),
+            );
         }
         if kind == Kind::Masters {
-            counters.push(("pgn_requests", &self.pgn_requests));
+            out.counter(
+                "pgn_requests_total",
+                "Requests for the PGN of a game.",
+                self.pgn_requests.get(),
+            );
         }
-        let mut out = Vec::new();
-        push_counters(&mut out, counters);
-        self.compute.fields("compute", &mut out);
-        self.request.fields("request", &mut out);
-        out
+        out.histogram(
+            "compute_duration_seconds",
+            "Computed responses: time spent computing on the blocking pool.",
+            &self.compute,
+        );
+        out.histogram(
+            "request_duration_seconds",
+            "Computed responses: time from receiving the request to the response, including queueing for the blocking pool.",
+            &self.request,
+        );
     }
 }

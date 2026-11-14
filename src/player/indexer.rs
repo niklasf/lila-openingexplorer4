@@ -18,7 +18,7 @@ use crate::{
         status::PlayerStatus,
         time::UnixMillis,
     },
-    util::{Counter, push_counters},
+    util::{Counter, Exposition, micros_to_seconds},
 };
 
 fn micros(duration: Duration) -> u64 {
@@ -76,7 +76,7 @@ impl Default for IndexerConfig {
     }
 }
 
-/// Counters of the indexers, for `/monitor`.
+/// Counters of the indexers, for `/metrics`.
 #[derive(Default)]
 pub struct IndexerMetrics {
     pub runs: Counter,
@@ -103,30 +103,74 @@ pub struct IndexerMetrics {
 }
 
 impl IndexerMetrics {
-    /// The fields for `/monitor`.
-    pub fn fields(&self, out: &mut Vec<String>) {
-        push_counters(
-            out,
+    pub fn write(&self, out: &mut Exposition) {
+        out.counter(
+            "index_runs_started_total",
+            "Index runs started.",
+            self.runs.get(),
+        );
+        out.labeled_counter(
+            "index_runs_ended_total",
+            "Index runs that ended, by how.",
+            "end",
             [
-                ("runs", &self.runs),
-                ("runs_complete", &self.runs_complete),
-                ("runs_not_found", &self.runs_not_found),
-                ("runs_failed", &self.runs_failed),
-                ("runs_abandoned", &self.runs_abandoned),
-                ("runs_requeued", &self.runs_requeued),
-                ("games_received", &self.games_received),
-                ("skipped_ongoing", &self.skipped_ongoing),
-                ("skipped_unfinished", &self.skipped_unfinished),
-                ("skipped_anonymous", &self.skipped_anonymous),
-                ("skipped_invalid", &self.skipped_invalid),
-                ("malformed_lines", &self.malformed_lines),
-                ("lila_errors", &self.lila_errors),
-                ("lila_timeouts", &self.lila_timeouts),
-                ("stream_retries", &self.stream_retries),
-                ("writer_wait_us", &self.writer_wait_micros),
-                ("lila_stream_us", &self.stream_micros),
-                ("rebuild_errors", &self.rebuild_errors),
+                ("complete", self.runs_complete.get()),
+                ("not_found", self.runs_not_found.get()),
+                ("failed", self.runs_failed.get()),
+                ("abandoned", self.runs_abandoned.get()),
+                ("requeued", self.runs_requeued.get()),
             ],
+        );
+        out.counter(
+            "games_received_total",
+            "Games received from lila.",
+            self.games_received.get(),
+        );
+        out.labeled_counter(
+            "games_skipped_total",
+            "Received games that were not indexed, by reason.",
+            "reason",
+            [
+                ("ongoing", self.skipped_ongoing.get()),
+                ("unfinished", self.skipped_unfinished.get()),
+                ("anonymous", self.skipped_anonymous.get()),
+                ("invalid", self.skipped_invalid.get()),
+            ],
+        );
+        out.counter(
+            "lila_malformed_lines_total",
+            "Malformed lines in game streams from lila.",
+            self.malformed_lines.get(),
+        );
+        out.counter(
+            "lila_errors_total",
+            "Errors of game streams from lila.",
+            self.lila_errors.get(),
+        );
+        out.counter(
+            "lila_timeouts_total",
+            "Timeouts of game streams from lila.",
+            self.lila_timeouts.get(),
+        );
+        out.counter(
+            "lila_stream_retries_total",
+            "Retried game streams from lila.",
+            self.stream_retries.get(),
+        );
+        out.counter(
+            "writer_wait_seconds_total",
+            "Time that game streams waited for chunk writes.",
+            micros_to_seconds(self.writer_wait_micros.get()),
+        );
+        out.counter(
+            "lila_stream_seconds_total",
+            "Time that game streams from lila were open.",
+            micros_to_seconds(self.stream_micros.get()),
+        );
+        out.counter(
+            "rebuild_errors_total",
+            "Failed rebuilds of player indexes.",
+            self.rebuild_errors.get(),
         );
     }
 }

@@ -37,7 +37,7 @@ use crate::{
         query::PlayError,
         response::Stats,
     },
-    util::{Counter, Histogram, push_counters, push_field},
+    util::{Counter, Exposition, Histogram, micros_to_seconds},
 };
 
 #[derive(Debug, Clone)]
@@ -115,7 +115,6 @@ pub struct ServerMetrics {
     /// Streams that the client closed before the final snapshot.
     pub streams_gone: Counter,
     pub stream_micros: Counter,
-    pub snapshots: Counter,
     /// Snapshots that repeated the last read with a new queue position.
     pub snapshots_repeated: Counter,
     pub keep_alives: Counter,
@@ -130,36 +129,99 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
-    /// The fields for `/monitor`. Takes the maximum of the read histogram.
-    fn fields(&self, out: &mut Vec<String>) {
-        push_counters(
-            out,
+    fn write(&self, out: &mut Exposition) {
+        out.counter(
+            "requests_total",
+            "Valid player requests.",
+            self.requests.get(),
+        );
+        out.counter(
+            "bad_requests_total",
+            "Rejected player requests.",
+            self.bad_requests.get(),
+        );
+        out.counter(
+            "queue_full_total",
+            "Requests rejected because the indexing queue was full.",
+            self.queue_full.get(),
+        );
+        out.labeled_counter(
+            "streams_ended_total",
+            "Response streams that ended, by how: final snapshot sent, or closed by the client before.",
+            "end",
             [
-                ("requests", &self.requests),
-                ("bad_requests", &self.bad_requests),
-                ("queue_full", &self.queue_full),
-                ("streams_complete", &self.streams_complete),
-                ("streams_gone", &self.streams_gone),
-                ("stream_us", &self.stream_micros),
-                ("snapshots", &self.snapshots),
-                ("snapshots_repeated", &self.snapshots_repeated),
-                ("keep_alives", &self.keep_alives),
-                ("warm_hits", &self.warm_hits),
-                ("cold_candidates", &self.cold_candidates),
-                ("cold_validated", &self.cold_validated),
-                ("players_deleted", &self.players_deleted),
+                ("complete", self.streams_complete.get()),
+                ("gone", self.streams_gone.get()),
             ],
         );
-        for (i, (partial, complete)) in self.ply.iter().enumerate() {
-            let bucket = if i + 1 == PLY_BUCKETS {
-                format!("ply_ge{}", i * 10)
-            } else {
-                format!("ply_lt{}", (i + 1) * 10)
-            };
-            push_field(out, &format!("{bucket}_partial"), partial.get());
-            push_field(out, &format!("{bucket}_final"), complete.get());
-        }
-        self.read.fields("read", out);
+        out.counter(
+            "stream_seconds_total",
+            "Time that ended response streams were open.",
+            micros_to_seconds(self.stream_micros.get()),
+        );
+        let plies: Vec<String> = (0..PLY_BUCKETS)
+            .map(|i| {
+                if i + 1 == PLY_BUCKETS {
+                    format!("{}+", i * 10)
+                } else {
+                    format!("{}-{}", i * 10, i * 10 + 9)
+                }
+            })
+            .collect();
+        let labels: Vec<[(&str, &str); 2]> = plies
+            .iter()
+            .flat_map(|ply| {
+                [
+                    [("ply", ply.as_str()), ("final", "false")],
+                    [("ply", ply.as_str()), ("final", "true")],
+                ]
+            })
+            .collect();
+        out.family(
+            "counter",
+            "snapshots_total",
+            "Snapshots sent, by ply of the position and whether final.",
+            labels.iter().map(|labels| labels.as_slice()).zip(
+                self.ply
+                    .iter()
+                    .flat_map(|(partial, complete)| [partial.get(), complete.get()]),
+            ),
+        );
+        out.counter(
+            "snapshots_repeated_total",
+            "Snapshots that repeated the last read with a new queue position.",
+            self.snapshots_repeated.get(),
+        );
+        out.counter(
+            "keep_alives_total",
+            "Keep-alive lines sent.",
+            self.keep_alives.get(),
+        );
+        out.histogram(
+            "read_duration_seconds",
+            "Database reads of snapshots (on the blocking pool).",
+            &self.read,
+        );
+        out.counter(
+            "warm_hits_total",
+            "Positions found in the warm column family.",
+            self.warm_hits.get(),
+        );
+        out.counter(
+            "cold_candidates_total",
+            "Cold candidates of positions.",
+            self.cold_candidates.get(),
+        );
+        out.counter(
+            "cold_validated_total",
+            "Cold candidates validated by replay.",
+            self.cold_validated.get(),
+        );
+        out.counter(
+            "players_deleted_total",
+            "Players deleted (DELETE /player/{id}).",
+            self.players_deleted.get(),
+        );
     }
 }
 
@@ -363,7 +425,6 @@ async fn snapshots(
         // dropped, as before (also an unchanged final snapshot).
         let key = (last.queue_position, last.total_games());
         if last_key != Some(key) {
-            state.metrics.snapshots.inc();
             state.record_ply(&request, progress.done);
             if tx.send(Ok(line(&last))).await.is_err() {
                 return;
@@ -463,81 +524,144 @@ async fn player(
         .expect("response"))
 }
 
-async fn monitor(State(state): State<Shared>) -> String {
-    let mut fields = Vec::new();
-    state.metrics.fields(&mut fields);
-    push_field(
-        &mut fields,
+async fn metrics(State(state): State<Shared>) -> Response {
+    use rocksdb::statistics::Ticker;
+    let mut out = Exposition::new();
+    state.metrics.write(&mut out);
+    out.gauge(
         "open_streams",
+        "Open response streams.",
         state.open_streams.load(Ordering::Relaxed),
     );
     let indexer = &state.indexer;
     let queue = indexer.queue().stats();
-    push_field(&mut fields, "queue_waiting", queue.waiting as u64);
-    push_field(&mut fields, "queue_running", queue.running as u64);
-    push_field(&mut fields, "queue_busy", queue.busy as u64);
-    push_field(&mut fields, "lila_streams", indexer.lila().busy() as u64);
-    indexer.metrics.fields(&mut fields);
+    out.gauge(
+        "queue_waiting",
+        "Players waiting in the indexing queue.",
+        queue.waiting,
+    );
+    out.gauge("queue_running", "Index runs in progress.", queue.running);
+    out.gauge(
+        "queue_busy",
+        "Players that are busy (queued, being indexed or written).",
+        queue.busy,
+    );
+    out.gauge(
+        "lila_streams",
+        "Open game streams from lila.",
+        indexer.lila().busy(),
+    );
+    indexer.metrics.write(&mut out);
     let db = indexer.db();
-    db.counters.fields(&mut fields);
-    push_field(&mut fields, "block_cache_usage", db.cache_usage() as u64);
-    for cf in PlayerDb::column_families() {
-        for (prop, name) in [
-            ("rocksdb.estimate-num-keys", "keys"),
-            ("rocksdb.total-sst-files-size", "sst_bytes"),
-            (
-                "rocksdb.estimate-pending-compaction-bytes",
-                "pending_compaction_bytes",
-            ),
-        ] {
-            if let Ok(Some(value)) = db.cf_int_property(cf, prop) {
-                push_field(&mut fields, &format!("{cf}_{name}"), value);
-            }
-        }
+    db.counters.write(&mut out);
+    out.gauge(
+        "block_cache_usage_bytes",
+        "Memory used by the RocksDB block cache.",
+        db.cache_usage(),
+    );
+    for (prop, name, help) in [
+        (
+            "rocksdb.estimate-num-keys",
+            "rocksdb_estimated_keys",
+            "Estimated keys of the column family.",
+        ),
+        (
+            "rocksdb.total-sst-files-size",
+            "rocksdb_sst_files_bytes",
+            "Size of the SST files of the column family.",
+        ),
+        (
+            "rocksdb.estimate-pending-compaction-bytes",
+            "rocksdb_pending_compaction_bytes",
+            "Estimated bytes that compactions of the column family need to rewrite.",
+        ),
+    ] {
+        out.labeled_gauge(
+            name,
+            help,
+            "cf",
+            PlayerDb::column_families()
+                .into_iter()
+                .filter_map(|cf| Some((cf, db.cf_int_property(cf, prop).ok().flatten()?))),
+        );
     }
-    for (prop, name) in [
-        ("rocksdb.actual-delayed-write-rate", "delayed_write_rate"),
-        ("rocksdb.is-write-stopped", "write_stopped"),
-        ("rocksdb.num-running-compactions", "running_compactions"),
-        ("rocksdb.num-running-flushes", "running_flushes"),
+    for (prop, name, help) in [
+        (
+            "rocksdb.actual-delayed-write-rate",
+            "rocksdb_delayed_write_rate_bytes_per_second",
+            "Rate of delayed writes (0 if not delayed).",
+        ),
+        (
+            "rocksdb.is-write-stopped",
+            "rocksdb_write_stopped",
+            "1 if writes are stopped.",
+        ),
+        (
+            "rocksdb.num-running-compactions",
+            "rocksdb_running_compactions",
+            "Compactions in progress.",
+        ),
+        (
+            "rocksdb.num-running-flushes",
+            "rocksdb_running_flushes",
+            "Flushes in progress.",
+        ),
     ] {
         if let Ok(Some(value)) = db.cf_int_property(WARM_CF, prop) {
-            push_field(&mut fields, name, value);
+            out.gauge(name, help, value);
         }
     }
-    for (name, ticker) in [
-        ("stall_us", rocksdb::statistics::Ticker::StallMicros),
+    if let Some(micros) = db.ticker(Ticker::StallMicros) {
+        out.counter(
+            "rocksdb_stall_seconds_total",
+            "Time that writes were stalled.",
+            micros_to_seconds(micros),
+        );
+    }
+    for (ticker, name, help) in [
         (
-            "compact_read_bytes",
-            rocksdb::statistics::Ticker::CompactReadBytes,
+            Ticker::CompactReadBytes,
+            "rocksdb_compaction_read_bytes_total",
+            "Bytes read by compactions.",
         ),
         (
-            "compact_write_bytes",
-            rocksdb::statistics::Ticker::CompactWriteBytes,
+            Ticker::CompactWriteBytes,
+            "rocksdb_compaction_write_bytes_total",
+            "Bytes written by compactions.",
         ),
         (
-            "flush_write_bytes",
-            rocksdb::statistics::Ticker::FlushWriteBytes,
+            Ticker::FlushWriteBytes,
+            "rocksdb_flush_write_bytes_total",
+            "Bytes written by flushes.",
         ),
         (
-            "block_cache_miss",
-            rocksdb::statistics::Ticker::BlockCacheMiss,
-        ),
-        (
-            "block_cache_hit",
-            rocksdb::statistics::Ticker::BlockCacheHit,
+            Ticker::BlockCacheHit,
+            "rocksdb_block_cache_hits_total",
+            "RocksDB block cache hits.",
         ),
     ] {
         if let Some(value) = db.ticker(ticker) {
-            push_field(&mut fields, name, value);
+            out.counter(name, help, value);
         }
     }
-    push_field(
-        &mut fields,
-        "openings",
-        state.openings.read().expect("read openings").len() as u64,
+    out.labeled_counter(
+        "rocksdb_block_cache_misses_total",
+        "RocksDB block cache misses, by block type.",
+        "block",
+        [
+            ("index", Ticker::BlockCacheIndexMiss),
+            ("filter", Ticker::BlockCacheFilterMiss),
+            ("data", Ticker::BlockCacheDataMiss),
+        ]
+        .into_iter()
+        .filter_map(|(block, ticker)| Some((block, db.ticker(ticker)?))),
     );
-    format!("opening_explorer_player {}\n", fields.join(","))
+    out.gauge(
+        "openings",
+        "Known opening names.",
+        state.openings.read().expect("read openings").len(),
+    );
+    listen::metrics_response(out)
 }
 
 async fn delete_player(
@@ -601,9 +725,9 @@ pub fn router(
         .route("/personal", get(player))
         .with_state(Arc::clone(&state));
     let admin = Router::new()
-        .route("/monitor", get(monitor))
-        .route("/monitor/db/{prop}", get(db_prop))
-        .route("/monitor/cf/{cf}/{prop}", get(cf_prop))
+        .route("/metrics", get(metrics))
+        .route("/db/{prop}", get(db_prop))
+        .route("/cf/{cf}/{prop}", get(cf_prop))
         .route("/player/{id}", delete(delete_player))
         .with_state(Arc::clone(&state));
     let app = if state.config.cors {

@@ -50,7 +50,7 @@ $B/explorer masters --db /hdd/masters/db --bind 127.0.0.1:9003 --cors \
   (or `EXPLORER_BEARER_FILE`), for the blacklist of players marked by
   moderators every `--blacklist-refresh` seconds, default 173 min.
   `--no-blacklist` to disable.
-* `--admin-bind`: Provide `/monitor`.
+* `--admin-bind`: Provide Prometheus metrics at `/metrics`.
 
 The personal opening explorer (`/player`) has its own writable database,
 created on first start, and indexes games from lila on demand:
@@ -66,7 +66,7 @@ $B/explorer player --db /nvme/player/db --bind 127.0.0.1:9004 --cors \
   their capacities (to put the upper levels on fast storage, if possible).
 * `--rate-limit 16m` (default): Bounds write throughput per second of
   compactions.
-* `--admin-bind`: Provide `/monitor` and `DELETE /player/{id}`.
+* `--admin-bind`: Provide Prometheus metrics at `/metrics` and `DELETE /player/{id}`.
 * `--indexers 8` (default): Parallel index runs, which is also the most
   parallel streams from lila's games export. Uses `--lila-bearer-file`
   if specified.

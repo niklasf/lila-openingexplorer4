@@ -29,7 +29,7 @@ use crate::{
         status::PlayerStatus,
     },
     sst::SstConfig,
-    util::{Counter, push_counters},
+    util::{Counter, Exposition, micros_to_seconds},
 };
 
 pub const STATUS_CF: &str = "player_status";
@@ -186,22 +186,55 @@ pub struct DbCounters {
 }
 
 impl DbCounters {
-    /// The fields for `/monitor`.
-    pub fn fields(&self, out: &mut Vec<String>) {
-        push_counters(
-            out,
+    pub fn write(&self, out: &mut Exposition) {
+        out.counter(
+            "chunks_written_total",
+            "Chunks of games written.",
+            self.chunks.get(),
+        );
+        out.counter(
+            "games_indexed_total",
+            "Games written to the index.",
+            self.games_written.get(),
+        );
+        out.counter(
+            "games_known_total",
+            "Games skipped because they were already indexed.",
+            self.games_known.get(),
+        );
+        out.labeled_counter(
+            "merge_operands_total",
+            "Merge operands written, by column family.",
+            "cf",
             [
-                ("chunks", &self.chunks),
-                ("games_indexed", &self.games_written),
-                ("games_known", &self.games_known),
-                ("warm_operands", &self.warm_operands),
-                ("cold_operands", &self.cold_operands),
-                ("cold_false", &self.cold_false),
-                ("rebuilds", &self.rebuilds),
-                ("rebuilds_ingested", &self.rebuilds_ingested),
-                ("rebuild_us", &self.rebuild_micros),
-                ("rebuild_bytes", &self.rebuild_bytes),
+                ("warm", self.warm_operands.get()),
+                ("cold", self.cold_operands.get()),
             ],
+        );
+        out.counter(
+            "cold_false_total",
+            "Cold candidates that replay rejected.",
+            self.cold_false.get(),
+        );
+        out.counter(
+            "rebuilds_total",
+            "Rebuilds of player indexes.",
+            self.rebuilds.get(),
+        );
+        out.counter(
+            "rebuilds_ingested_total",
+            "Rebuilds ingested as SST files.",
+            self.rebuilds_ingested.get(),
+        );
+        out.counter(
+            "rebuild_seconds_total",
+            "Time spent rebuilding.",
+            micros_to_seconds(self.rebuild_micros.get()),
+        );
+        out.counter(
+            "rebuild_bytes_total",
+            "Bytes written by rebuilds.",
+            self.rebuild_bytes.get(),
         );
     }
 }

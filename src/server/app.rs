@@ -42,7 +42,7 @@ use crate::{
             ExplorerGame, ExplorerGameWithUci, ExplorerMove, ExplorerResponse, HistoryEntry, Stats,
         },
     },
-    util::{Counter, push_field},
+    util::{Counter, Exposition},
 };
 
 /// Which database the server serves.
@@ -607,65 +607,69 @@ async fn masters_pgn_handler(
         .into_response())
 }
 
-async fn monitor(State(state): State<Shared>) -> String {
-    let fields = {
-        let mut fields = state.metrics.fields(state.config.kind);
-        push_field(&mut fields, "response_cache", state.cache.entry_count());
-        push_field(
-            &mut fields,
-            "block_cache_usage",
-            state.db.cache_usage() as u64,
+async fn metrics(State(state): State<Shared>) -> Response {
+    let mut out = Exposition::new();
+    state.metrics.write(state.config.kind, &mut out);
+    out.gauge(
+        "response_cache_entries",
+        "Entries in the response cache.",
+        state.cache.entry_count(),
+    );
+    out.gauge(
+        "block_cache_usage_bytes",
+        "Memory used by the RocksDB block cache.",
+        state.db.cache_usage(),
+    );
+    out.gauge(
+        "block_cache_pinned_usage_bytes",
+        "Memory used by pinned entries of the RocksDB block cache.",
+        state.db.cache_pinned_usage(),
+    );
+    out.gauge(
+        "openings",
+        "Known opening names.",
+        state.openings.read().expect("read openings").len(),
+    );
+    if state.config.blacklist.is_some() {
+        out.gauge(
+            "blacklisted_players",
+            "Players on the blacklist.",
+            state.blacklist.len(),
         );
-        push_field(
-            &mut fields,
-            "block_cache_pinned",
-            state.db.cache_pinned_usage() as u64,
+    }
+    write_tickers(&state.db, &mut out);
+    listen::metrics_response(out)
+}
+
+/// RocksDB statistics, if collected (--db-statistics).
+fn write_tickers(db: &Database, out: &mut Exposition) {
+    use rocksdb::statistics::Ticker;
+    if let Some(hits) = db.ticker(Ticker::BlockCacheHit) {
+        out.counter(
+            "rocksdb_block_cache_hits_total",
+            "RocksDB block cache hits.",
+            hits,
         );
-        push_field(
-            &mut fields,
-            "openings",
-            state.openings.read().expect("read openings").len() as u64,
+    }
+    out.labeled_counter(
+        "rocksdb_block_cache_misses_total",
+        "RocksDB block cache misses, by block type.",
+        "block",
+        [
+            ("index", Ticker::BlockCacheIndexMiss),
+            ("filter", Ticker::BlockCacheFilterMiss),
+            ("data", Ticker::BlockCacheDataMiss),
+        ]
+        .into_iter()
+        .filter_map(|(block, ticker)| Some((block, db.ticker(ticker)?))),
+    );
+    if let Some(useful) = db.ticker(Ticker::BloomFilterUseful) {
+        out.counter(
+            "rocksdb_bloom_filter_useful_total",
+            "Point lookups that a filter ruled out.",
+            useful,
         );
-        if state.config.blacklist.is_some() {
-            push_field(&mut fields, "blacklist", state.blacklist.len() as u64);
-        }
-        for (name, ticker) in [
-            (
-                "block_cache_hit",
-                rocksdb::statistics::Ticker::BlockCacheHit,
-            ),
-            (
-                "block_cache_miss",
-                rocksdb::statistics::Ticker::BlockCacheMiss,
-            ),
-            (
-                "block_cache_index_miss",
-                rocksdb::statistics::Ticker::BlockCacheIndexMiss,
-            ),
-            (
-                "block_cache_filter_miss",
-                rocksdb::statistics::Ticker::BlockCacheFilterMiss,
-            ),
-            (
-                "block_cache_data_miss",
-                rocksdb::statistics::Ticker::BlockCacheDataMiss,
-            ),
-            (
-                "bloom_filter_useful",
-                rocksdb::statistics::Ticker::BloomFilterUseful,
-            ),
-        ] {
-            if let Some(count) = state.db.ticker(ticker) {
-                push_field(&mut fields, name, count);
-            }
-        }
-        fields
-    };
-    format!(
-        "opening_explorer_{} {}\n",
-        state.config.kind.as_str(),
-        fields.join(",")
-    )
+    }
 }
 
 async fn db_prop(State(state): State<Shared>, Path(prop): Path<String>) -> Result<String, Error> {
@@ -736,9 +740,9 @@ pub async fn serve(config: AppConfig, db: Database) -> Result<(), Box<dyn std::e
 
     let admin = state.config.admin_bind.map(|addr| {
         let router = Router::new()
-            .route("/monitor", get(monitor))
-            .route("/monitor/db/{prop}", get(db_prop))
-            .route("/monitor/cf/{cf}/{prop}", get(cf_prop))
+            .route("/metrics", get(metrics))
+            .route("/db/{prop}", get(db_prop))
+            .route("/cf/{cf}/{prop}", get(cf_prop))
             .with_state(Arc::clone(&state));
         (addr, router)
     });

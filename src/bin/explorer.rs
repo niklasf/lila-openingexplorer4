@@ -57,7 +57,7 @@ struct PlayerArgs {
     /// Binding address of the public endpoints.
     #[arg(long, env = "EXPLORER_BIND", default_value = "127.0.0.1:9003")]
     bind: SocketAddr,
-    /// Binding address of administration and monitoring (/monitor and
+    /// Binding address of administration and monitoring (/metrics and
     /// DELETE /player/{id}), to be kept private. Without it, these are not
     /// served at all.
     #[arg(long, env = "EXPLORER_ADMIN_BIND")]
@@ -93,7 +93,7 @@ struct PlayerArgs {
     /// several paths, so the server sets the level targets itself).
     #[arg(long, env = "EXPLORER_LEVEL_RATIO", default_value_t = 10.0)]
     level_ratio: f64,
-    /// Collect RocksDB statistics (tickers in /monitor).
+    /// Collect RocksDB statistics (tickers in /metrics).
     #[arg(long, env = "EXPLORER_DB_STATISTICS")]
     db_statistics: bool,
     /// Parallel index runs, which is also the most parallel streams from
@@ -253,7 +253,7 @@ struct DbArgs {
     /// Read SST files with O_DIRECT, bypassing the page cache.
     #[arg(long, env = "EXPLORER_DIRECT_READS")]
     direct_reads: bool,
-    /// Collect RocksDB statistics (tickers in /monitor). Costs a few
+    /// Collect RocksDB statistics (tickers in /metrics). Costs a few
     /// percent of CPU.
     #[arg(long, env = "EXPLORER_DB_STATISTICS")]
     db_statistics: bool,

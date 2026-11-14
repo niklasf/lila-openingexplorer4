@@ -1,12 +1,22 @@
 use std::{io, net::SocketAddr};
 
-use axum::{Router, http::Method};
+use axum::{
+    Router,
+    http::{Method, header},
+    response::{IntoResponse, Response},
+};
 use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
 };
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+use crate::util::{Exposition, METRICS_CONTENT_TYPE};
+
+pub fn metrics_response(out: Exposition) -> Response {
+    ([(header::CONTENT_TYPE, METRICS_CONTENT_TYPE)], out.finish()).into_response()
+}
 
 pub fn cors() -> CorsLayer {
     CorsLayer::new()

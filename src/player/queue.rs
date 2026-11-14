@@ -125,7 +125,7 @@ pub struct Queue {
     known_first: bool,
 }
 
-/// Counts of the queue, for `/monitor`.
+/// Counts of the queue, for `/metrics`.
 #[derive(Debug, Clone)]
 pub struct QueueStats {
     pub waiting: usize,
